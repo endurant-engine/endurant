@@ -1,0 +1,288 @@
+defmodule Endurant.Events do
+  @moduledoc false
+
+  @default_prefix "public"
+
+  @type event :: %{
+          id: integer(),
+          execution_id: binary(),
+          sequence: non_neg_integer(),
+          type: atom(),
+          payload: map(),
+          inserted_at: NaiveDateTime.t() | DateTime.t() | nil
+        }
+
+  @doc """
+  Appends an event for an existing execution.
+
+  This function only requires that the execution row exists. It does not enforce
+  executor ownership or running lease checks.
+
+  Use this for system/state-transition events where correctness is enforced by
+  the surrounding transaction/state machine, or for external events that may be
+  recorded while an execution is not running (for example: `signal_received`,
+  `cancel_requested`).
+
+  If you need to guarantee that only the current lease owner can append the
+  event while the execution is running, use `append_if_running_owned/5`.
+  """
+  @spec append(binary(), atom() | String.t(), map(), keyword()) :: :ok
+  def append(execution_id, type, payload \\ %{}, opts \\ []) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    execution_id = to_db_id(execution_id)
+    type = normalize_type(type)
+    payload = payload || %{}
+
+    sql = """
+    WITH locked_execution AS (
+      SELECT id
+      FROM #{prefix}.endurant_executions
+      WHERE id = $1
+      FOR UPDATE
+    ),
+    next_sequence AS (
+      SELECT
+        COALESCE(MAX(sequence) + 1, 1) AS value
+      FROM #{prefix}.endurant_events
+      WHERE execution_id = $1
+    )
+    INSERT INTO #{prefix}.endurant_events (execution_id, sequence, type, payload, inserted_at)
+    SELECT
+      $1,
+      next_sequence.value,
+      $2::#{prefix}.endurant_event_type,
+      $3,
+      timezone('UTC', now())
+    FROM locked_execution, next_sequence
+    """
+
+    params = [execution_id, type, payload]
+
+    do_append(repo, sql, params, execution_id, 0)
+  end
+
+  @doc """
+  Appends an event only when the execution is currently running and owned by the
+  provided worker lease.
+
+  Conditions enforced by this function:
+  - execution exists
+  - status is `running`
+  - `locked_by` matches `worker_id`
+  - `locked_until` is in the future
+
+  Returns `{:error, :not_running}` when those ownership/lease conditions are not met.
+
+  Use this for executor-owned events (such as task lifecycle events) where stale
+  or orphaned executors must not be allowed to write.
+  """
+  @spec append_if_running_owned(binary(), String.t(), atom() | String.t(), map(), keyword()) ::
+          :ok | {:error, :not_running}
+  def append_if_running_owned(execution_id, worker_id, type, payload \\ %{}, opts \\ [])
+      when is_binary(worker_id) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    execution_id = to_db_id(execution_id)
+    type = normalize_type(type)
+    payload = payload || %{}
+
+    sql = """
+    WITH locked_execution AS (
+      SELECT id
+      FROM #{prefix}.endurant_executions
+      WHERE id = $1
+      AND status = 'running'::#{prefix}.endurant_execution_status
+      AND locked_by = $2
+      AND locked_until IS NOT NULL
+      AND locked_until > timezone('UTC', now())
+      FOR UPDATE
+    ),
+    next_sequence AS (
+      SELECT
+        COALESCE(MAX(sequence) + 1, 1) AS value
+      FROM #{prefix}.endurant_events
+      WHERE execution_id = $1
+    )
+    INSERT INTO #{prefix}.endurant_events (execution_id, sequence, type, payload, inserted_at)
+    SELECT
+      $1,
+      next_sequence.value,
+      $3::#{prefix}.endurant_event_type,
+      $4,
+      timezone('UTC', now())
+    FROM locked_execution, next_sequence
+    """
+
+    params = [execution_id, worker_id, type, payload]
+    do_append_if_running(repo, sql, params, 0)
+  end
+
+  @doc """
+  Lists the full event history for an execution in ascending sequence order.
+  """
+  @spec list(binary(), keyword()) :: [event()]
+  def list(execution_id, opts \\ []) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    execution_id = to_db_id(execution_id)
+
+    sql = """
+    SELECT id, execution_id, sequence, type::text, payload, inserted_at
+    FROM #{prefix}.endurant_events
+    WHERE execution_id = $1
+    ORDER BY sequence ASC
+    """
+
+    rows =
+      repo
+      |> query!(sql, [execution_id])
+      |> Map.fetch!(:rows)
+
+    Enum.map(rows, fn [id, exec_id, sequence, type, payload, inserted_at] ->
+      %{
+        id: id,
+        execution_id: to_app_id(exec_id),
+        sequence: sequence,
+        type: parse_type(type),
+        payload: payload || %{},
+        inserted_at: inserted_at
+      }
+    end)
+  end
+
+  @doc """
+  Lists events with sequence strictly greater than the provided sequence number.
+
+  Ordering is ascending by sequence. This is intended for incremental reads from
+  a known checkpoint.
+  """
+  @spec list_after(binary(), non_neg_integer(), keyword()) :: [event()]
+  def list_after(execution_id, sequence, opts \\ [])
+      when is_integer(sequence) and sequence >= 0 do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    execution_id = to_db_id(execution_id)
+
+    sql = """
+    SELECT id, execution_id, sequence, type::text, payload, inserted_at
+    FROM #{prefix}.endurant_events
+    WHERE execution_id = $1
+    AND sequence > $2
+    ORDER BY sequence ASC
+    """
+
+    rows =
+      repo
+      |> query!(sql, [execution_id, sequence])
+      |> Map.fetch!(:rows)
+
+    Enum.map(rows, fn [id, exec_id, sequence_value, type, payload, inserted_at] ->
+      %{
+        id: id,
+        execution_id: to_app_id(exec_id),
+        sequence: sequence_value,
+        type: parse_type(type),
+        payload: payload || %{},
+        inserted_at: inserted_at
+      }
+    end)
+  end
+
+  @spec normalize_type(atom() | String.t()) :: String.t()
+  defp normalize_type(type) when is_atom(type), do: Atom.to_string(type)
+  defp normalize_type(type) when is_binary(type), do: type
+
+  @spec query!(module(), iodata(), list()) :: map()
+  defp query!(repo, sql, params) do
+    repo.query!(sql, params, log: false)
+  end
+
+  @max_append_retries 5
+
+  @spec do_append(module(), iodata(), list(), binary(), non_neg_integer()) :: :ok
+  defp do_append(repo, sql, params, execution_id, retries) when retries <= @max_append_retries do
+    case repo.query!(sql, params, log: false).num_rows do
+      1 ->
+        :ok
+
+      _ ->
+        raise ArgumentError, "execution not found: #{inspect(to_app_id(execution_id))}"
+    end
+  rescue
+    error ->
+      if unique_sequence_violation?(error) and retries < @max_append_retries do
+        do_append(repo, sql, params, execution_id, retries + 1)
+      else
+        reraise(error, __STACKTRACE__)
+      end
+  end
+
+  @spec do_append_if_running(module(), iodata(), list(), non_neg_integer()) ::
+          :ok | {:error, :not_running}
+  defp do_append_if_running(repo, sql, params, retries) when retries <= @max_append_retries do
+    case repo.query!(sql, params, log: false).num_rows do
+      1 -> :ok
+      _ -> {:error, :not_running}
+    end
+  rescue
+    error ->
+      if unique_sequence_violation?(error) and retries < @max_append_retries do
+        do_append_if_running(repo, sql, params, retries + 1)
+      else
+        reraise(error, __STACKTRACE__)
+      end
+  end
+
+  @spec unique_sequence_violation?(Exception.t()) :: boolean()
+  defp unique_sequence_violation?(%{
+         __struct__: Postgrex.Error,
+         postgres: %{
+           code: :unique_violation,
+           constraint: "endurant_events_execution_id_sequence_index"
+         }
+       }),
+       do: true
+
+  defp unique_sequence_violation?(_), do: false
+
+  @spec parse_type(String.t()) :: atom()
+  defp parse_type(type) do
+    case type do
+      "execution_created" -> :execution_created
+      "execution_started" -> :execution_started
+      "execution_completed" -> :execution_completed
+      "execution_failed" -> :execution_failed
+      "execution_cancelled" -> :execution_cancelled
+      "execution_abandoned" -> :execution_abandoned
+      "execution_resumed" -> :execution_resumed
+      "execution_waiting" -> :execution_waiting
+      "task_started" -> :task_started
+      "task_completed" -> :task_completed
+      "task_failed" -> :task_failed
+      "signal_received" -> :signal_received
+      "cancel_requested" -> :cancel_requested
+    end
+  end
+
+  @spec repo!(keyword()) :: module()
+  defp repo!(opts) do
+    Keyword.get_lazy(opts, :repo, fn -> Application.fetch_env!(:endurant, :repo) end)
+  end
+
+  @spec to_db_id(binary()) :: binary()
+  defp to_db_id(id) when is_binary(id) do
+    case Ecto.UUID.dump(id) do
+      {:ok, dumped} -> dumped
+      :error -> id
+    end
+  end
+
+  @spec to_app_id(binary()) :: binary()
+  defp to_app_id(id) when is_binary(id) do
+    case Ecto.UUID.load(id) do
+      {:ok, loaded} -> loaded
+      :error -> id
+    end
+  end
+end
