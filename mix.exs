@@ -10,6 +10,8 @@ defmodule Endurant.MixProject do
       start_permanent: Mix.env() == :prod,
       dialyzer: [plt_add_apps: [:mix]],
       description: "Durable workflow engine for Elixir",
+      source_url: "https://github.com/endurant-engine/endurant",
+      package: package(),
       deps: deps()
     ]
   end
@@ -27,7 +29,17 @@ defmodule Endurant.MixProject do
       {:ecto_sql, "~> 3.11"},
       {:postgrex, "~> 0.20"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
+      {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
+      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
+    ]
+  end
+
+  defp package do
+    [
+      licenses: ["MIT"],
+      links: %{
+        "GitHub" => "https://github.com/endurant-engine/endurant"
+      }
     ]
   end
 
