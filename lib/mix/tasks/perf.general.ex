@@ -1,23 +1,5 @@
 defmodule Mix.Tasks.Perf.General do
-  @moduledoc """
-  Runs a baseline end-to-end performance benchmark for Endurant.
-
-  This benchmark measures:
-  - Total wall time for insert + execute + complete
-  - Throughput (executions/sec)
-  - Latency percentiles (p50/p95/p99) from `execution_created` to `execution_completed`
-
-  Run in test env so Postgres test deps/config are available:
-
-      MIX_ENV=test mix perf.general
-
-  Options:
-  - `--count` number of executions per run (default: `1000`)
-  - `--repeats` number of runs (default: `5`)
-  - `--limit` queue limit (default: `8`)
-  - `--poll` queue poll interval ms (default: `50`)
-  - `--lease` lock lease ms (default: `30000`)
-  """
+  @moduledoc false
   use Mix.Task
   require Logger
 

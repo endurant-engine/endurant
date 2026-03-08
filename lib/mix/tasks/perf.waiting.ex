@@ -1,18 +1,5 @@
 defmodule Mix.Tasks.Perf.Waiting do
-  @moduledoc """
-  Measures runtime performance as DB waiting cardinality grows.
-
-  Metrics per step:
-  - signal->resume latency (p50/p95/p99)
-  - BEAM process count
-  - BEAM memory
-  - parked waiter count
-  - DB waiting row count
-
-  Run in test env:
-
-      MIX_ENV=test mix perf.waiting
-  """
+  @moduledoc false
   use Mix.Task
   require Logger
 
