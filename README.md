@@ -1,6 +1,88 @@
 # Endurant
 
-**TODO: Add description**
+## Description
+Endurant is a durable workflow engine where workflows are written as Elixir code. It has built-in retries, signals, and crash-safe recovery. It uses an event log and replays it during recovery to reconstruct workflow state.
+
+## Workflow Example: Shop Order With Vendor Choice
+
+```elixir
+defmodule MyApp.Workflows.ShopOrderWorkflow do
+  use Endurant.Workflow, version: "1"
+
+  workflow do
+    queue("orders")
+    unique_id(fn %{"order_id" => order_id} ->
+      "shop-order:#{order_id}"
+    end)
+  end
+
+  @impl Endurant.Workflow
+  def run(_version, input) do
+    vendors = Map.get(input, "vendors", ["shop_a", "shop_b", "shop_c"])
+
+    order =
+      task(input, "load_order", fn i ->
+        MyApp.Shop.load_order!(i["order_id"])
+      end)
+
+    shipping_h = task_async(order, "quote_shipping", &MyApp.Shop.quote_shipping!/1)
+    tax_h = task_async(order, "quote_tax", &MyApp.Shop.quote_tax!/1)
+
+    offers =
+      task_async_stream(
+        vendors,
+        fn vendor -> "offer:#{vendor}" end,
+        fn vendor -> MyApp.Marketplace.fetch_offer!(vendor, order) end,
+        max_concurrency: 5
+      )
+      |> Enum.map(fn {_task_key, offer} -> offer end)
+
+    totals = task_await_many([shipping_h, tax_h])
+
+    task({order, offers, totals}, "ask_user_to_choose_vendor", fn {o, candidate_offers, quoted} ->
+      MyApp.Shop.notify_vendor_options!(o, candidate_offers, quoted)
+      :ok
+    end)
+
+    # Expected signal payload: %{"vendor_id" => "shop_b"}
+    selection = wait_signal("vendor_selected")
+
+    chosen_offer =
+      task({offers, selection}, "pick_vendor", fn {candidate_offers, picked} ->
+        vendor_id = picked["vendor_id"]
+
+        Enum.find(candidate_offers, fn offer -> offer.vendor_id == vendor_id end) ||
+          raise("unknown vendor: #{vendor_id}")
+      end)
+
+    payment =
+      task(
+        {order, chosen_offer, totals},
+        "charge_payment",
+        fn {o, offer, t} ->
+          MyApp.Payments.charge!(
+            order: o,
+            vendor_offer: offer,
+            shipping: t["quote_shipping"],
+            tax: t["quote_tax"]
+          )
+        end,
+        retry: [max_attempts: 3, backoff: :exponential, base_ms: 200]
+      )
+
+    task({order, chosen_offer, payment}, "place_order", fn {o, offer, p} ->
+      MyApp.Shop.place_order!(o, offer, p)
+      %{
+        order_id: o.id,
+        vendor_id: offer.vendor_id,
+        payment_id: p.id,
+        status: "confirmed"
+      }
+    end)
+  end
+end
+```
+
 
 ## Migrations
 
@@ -51,35 +133,3 @@ def deps do
   ]
 end
 ```
-
-
-
-
-# TODO
-- look into SKIP LOCKED
-- dialyzer
-- do not run await, task in child process
-- update version of a runnig workflow
-- retrinking heartbeat, freezing executor processes
-- task ..., error_as_failure: true, or {:task_error, reason}/ add a task!
-- rollbacks (saga)
-- loglevel
-- maybe return {:new/cached, result} in tasks, source = task_source("fetch_user") # :executed or :history
-- is it possible to store any data in an input, not just json
-- recover_expired_locks, Heavy per-tick workload
-
-  task(input, "fetch_user", fn i -> Api.fetch!(i.id) end,
-    retry: [
-      max_attempts: 5,
-      retryable: fn error_or_reason ->
-        match?(%RuntimeError{}, error_or_reason)
-      end
-    ]
-  )
-- signal_wait_for(1000) stop process after this
-- add a default "suspense" time to queue settings and to workflow settings
-- workflow querying/filtering
-- add propper benchmarking
-- find a name for waiting processes that are "paused" or "suspended"
-- query/filter workflows, use temporal system, register custom properties to create indicies
-- globally handling prefix and repo
