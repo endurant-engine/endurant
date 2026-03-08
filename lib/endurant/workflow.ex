@@ -60,13 +60,7 @@ defmodule Endurant.Workflow do
   @callback run(version(), input()) :: result()
 
   # DSL
-  @doc """
-  Injects workflow DSL and behaviour.
-
-  ## Options
-
-    * `:version` - workflow version string (default `"1"`)
-  """
+  @doc false
   defmacro __using__(opts) do
     version = Keyword.get(opts, :version, "1")
 

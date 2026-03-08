@@ -11,6 +11,7 @@ defmodule Endurant.MixProject do
       dialyzer: [plt_add_apps: [:mix]],
       description: "Durable workflow engine for Elixir",
       source_url: "https://github.com/endurant-engine/endurant",
+      docs: docs(),
       package: package(),
       deps: deps()
     ]
@@ -40,6 +41,37 @@ defmodule Endurant.MixProject do
       links: %{
         "GitHub" => "https://github.com/endurant-engine/endurant"
       }
+    ]
+  end
+
+  defp docs do
+    introduction = [
+      "docs/introduction/overview.md",
+      "docs/introduction/installation.md",
+      "docs/introduction/up-and-running.md"
+    ]
+
+    concepts = [
+      "docs/concepts/tasks.md",
+      "docs/concepts/signals.md",
+      "docs/concepts/sleep.md",
+      "docs/concepts/async.md"
+    ]
+
+    advanced = [
+      "docs/advanced/internals.md",
+      "docs/advanced/parking.md",
+      "docs/state_machine.md"
+    ]
+
+    [
+      main: "overview",
+      extras: introduction ++ concepts ++ advanced,
+      groups_for_extras: [
+        Introduction: introduction,
+        Concepts: concepts,
+        Advanced: advanced
+      ]
     ]
   end
 
