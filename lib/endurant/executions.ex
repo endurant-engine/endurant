@@ -12,6 +12,8 @@ defmodule Endurant.Executions do
           status: atom(),
           version: String.t()
         }
+  @type claim_ready_branch :: :continuable | :waiting_ready
+  @type recover_runnable_branch :: :running | :continuable | :waiting_ready
 
   @doc """
   Inserts a new execution in `pending` state and appends `:execution_created`.
@@ -811,44 +813,20 @@ defmodule Endurant.Executions do
     repo = repo!(opts)
     prefix = Keyword.get(opts, :prefix, @default_prefix)
     queue = normalize_queue(queue)
-
-    sql = """
-    WITH candidate AS (
-      SELECT
-        e.id
-      FROM #{prefix}.endurant_executions e
-      WHERE e.queue = $1
-      AND (
-        e.status = 'continuable'::#{prefix}.endurant_execution_status
-        OR (
-          e.status = 'waiting'::#{prefix}.endurant_execution_status
-          AND e.waiting_until IS NOT NULL
-          AND e.waiting_until <= timezone('UTC', now())
-        )
-      )
-      AND e.locked_by IS NULL
-      ORDER BY inserted_at ASC, id ASC
-      LIMIT $2
-      FOR UPDATE SKIP LOCKED
-    )
-    UPDATE #{prefix}.endurant_executions e
-    SET
-      status = 'running'::#{prefix}.endurant_execution_status,
-      waiting_until = NULL,
-      locked_by = $3,
-      locked_until = timezone('UTC', now()) + ($4::int * interval '1 millisecond'),
-      updated_at = timezone('UTC', now())
-    FROM candidate
-    WHERE e.id = candidate.id
-    RETURNING e.id, e.workflow_name, e.input, e.version
-    """
+    branch_order = claim_ready_branch_order(opts)
 
     case repo.transaction(
            fn ->
-             rows =
-               repo
-               |> query!(sql, [queue, limit, worker_id, lease_ms])
-               |> Map.fetch!(:rows)
+             {rows, _remaining} =
+               Enum.reduce(branch_order, {[], limit}, fn branch, {acc, remaining} ->
+                 if remaining <= 0 do
+                   {acc, 0}
+                 else
+                   sql = claim_ready_waiting_sql(prefix, branch)
+                   branch_rows = query!(repo, sql, [queue, remaining, worker_id, lease_ms]).rows
+                   {acc ++ branch_rows, max(remaining - length(branch_rows), 0)}
+                 end
+               end)
 
              Enum.map(rows, fn [id, workflow_name, input, version] ->
                execution = %{
@@ -1185,69 +1163,18 @@ defmodule Endurant.Executions do
             Events.append(to_app_id(id), :execution_cancelled, %{}, opts)
           end)
 
-          abandon_sql = """
-          WITH expired_runnable AS (
-            SELECT
-              e.id,
-              e.locked_until,
-              (
-                e.status IN (
-                  'waiting'::#{prefix}.endurant_execution_status,
-                  'continuable'::#{prefix}.endurant_execution_status
-                )
-                AND e.locked_by IS NULL
-              ) AS pre_orphaned_waiting,
-              EXISTS (
-                SELECT 1
-                FROM #{prefix}.endurant_events ae
-                WHERE ae.execution_id = e.id
-                AND ae.type = 'execution_abandoned'::#{prefix}.endurant_event_type
-              ) AS has_abandoned_event
-            FROM #{prefix}.endurant_executions e
-            WHERE
-              ($1::text IS NULL OR e.queue = $1)
-              AND
-              (
-                e.status = 'running'::#{prefix}.endurant_execution_status
-                AND e.locked_until IS NOT NULL
-                AND e.locked_until <= timezone('UTC', now())
-              )
-              OR (
-                e.status = 'continuable'::#{prefix}.endurant_execution_status
-                AND e.locked_by IS NOT NULL
-                AND e.locked_until IS NOT NULL
-                AND e.locked_until <= timezone('UTC', now())
-              )
-              OR (
-                e.status = 'waiting'::#{prefix}.endurant_execution_status
-                AND (
-                  e.waiting_until IS NOT NULL
-                  AND e.waiting_until <= timezone('UTC', now())
-                )
-                AND e.locked_until IS NOT NULL
-                AND e.locked_until <= timezone('UTC', now())
-              )
-            ORDER BY e.locked_until ASC
-            LIMIT $2
-            FOR UPDATE SKIP LOCKED
-          )
-          UPDATE #{prefix}.endurant_executions e
-          SET
-            status = 'abandoned'::#{prefix}.endurant_execution_status,
-            waiting_until = NULL,
-            locked_by = NULL,
-            locked_until = NULL,
-            updated_at = timezone('UTC', now())
-          FROM expired_runnable
-          WHERE e.id = expired_runnable.id
-          RETURNING
-            e.id,
-            expired_runnable.locked_until,
-            expired_runnable.pre_orphaned_waiting,
-            expired_runnable.has_abandoned_event
-          """
+          recover_order = recover_runnable_branch_order(opts)
 
-          rows = query!(repo, abandon_sql, [queue, limit]).rows
+          {rows, _remaining} =
+            Enum.reduce(recover_order, {[], limit}, fn branch, {acc, remaining} ->
+              if remaining <= 0 do
+                {acc, 0}
+              else
+                sql = recover_runnable_sql(prefix, branch)
+                branch_rows = query!(repo, sql, [queue, remaining]).rows
+                {acc ++ branch_rows, max(remaining - length(branch_rows), 0)}
+              end
+            end)
 
           Enum.each(rows, fn [id, locked_until, pre_orphaned_waiting, has_abandoned_event] ->
             # Rows that were already orphaned may already have an abandoned event.
@@ -1287,6 +1214,216 @@ defmodule Endurant.Executions do
       end
 
     length(abandoned_rows)
+  end
+
+  @spec claim_ready_branch_order(keyword()) :: [claim_ready_branch()]
+  defp claim_ready_branch_order(opts) do
+    default_order = [:continuable, :waiting_ready]
+    configured_order = Keyword.get(opts, :claim_order, default_order)
+
+    case configured_order do
+      [first, second] = order ->
+        if first != second and MapSet.new(order) == MapSet.new(default_order) do
+          order
+        else
+          default_order
+        end
+
+      _ ->
+        default_order
+    end
+  end
+
+  @spec claim_ready_waiting_sql(String.t(), claim_ready_branch()) :: String.t()
+  defp claim_ready_waiting_sql(prefix, :continuable) do
+    """
+    WITH candidate AS (
+      SELECT e.id
+      FROM #{prefix}.endurant_executions e
+      WHERE e.queue = $1
+      AND e.status = 'continuable'::#{prefix}.endurant_execution_status
+      AND e.locked_by IS NULL
+      ORDER BY e.inserted_at ASC, e.id ASC
+      LIMIT $2
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE #{prefix}.endurant_executions e
+    SET
+      status = 'running'::#{prefix}.endurant_execution_status,
+      waiting_until = NULL,
+      locked_by = $3,
+      locked_until = timezone('UTC', now()) + ($4::int * interval '1 millisecond'),
+      updated_at = timezone('UTC', now())
+    FROM candidate
+    WHERE e.id = candidate.id
+    RETURNING e.id, e.workflow_name, e.input, e.version
+    """
+  end
+
+  defp claim_ready_waiting_sql(prefix, :waiting_ready) do
+    """
+    WITH candidate AS (
+      SELECT e.id
+      FROM #{prefix}.endurant_executions e
+      WHERE e.queue = $1
+      AND e.status = 'waiting'::#{prefix}.endurant_execution_status
+      AND e.waiting_until IS NOT NULL
+      AND e.waiting_until <= timezone('UTC', now())
+      AND e.locked_by IS NULL
+      ORDER BY e.inserted_at ASC, e.id ASC
+      LIMIT $2
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE #{prefix}.endurant_executions e
+    SET
+      status = 'running'::#{prefix}.endurant_execution_status,
+      waiting_until = NULL,
+      locked_by = $3,
+      locked_until = timezone('UTC', now()) + ($4::int * interval '1 millisecond'),
+      updated_at = timezone('UTC', now())
+    FROM candidate
+    WHERE e.id = candidate.id
+    RETURNING e.id, e.workflow_name, e.input, e.version
+    """
+  end
+
+  @spec recover_runnable_branch_order(keyword()) :: [recover_runnable_branch()]
+  defp recover_runnable_branch_order(opts) do
+    default_order = [:running, :continuable, :waiting_ready]
+    configured_order = Keyword.get(opts, :recover_order, default_order)
+
+    case configured_order do
+      [a, b, c] = order ->
+        if a != b and b != c and a != c and MapSet.new(order) == MapSet.new(default_order) do
+          order
+        else
+          default_order
+        end
+
+      _ ->
+        default_order
+    end
+  end
+
+  @spec recover_runnable_sql(String.t(), recover_runnable_branch()) :: String.t()
+  defp recover_runnable_sql(prefix, :running) do
+    """
+    WITH expired_running AS (
+      SELECT
+        e.id,
+        e.locked_until,
+        FALSE AS pre_orphaned_waiting,
+        EXISTS (
+          SELECT 1
+          FROM #{prefix}.endurant_events ae
+          WHERE ae.execution_id = e.id
+          AND ae.type = 'execution_abandoned'::#{prefix}.endurant_event_type
+        ) AS has_abandoned_event
+      FROM #{prefix}.endurant_executions e
+      WHERE ($1::text IS NULL OR e.queue = $1)
+      AND e.status = 'running'::#{prefix}.endurant_execution_status
+      AND e.locked_until IS NOT NULL
+      AND e.locked_until <= timezone('UTC', now())
+      ORDER BY e.locked_until ASC
+      LIMIT $2
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE #{prefix}.endurant_executions e
+    SET
+      status = 'abandoned'::#{prefix}.endurant_execution_status,
+      waiting_until = NULL,
+      locked_by = NULL,
+      locked_until = NULL,
+      updated_at = timezone('UTC', now())
+    FROM expired_running
+    WHERE e.id = expired_running.id
+    RETURNING
+      e.id,
+      expired_running.locked_until,
+      expired_running.pre_orphaned_waiting,
+      expired_running.has_abandoned_event
+    """
+  end
+
+  defp recover_runnable_sql(prefix, :continuable) do
+    """
+    WITH expired_continuable AS (
+      SELECT
+        e.id,
+        e.locked_until,
+        FALSE AS pre_orphaned_waiting,
+        EXISTS (
+          SELECT 1
+          FROM #{prefix}.endurant_events ae
+          WHERE ae.execution_id = e.id
+          AND ae.type = 'execution_abandoned'::#{prefix}.endurant_event_type
+        ) AS has_abandoned_event
+      FROM #{prefix}.endurant_executions e
+      WHERE ($1::text IS NULL OR e.queue = $1)
+      AND e.status = 'continuable'::#{prefix}.endurant_execution_status
+      AND e.locked_by IS NOT NULL
+      AND e.locked_until IS NOT NULL
+      AND e.locked_until <= timezone('UTC', now())
+      ORDER BY e.locked_until ASC
+      LIMIT $2
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE #{prefix}.endurant_executions e
+    SET
+      status = 'abandoned'::#{prefix}.endurant_execution_status,
+      waiting_until = NULL,
+      locked_by = NULL,
+      locked_until = NULL,
+      updated_at = timezone('UTC', now())
+    FROM expired_continuable
+    WHERE e.id = expired_continuable.id
+    RETURNING
+      e.id,
+      expired_continuable.locked_until,
+      expired_continuable.pre_orphaned_waiting,
+      expired_continuable.has_abandoned_event
+    """
+  end
+
+  defp recover_runnable_sql(prefix, :waiting_ready) do
+    """
+    WITH expired_waiting_ready AS (
+      SELECT
+        e.id,
+        e.locked_until,
+        (e.locked_by IS NULL) AS pre_orphaned_waiting,
+        EXISTS (
+          SELECT 1
+          FROM #{prefix}.endurant_events ae
+          WHERE ae.execution_id = e.id
+          AND ae.type = 'execution_abandoned'::#{prefix}.endurant_event_type
+        ) AS has_abandoned_event
+      FROM #{prefix}.endurant_executions e
+      WHERE ($1::text IS NULL OR e.queue = $1)
+      AND e.status = 'waiting'::#{prefix}.endurant_execution_status
+      AND e.waiting_until IS NOT NULL
+      AND e.waiting_until <= timezone('UTC', now())
+      AND e.locked_until IS NOT NULL
+      AND e.locked_until <= timezone('UTC', now())
+      ORDER BY e.locked_until ASC
+      LIMIT $2
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE #{prefix}.endurant_executions e
+    SET
+      status = 'abandoned'::#{prefix}.endurant_execution_status,
+      waiting_until = NULL,
+      locked_by = NULL,
+      locked_until = NULL,
+      updated_at = timezone('UTC', now())
+    FROM expired_waiting_ready
+    WHERE e.id = expired_waiting_ready.id
+    RETURNING
+      e.id,
+      expired_waiting_ready.locked_until,
+      expired_waiting_ready.pre_orphaned_waiting,
+      expired_waiting_ready.has_abandoned_event
+    """
   end
 
   @spec normalize_queue_option(nil | atom() | String.t()) :: nil | String.t()
