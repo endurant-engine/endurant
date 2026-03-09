@@ -6,6 +6,7 @@ defmodule Endurant.QueueManager do
   defstruct [
     :queue,
     :opts,
+    tick: 0,
     running: %{},
     parked: %{},
     ready: :queue.new()
@@ -14,10 +15,14 @@ defmodule Endurant.QueueManager do
   @type state :: %__MODULE__{
           queue: atom(),
           opts: keyword(),
+          tick: non_neg_integer(),
           running: %{reference() => %{execution_id: term(), pid: pid()}},
           parked: %{reference() => %{execution_id: term(), pid: pid(), ready?: boolean()}},
           ready: :queue.queue(reference())
         }
+
+  @type claim_branch :: :continuable | :waiting_ready
+  @type recover_branch :: :running | :continuable | :waiting_ready
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) when is_list(opts) do
@@ -39,7 +44,11 @@ defmodule Endurant.QueueManager do
 
   @impl true
   def handle_info(:tick, %__MODULE__{} = state) do
-    recover_opts = Keyword.put(state.opts, :queue, state.queue)
+    recover_opts =
+      state.opts
+      |> Keyword.put(:queue, state.queue)
+      |> Keyword.put(:recover_order, recover_order_for_tick(state.tick))
+
     _ = Endurant.Executions.recover_expired_locks(recovery_limit(state.opts), recover_opts)
     state = promote_db_ready_waiters(state)
     worker_id = worker_id(state.queue)
@@ -49,12 +58,14 @@ defmodule Endurant.QueueManager do
 
     ready_waiting =
       if capacity_after_resume > 0 do
+        claim_opts = Keyword.put(state.opts, :claim_order, claim_order_for_tick(state.tick))
+
         Endurant.Executions.claim_ready_waiting(
           state.queue,
           capacity_after_resume,
           worker_id,
           lease_ms(state.opts),
-          state.opts
+          claim_opts
         )
       else
         []
@@ -80,7 +91,10 @@ defmodule Endurant.QueueManager do
 
     running = spawn_executions(executions, running_after_waiting, worker_id, self(), state.opts)
 
-    state = Map.put(state, :running, running)
+    state =
+      state
+      |> Map.put(:running, running)
+      |> Map.update!(:tick, &(&1 + 1))
 
     Process.send_after(self(), :tick, poll_interval(state.opts))
     {:noreply, state}
@@ -319,6 +333,24 @@ defmodule Endurant.QueueManager do
 
   @spec recovery_limit(keyword()) :: pos_integer()
   defp recovery_limit(opts), do: Keyword.get(opts, :recovery_limit, 100)
+
+  @spec claim_order_for_tick(non_neg_integer()) :: [claim_branch()]
+  defp claim_order_for_tick(tick) do
+    if rem(tick, 2) == 0 do
+      [:continuable, :waiting_ready]
+    else
+      [:waiting_ready, :continuable]
+    end
+  end
+
+  @spec recover_order_for_tick(non_neg_integer()) :: [recover_branch()]
+  defp recover_order_for_tick(tick) do
+    case rem(tick, 3) do
+      0 -> [:running, :continuable, :waiting_ready]
+      1 -> [:continuable, :waiting_ready, :running]
+      _ -> [:waiting_ready, :running, :continuable]
+    end
+  end
 
   @spec worker_id(atom()) :: String.t()
   defp worker_id(queue), do: "#{node()}:#{queue}"

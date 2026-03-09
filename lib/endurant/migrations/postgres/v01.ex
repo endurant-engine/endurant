@@ -84,17 +84,60 @@ defmodule Endurant.Migrations.Postgres.V01 do
     )
     """)
 
-    create_if_not_exists(index(:endurant_executions, [:status], prefix: prefix))
-
     create_if_not_exists(
-      index(:endurant_executions, [:queue, :status, :inserted_at], prefix: prefix)
+      index(:endurant_executions, [:queue, :inserted_at, :id],
+        name: :endurant_executions_claim_pending_idx,
+        where: "status IN ('pending', 'abandoned')",
+        prefix: prefix
+      )
     )
 
-    create_if_not_exists(index(:endurant_executions, [:status, :waiting_until], prefix: prefix))
-    create_if_not_exists(index(:endurant_executions, [:locked_until], prefix: prefix))
+    create_if_not_exists(
+      index(:endurant_executions, [:queue, :inserted_at, :id],
+        name: :endurant_executions_claim_continuable_idx,
+        where: "status = 'continuable' AND locked_by IS NULL",
+        prefix: prefix
+      )
+    )
 
     create_if_not_exists(
-      index(:endurant_executions, [:workflow_name, :inserted_at], prefix: prefix)
+      index(:endurant_executions, [:queue, :waiting_until, :inserted_at, :id],
+        name: :endurant_executions_claim_waiting_ready_idx,
+        where: "status = 'waiting' AND waiting_until IS NOT NULL AND locked_by IS NULL",
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_executions, [:queue, :locked_until, :id],
+        name: :endurant_executions_recover_waiting_idx,
+        where: "status = 'waiting' AND locked_until IS NOT NULL",
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_executions, [:queue, :locked_until, :id],
+        name: :endurant_executions_recover_running_idx,
+        where: "status = 'running' AND locked_until IS NOT NULL",
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_executions, [:queue, :locked_until, :id],
+        name: :endurant_executions_recover_continuable_idx,
+        where: "status = 'continuable' AND locked_by IS NOT NULL AND locked_until IS NOT NULL",
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_executions, [:queue, :locked_until, :id],
+        name: :endurant_executions_recover_cancelling_idx,
+        where: "status = 'cancelling' AND locked_until IS NOT NULL",
+        prefix: prefix
+      )
     )
 
     create_if_not_exists table(:endurant_events, primary_key: false, prefix: prefix) do
@@ -124,22 +167,63 @@ defmodule Endurant.Migrations.Postgres.V01 do
       unique_index(:endurant_events, [:execution_id, :sequence], prefix: prefix)
     )
 
-    create_if_not_exists(index(:endurant_events, [:execution_id, :inserted_at], prefix: prefix))
-
     :ok
   end
 
   @spec down(map()) :: :ok
   def down(%{prefix: prefix, quoted_prefix: quoted}) do
-    drop_if_exists(index(:endurant_events, [:execution_id, :inserted_at], prefix: prefix))
     drop_if_exists(index(:endurant_events, [:execution_id, :sequence], prefix: prefix))
     drop_if_exists(table(:endurant_events, prefix: prefix))
 
-    drop_if_exists(index(:endurant_executions, [:workflow_name, :inserted_at], prefix: prefix))
-    drop_if_exists(index(:endurant_executions, [:queue, :status, :inserted_at], prefix: prefix))
-    drop_if_exists(index(:endurant_executions, [:status, :waiting_until], prefix: prefix))
-    drop_if_exists(index(:endurant_executions, [:locked_until], prefix: prefix))
-    drop_if_exists(index(:endurant_executions, [:status], prefix: prefix))
+    drop_if_exists(
+      index(:endurant_executions, [:queue, :locked_until, :id],
+        name: :endurant_executions_recover_cancelling_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_executions, [:queue, :locked_until, :id],
+        name: :endurant_executions_recover_continuable_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_executions, [:queue, :locked_until, :id],
+        name: :endurant_executions_recover_running_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_executions, [:queue, :locked_until, :id],
+        name: :endurant_executions_recover_waiting_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_executions, [:queue, :waiting_until, :inserted_at, :id],
+        name: :endurant_executions_claim_waiting_ready_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_executions, [:queue, :inserted_at, :id],
+        name: :endurant_executions_claim_continuable_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_executions, [:queue, :inserted_at, :id],
+        name: :endurant_executions_claim_pending_idx,
+        prefix: prefix
+      )
+    )
+
     execute("DROP INDEX IF EXISTS #{quoted}.endurant_executions_one_open_unique_idx")
     drop_if_exists(table(:endurant_executions, prefix: prefix))
     execute("DROP TYPE IF EXISTS #{quoted}.endurant_event_type")

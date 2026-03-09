@@ -34,32 +34,7 @@ defmodule Endurant.Events do
     type = normalize_type(type)
     payload = payload || %{}
 
-    sql = """
-    WITH locked_execution AS (
-      SELECT id
-      FROM #{prefix}.endurant_executions
-      WHERE id = $1
-      FOR UPDATE
-    ),
-    next_sequence AS (
-      SELECT
-        COALESCE(MAX(sequence) + 1, 1) AS value
-      FROM #{prefix}.endurant_events
-      WHERE execution_id = $1
-    )
-    INSERT INTO #{prefix}.endurant_events (execution_id, sequence, type, payload, inserted_at)
-    SELECT
-      $1,
-      next_sequence.value,
-      $2::#{prefix}.endurant_event_type,
-      $3,
-      timezone('UTC', now())
-    FROM locked_execution, next_sequence
-    """
-
-    params = [execution_id, type, payload]
-
-    do_append(repo, sql, params, execution_id, 0)
+    do_append(repo, prefix, execution_id, type, payload, 0)
   end
 
   @doc """
@@ -87,35 +62,7 @@ defmodule Endurant.Events do
     type = normalize_type(type)
     payload = payload || %{}
 
-    sql = """
-    WITH locked_execution AS (
-      SELECT id
-      FROM #{prefix}.endurant_executions
-      WHERE id = $1
-      AND status = 'running'::#{prefix}.endurant_execution_status
-      AND locked_by = $2
-      AND locked_until IS NOT NULL
-      AND locked_until > timezone('UTC', now())
-      FOR UPDATE
-    ),
-    next_sequence AS (
-      SELECT
-        COALESCE(MAX(sequence) + 1, 1) AS value
-      FROM #{prefix}.endurant_events
-      WHERE execution_id = $1
-    )
-    INSERT INTO #{prefix}.endurant_events (execution_id, sequence, type, payload, inserted_at)
-    SELECT
-      $1,
-      next_sequence.value,
-      $3::#{prefix}.endurant_event_type,
-      $4,
-      timezone('UTC', now())
-    FROM locked_execution, next_sequence
-    """
-
-    params = [execution_id, worker_id, type, payload]
-    do_append_if_running(repo, sql, params, 0)
+    do_append_if_running(repo, prefix, execution_id, worker_id, type, payload, 0)
   end
 
   @doc """
@@ -200,38 +147,129 @@ defmodule Endurant.Events do
 
   @max_append_retries 5
 
-  @spec do_append(module(), iodata(), list(), binary(), non_neg_integer()) :: :ok
-  defp do_append(repo, sql, params, execution_id, retries) when retries <= @max_append_retries do
-    case repo.query!(sql, params, log: false).num_rows do
-      1 ->
+  @spec do_append(module(), String.t(), binary(), String.t(), map(), non_neg_integer()) :: :ok
+  defp do_append(repo, prefix, execution_id, type, payload, retries)
+       when retries <= @max_append_retries do
+    lock_sql = lock_execution_for_append_sql(prefix)
+    insert_sql = insert_event_with_max_sequence_sql(prefix)
+
+    case repo.transaction(
+           fn ->
+             case query!(repo, lock_sql, [execution_id]).num_rows do
+               1 ->
+                 case query!(repo, insert_sql, [execution_id, type, payload]).num_rows do
+                   1 -> :ok
+                   _ -> repo.rollback(:execution_not_found)
+                 end
+
+               _ ->
+                 repo.rollback(:execution_not_found)
+             end
+           end,
+           log: false
+         ) do
+      {:ok, :ok} ->
         :ok
 
-      _ ->
+      {:error, :execution_not_found} ->
         raise ArgumentError, "execution not found: #{inspect(to_app_id(execution_id))}"
     end
   rescue
     error ->
       if unique_sequence_violation?(error) and retries < @max_append_retries do
-        do_append(repo, sql, params, execution_id, retries + 1)
+        do_append(repo, prefix, execution_id, type, payload, retries + 1)
       else
         reraise(error, __STACKTRACE__)
       end
   end
 
-  @spec do_append_if_running(module(), iodata(), list(), non_neg_integer()) ::
+  @spec do_append_if_running(
+          module(),
+          String.t(),
+          binary(),
+          String.t(),
+          String.t(),
+          map(),
+          non_neg_integer()
+        ) ::
           :ok | {:error, :not_running}
-  defp do_append_if_running(repo, sql, params, retries) when retries <= @max_append_retries do
-    case repo.query!(sql, params, log: false).num_rows do
-      1 -> :ok
-      _ -> {:error, :not_running}
+  defp do_append_if_running(repo, prefix, execution_id, worker_id, type, payload, retries)
+       when retries <= @max_append_retries do
+    lock_sql = lock_execution_for_owned_append_sql(prefix)
+    insert_sql = insert_event_with_max_sequence_sql(prefix)
+
+    case repo.transaction(
+           fn ->
+             case query!(repo, lock_sql, [execution_id, worker_id]).num_rows do
+               1 ->
+                 case query!(repo, insert_sql, [execution_id, type, payload]).num_rows do
+                   1 -> :ok
+                   _ -> repo.rollback(:not_running)
+                 end
+
+               _ ->
+                 repo.rollback(:not_running)
+             end
+           end,
+           log: false
+         ) do
+      {:ok, :ok} -> :ok
+      {:error, :not_running} -> {:error, :not_running}
     end
   rescue
     error ->
       if unique_sequence_violation?(error) and retries < @max_append_retries do
-        do_append_if_running(repo, sql, params, retries + 1)
+        do_append_if_running(
+          repo,
+          prefix,
+          execution_id,
+          worker_id,
+          type,
+          payload,
+          retries + 1
+        )
       else
         reraise(error, __STACKTRACE__)
       end
+  end
+
+  @spec lock_execution_for_append_sql(String.t()) :: String.t()
+  defp lock_execution_for_append_sql(prefix) do
+    """
+    SELECT id
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    FOR UPDATE
+    """
+  end
+
+  @spec lock_execution_for_owned_append_sql(String.t()) :: String.t()
+  defp lock_execution_for_owned_append_sql(prefix) do
+    """
+    SELECT id
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    AND status = 'running'::#{prefix}.endurant_execution_status
+    AND locked_by = $2
+    AND locked_until IS NOT NULL
+    AND locked_until > timezone('UTC', now())
+    FOR UPDATE
+    """
+  end
+
+  @spec insert_event_with_max_sequence_sql(String.t()) :: String.t()
+  defp insert_event_with_max_sequence_sql(prefix) do
+    """
+    INSERT INTO #{prefix}.endurant_events (execution_id, sequence, type, payload, inserted_at)
+    SELECT
+      $1,
+      COALESCE(MAX(sequence) + 1, 1),
+      $2::#{prefix}.endurant_event_type,
+      $3,
+      timezone('UTC', now())
+    FROM #{prefix}.endurant_events
+    WHERE execution_id = $1
+    """
   end
 
   @spec unique_sequence_violation?(Exception.t()) :: boolean()
