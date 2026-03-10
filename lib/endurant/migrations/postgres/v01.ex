@@ -84,6 +84,36 @@ defmodule Endurant.Migrations.Postgres.V01 do
     )
     """)
 
+    # Indexes for execution list/filter queries.
+    create_if_not_exists(
+      index(:endurant_executions, [:unique_id],
+        name: :endurant_executions_unique_id_lookup_idx,
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_executions, [:inserted_at, :id],
+        name: :endurant_executions_recent_idx,
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_executions, [:status, :inserted_at, :id],
+        name: :endurant_executions_status_recent_idx,
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_executions, [:queue, :inserted_at, :id],
+        name: :endurant_executions_queue_recent_idx,
+        prefix: prefix
+      )
+    )
+
+    # Runtime claim/recovery indexes used by queue manager internals.
     create_if_not_exists(
       index(:endurant_executions, [:queue, :inserted_at, :id],
         name: :endurant_executions_claim_pending_idx,
@@ -220,6 +250,35 @@ defmodule Endurant.Migrations.Postgres.V01 do
     drop_if_exists(
       index(:endurant_executions, [:queue, :inserted_at, :id],
         name: :endurant_executions_claim_pending_idx,
+        prefix: prefix
+      )
+    )
+
+    # Drop list/filter query indexes.
+    drop_if_exists(
+      index(:endurant_executions, [:queue, :inserted_at, :id],
+        name: :endurant_executions_queue_recent_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_executions, [:status, :inserted_at, :id],
+        name: :endurant_executions_status_recent_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_executions, [:inserted_at, :id],
+        name: :endurant_executions_recent_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_executions, [:unique_id],
+        name: :endurant_executions_unique_id_lookup_idx,
         prefix: prefix
       )
     )
