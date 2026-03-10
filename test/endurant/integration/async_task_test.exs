@@ -1,9 +1,9 @@
 defmodule Endurant.Integration.AsyncTaskTest do
   use Endurant.TestSupport.IntegrationCase
 
-  test "task_async + task_await_many runs and commits deterministically", %{
+  test("task_async + task_await_many runs and commits deterministically", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.AsyncTaskTest.ManyWorkflow do
@@ -45,21 +45,23 @@ defmodule Endurant.Integration.AsyncTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.AsyncTaskTest.ManyWorkflow,
-               %{id: "m1"},
-               runtime_opts
+               %{id: "m1"}
              )
 
     assert {:ok, %{status: :completed, result: result}} =
-             PostgresHelper.wait_for_execution!(execution.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
 
     assert result == %{id: "m1", fast: 1, slow: 2}
-
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.count(events, &(&1.type == :task_completed)) == 3
   end
 
-  test "task_await handles async failures with retry policy", %{runtime_opts: runtime_opts} do
+  test("task_await handles async failures with retry policy", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.AsyncTaskTest.RetryWorkflow do
@@ -76,9 +78,7 @@ defmodule Endurant.Integration.AsyncTaskTest do
               task_async(
                 nil,
                 "issue_invoice",
-                fn _ ->
-                  Endurant.TestSupport.WorkflowHelpers.RetryGate.issue(input["id"])
-                end,
+                fn _ -> Endurant.TestSupport.WorkflowHelpers.RetryGate.issue(input["id"]) end,
                 retry: [max_attempts: 2, base_ms: 20]
               )
 
@@ -99,22 +99,24 @@ defmodule Endurant.Integration.AsyncTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.AsyncTaskTest.RetryWorkflow,
-               %{id: "r1"},
-               runtime_opts
+               %{id: "r1"}
              )
 
     assert {:ok, %{status: :completed, result: result}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     assert result == %{status: :issued, order_id: "r1"}
-
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.count(events, &(&1.type == :task_failed)) >= 1
     assert Enum.count(events, &(&1.type == :task_completed)) >= 1
   end
 
-  test "task_async_stream fails on duplicate task keys", %{runtime_opts: runtime_opts} do
+  test("task_async_stream fails on duplicate task keys", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.AsyncTaskTest.StreamDuplicateWorkflow do
@@ -136,18 +138,21 @@ defmodule Endurant.Integration.AsyncTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.AsyncTaskTest.StreamDuplicateWorkflow,
-               %{id: "s1"},
-               runtime_opts
+               %{id: "s1"}
              )
 
     assert {:ok, %{status: :failed, result: error}} =
-             PostgresHelper.wait_for_execution!(execution.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
 
     assert Map.get(error, "message", "") =~ "task_async_stream requires unique task keys"
   end
 
-  test "task_await_many fails execution when an async task crashes", %{runtime_opts: runtime_opts} do
+  test("task_await_many fails execution when an async task crashes", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.AsyncTaskTest.FailWorkflow do
@@ -160,10 +165,7 @@ defmodule Endurant.Integration.AsyncTaskTest do
 
           @impl Endurant.Workflow
           def run(_version, _input) do
-            bad =
-              task_async(nil, "bad", fn _ ->
-                raise "boom"
-              end)
+            bad = task_async(nil, "bad", fn _ -> raise "boom" end)
 
             good =
               task_async(nil, "good", fn _ ->
@@ -180,16 +182,18 @@ defmodule Endurant.Integration.AsyncTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.AsyncTaskTest.FailWorkflow,
-               %{id: "f1"},
-               runtime_opts
+               %{id: "f1"}
              )
 
     assert {:ok, %{status: :failed, result: error}} =
-             PostgresHelper.wait_for_execution!(execution.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
 
     assert (Map.get(error, "message") || Map.get(error, "reason") || inspect(error)) =~ "boom"
-
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.count(events, &(&1.type == :task_failed)) >= 1
   end

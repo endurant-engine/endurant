@@ -1,7 +1,7 @@
 defmodule Endurant.Integration.PipeTaskTest do
   use Endurant.TestSupport.IntegrationCase
 
-  test "workflow DX: pipe tasks with fn and capture forms", %{runtime_opts: runtime_opts} do
+  test("workflow DX: pipe tasks with fn and capture forms", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.PipeTaskTest.PipeWorkflow do
@@ -18,9 +18,7 @@ defmodule Endurant.Integration.PipeTaskTest do
             |> task("fetch_user", fn i ->
               Endurant.TestSupport.WorkflowHelpers.Accounts.fetch_user(i["user_id"])
             end)
-            |> task("mark_premium", fn user ->
-              Map.put(user, :kind, :pipe)
-            end)
+            |> task("mark_premium", fn user -> Map.put(user, :kind, :pipe) end)
             |> task("persist", &Map.put(&1, :saved, true), retry: [max_attempts: 2])
           end
         end
@@ -30,13 +28,16 @@ defmodule Endurant.Integration.PipeTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.PipeTaskTest.PipeWorkflow,
-               %{user_id: "u-9"},
-               runtime_opts
+               %{user_id: "u-9"}
              )
 
     assert {:ok, %{status: :completed, result: result}} =
-             PostgresHelper.wait_for_execution!(execution.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
 
     assert result == %{id: "u-9", premium: true, kind: :pipe, saved: true}
   end

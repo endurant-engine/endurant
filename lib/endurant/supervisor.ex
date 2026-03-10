@@ -3,84 +3,79 @@ defmodule Endurant.Supervisor do
 
   use Supervisor
 
+  alias Endurant.Config
+  alias Endurant.Registry
+
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts) when is_list(opts) do
-    name = require_name!(opts)
-    validate_name!(name)
-    opts = Keyword.put(opts, :name, name)
+    Registry.ensure_started()
+    config = build_config!(opts)
 
-    Supervisor.start_link(__MODULE__, opts, name: supervisor_name(name))
+    case Registry.supervisor_pid(config.name) do
+      nil ->
+        Supervisor.start_link(__MODULE__, config)
+
+      pid ->
+        {:error, {:already_started, pid}}
+    end
   end
 
   @impl true
-  def init(opts) do
-    queues = Keyword.get(opts, :queues, default: [limit: 1])
-    validate_unique_queues!(queues)
-    instance = Keyword.fetch!(opts, :name)
+  def init(%Config{} = config) do
+    case Registry.register_supervisor(config.name, self()) do
+      :ok ->
+        :ok
+
+      {:error, {:already_started, pid}} ->
+        raise "endurant instance #{inspect(config.name)} is already started at #{inspect(pid)}"
+    end
+
+    :ok = Registry.put_config(config)
 
     children =
-      Enum.map(queues, fn {queue, queue_opts} ->
+      Enum.map(config.queues, fn {queue, queue_opts} ->
         %{
           id: {:queue_manager, queue},
           start:
             {Endurant.QueueManager, :start_link,
-             [[name: queue_manager_name(instance, queue), queue: queue, opts: queue_opts]]}
+             [[instance: config.name, queue: queue, opts: queue_opts]]}
         }
       end)
 
     Supervisor.init(children, strategy: :one_for_one)
   end
 
-  @spec supervisor_name(String.t()) :: {:global, {:endurant_supervisor, String.t()}}
-  def supervisor_name(instance) when is_binary(instance) do
-    {:global, {:endurant_supervisor, instance}}
+  @spec supervisor_name(Config.instance_name()) :: pid() | nil
+  def supervisor_name(instance) do
+    supervisor_pid(instance)
   end
 
-  @spec queue_manager_name(String.t(), atom()) ::
-          {:global, {:endurant_queue_manager, String.t(), atom()}}
-  def queue_manager_name(instance, queue) when is_binary(instance) and is_atom(queue) do
-    {:global, {:endurant_queue_manager, instance, queue}}
+  @spec supervisor_pid(Config.instance_name()) :: pid() | nil
+  def supervisor_pid(instance) do
+    Registry.supervisor_pid(instance)
   end
 
-  @spec validate_unique_queues!(keyword()) :: :ok
-  defp validate_unique_queues!(queues) do
-    duplicates =
-      queues
-      |> Keyword.keys()
-      |> Enum.group_by(& &1)
-      |> Enum.filter(fn {_queue, entries} -> length(entries) > 1 end)
-      |> Enum.map(&elem(&1, 0))
-
-    case duplicates do
-      [] ->
-        :ok
-
-      _ ->
-        raise ArgumentError, "duplicate queues are not allowed: #{inspect(duplicates)}"
-    end
+  @spec queue_manager_name(Config.instance_name(), atom()) :: pid() | nil
+  def queue_manager_name(instance, queue) when is_atom(queue) do
+    queue_manager_pid(instance, queue)
   end
 
-  @spec validate_name!(term()) :: :ok
-  defp validate_name!(name) when is_binary(name) do
-    if String.trim(name) != "" do
-      :ok
-    else
-      raise ArgumentError, ":name must be a non-empty string, got: #{inspect(name)}"
-    end
+  @spec queue_manager_pid(Config.instance_name(), atom()) :: pid() | nil
+  def queue_manager_pid(instance, queue) when is_atom(queue) do
+    Registry.queue_manager_pid(instance, queue)
   end
 
-  defp validate_name!(name) do
-    raise ArgumentError, ":name must be a non-empty string, got: #{inspect(name)}"
-  end
+  @spec build_config!(keyword()) :: Config.t()
+  defp build_config!(opts) do
+    case Keyword.fetch(opts, :config) do
+      {:ok, %Config{} = config} ->
+        config
 
-  @spec require_name!(keyword()) :: String.t()
-  defp require_name!(opts) do
-    case Keyword.fetch(opts, :name) do
-      {:ok, name} ->
-        name
+      {:ok, other} ->
+        raise ArgumentError, ":config must be an %Endurant.Config{}, got: #{inspect(other)}"
 
       :error ->
-        raise ArgumentError, "missing required :name option (non-empty string)"
+        Config.new!(opts)
     end
   end
 end

@@ -2,26 +2,21 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
   @moduledoc false
   use Mix.Task
   require Logger
-
   @shortdoc "Run waiting benchmark with detailed slow-query output"
-
-  @switches [
-    steps: :integer,
-    batch: :integer,
-    limit: :integer,
-    queues: :integer,
-    time_wait_percent: :integer,
-    time_wait_delay_ms: :integer,
-    cancel_sample: :integer,
-    retry_percent: :integer,
-    parked_limit: :integer,
-    poll: :integer,
-    lease: :integer,
-    signal_sample: :integer,
-    insert_concurrency: :integer,
-    progress_every: :integer
-  ]
-
+  @switches steps: :integer,
+            batch: :integer,
+            limit: :integer,
+            queues: :integer,
+            time_wait_percent: :integer,
+            time_wait_delay_ms: :integer,
+            cancel_sample: :integer,
+            retry_percent: :integer,
+            parked_limit: :integer,
+            poll: :integer,
+            lease: :integer,
+            signal_sample: :integer,
+            insert_concurrency: :integer,
+            progress_every: :integer
   @impl Mix.Task
   @spec run([String.t()]) :: :ok
   def run(args) do
@@ -32,14 +27,11 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
     _ = Mix.Task.run("app.start")
     previous_level = Logger.level()
     Logger.configure(level: :info)
-
     {opts, _, invalid} = OptionParser.parse(args, strict: @switches)
 
     if invalid != [] do
       invalid_switches =
-        invalid
-        |> Enum.map(fn {switch, _value} -> to_string(switch) end)
-        |> Enum.join(", ")
+        invalid |> Enum.map(fn {switch, _value} -> to_string(switch) end) |> Enum.join(", ")
 
       Mix.raise(
         "invalid options: #{invalid_switches}. Use dashed names (for example --parked-limit, --signal-sample)."
@@ -47,44 +39,44 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
     end
 
     steps = positive(Keyword.get(opts, :steps, 5), 5)
-    batch = positive(Keyword.get(opts, :batch, 10_000), 10_000)
+    batch = positive(Keyword.get(opts, :batch, 10000), 10000)
     limit = positive(Keyword.get(opts, :limit, 8), 8)
     queue_count = positive(Keyword.get(opts, :queues, 1), 1)
     queues = build_queues(queue_count)
     time_wait_percent = percent(Keyword.get(opts, :time_wait_percent, 0), 0)
-    time_wait_delay_ms = positive(Keyword.get(opts, :time_wait_delay_ms, 1_000), 1_000)
+    time_wait_delay_ms = positive(Keyword.get(opts, :time_wait_delay_ms, 1000), 1000)
     cancel_sample = non_negative(Keyword.get(opts, :cancel_sample, 0), 0)
     retry_percent = percent(Keyword.get(opts, :retry_percent, 0), 0)
     parked_limit = non_negative(Keyword.get(opts, :parked_limit, 0), 0)
     poll_interval = positive(Keyword.get(opts, :poll, 50), 50)
-    lease_ms = positive(Keyword.get(opts, :lease, 30_000), 30_000)
+    lease_ms = positive(Keyword.get(opts, :lease, 30000), 30000)
     signal_sample = positive(Keyword.get(opts, :signal_sample, 20), 20)
     insert_concurrency = positive(Keyword.get(opts, :insert_concurrency, 32), 32)
-    progress_every = positive(Keyword.get(opts, :progress_every, 5_000), 5_000)
+    progress_every = positive(Keyword.get(opts, :progress_every, 5000), 5000)
     prefix = "perf_waiting_slow_#{System.system_time(:millisecond)}"
-
     helper_call!(:start_repo!, [])
     {:ok, repo_pid} = helper_repo().start_link()
     pg_stats_enabled = ensure_pg_stat_statements(helper_repo())
-
     engine_name = "perf_waiting_slow"
 
     try do
       ensure_clean_prefix!(prefix)
-      runtime_opts = helper_call!(:runtime_opts, [prefix])
+      runtime_opts = helper_call!(:runtime_opts, [prefix]) |> Keyword.put(:instance, engine_name)
+      repo = Keyword.fetch!(runtime_opts, :repo)
+      schema_prefix = Keyword.fetch!(runtime_opts, :prefix)
 
       {:ok, supervisor_pid} =
         Endurant.start_link(
           name: engine_name,
+          repo: repo,
+          prefix: schema_prefix,
           queues:
             Enum.map(queues, fn queue ->
               {queue,
-               [
-                 limit: limit,
-                 parked_limit: parked_limit,
-                 poll_interval: poll_interval,
-                 lease_ms: lease_ms
-               ] ++ runtime_opts}
+               limit: limit,
+               parked_limit: parked_limit,
+               poll_interval: poll_interval,
+               lease_ms: lease_ms}
             end)
         )
 
@@ -247,7 +239,7 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
     _ = insert_concurrency
     repo = Keyword.fetch!(runtime_opts, :repo)
     prefix = Keyword.get(runtime_opts, :prefix, "public")
-    chunk_size = 1_000
+    chunk_size = 1000
     queue_names = Enum.map(queues, &Atom.to_string/1)
     queue_count = length(queue_names)
     time_wait_run_at = DateTime.add(DateTime.utc_now(), time_wait_delay_ms, :millisecond)
@@ -290,13 +282,11 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
     _processed =
       seed_rows
       |> Enum.chunk_every(chunk_size)
-      |> Enum.reduce(0, fn
-        chunk, processed ->
-          seed_waiting_chunk!(repo, prefix, chunk)
-          inserted = length(chunk)
-          next = processed + inserted
-
-          next
+      |> Enum.reduce(0, fn chunk, processed ->
+        seed_waiting_chunk!(repo, prefix, chunk)
+        inserted = length(chunk)
+        next = processed + inserted
+        next
       end)
 
     :ok
@@ -358,14 +348,11 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
 
     values_sql = Enum.reverse(values_sql_rev)
     params = Enum.reverse(params_rev)
-
-    sql = """
-    INSERT INTO #{prefix}.endurant_executions
-      (id, unique_id, queue, workflow_name, version, input, waiting_until, status, inserted_at, updated_at)
-    VALUES #{Enum.join(values_sql, ",")}
-    ON CONFLICT DO NOTHING
-    """
-
+    sql = "INSERT INTO #{prefix}.endurant_executions
+  (id, unique_id, queue, workflow_name, version, input, waiting_until, status, inserted_at, updated_at)
+VALUES #{Enum.join(values_sql, ",")}
+ON CONFLICT DO NOTHING
+"
     _ = repo.query!(sql, params, log: false)
     :ok
   end
@@ -376,8 +363,6 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
       rows
       |> Enum.with_index()
       |> Enum.reduce({[], []}, fn {row, idx}, {values_acc, params_acc} ->
-        # 8 params per execution (2 events):
-        # 1: exec_id, 2: seq1, 3:type1, 4:payload1, 5:exec_id, 6:seq2, 7:type2, 8:payload2
         offset = idx * 8
 
         value_sql =
@@ -397,11 +382,7 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
             Integer.to_string(offset + 6) <>
             ", $" <>
             Integer.to_string(offset + 7) <>
-            "::" <>
-            prefix <>
-            ".endurant_event_type, $" <>
-            Integer.to_string(offset + 8) <>
-            ")"
+            "::" <> prefix <> ".endurant_event_type, $" <> Integer.to_string(offset + 8) <> ")"
 
         created_payload = %{
           workflow: row.workflow_name,
@@ -427,14 +408,11 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
 
     values_sql = Enum.reverse(values_sql_rev)
     params = Enum.reverse(params_rev)
-
-    sql = """
-    INSERT INTO #{prefix}.endurant_events
-      (execution_id, sequence, type, payload)
-    VALUES #{Enum.join(values_sql, ",")}
-    ON CONFLICT DO NOTHING
-    """
-
+    sql = "INSERT INTO #{prefix}.endurant_events
+  (execution_id, sequence, type, payload)
+VALUES #{Enum.join(values_sql, ",")}
+ON CONFLICT DO NOTHING
+"
     _ = repo.query!(sql, params, log: false)
     :ok
   end
@@ -443,12 +421,10 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
   defp waiting_count(runtime_opts) do
     repo = Keyword.fetch!(runtime_opts, :repo)
     prefix = Keyword.get(runtime_opts, :prefix, "public")
-
-    sql = """
-    SELECT COUNT(*)
-    FROM #{prefix}.endurant_executions
-    WHERE status = 'waiting'::#{prefix}.endurant_execution_status
-    """
+    sql = "SELECT COUNT(*)
+FROM #{prefix}.endurant_executions
+WHERE status = 'waiting'::#{prefix}.endurant_execution_status
+"
 
     case repo.query!(sql, [], log: false).rows do
       [[count]] when is_integer(count) -> count
@@ -460,13 +436,11 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
   defp signal_waiting_count(runtime_opts) do
     repo = Keyword.fetch!(runtime_opts, :repo)
     prefix = Keyword.get(runtime_opts, :prefix, "public")
-
-    sql = """
-    SELECT COUNT(*)
-    FROM #{prefix}.endurant_executions
-    WHERE status = 'waiting'::#{prefix}.endurant_execution_status
-    AND waiting_until IS NULL
-    """
+    sql = "SELECT COUNT(*)
+FROM #{prefix}.endurant_executions
+WHERE status = 'waiting'::#{prefix}.endurant_execution_status
+AND waiting_until IS NULL
+"
 
     case repo.query!(sql, [], log: false).rows do
       [[count]] when is_integer(count) -> count
@@ -475,13 +449,15 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
   end
 
   @spec cancel_waiting_executions(non_neg_integer(), keyword()) :: non_neg_integer()
-  defp cancel_waiting_executions(0, _runtime_opts), do: 0
+  defp cancel_waiting_executions(0, _runtime_opts) do
+    0
+  end
 
   defp cancel_waiting_executions(sample_size, runtime_opts) do
     sample_size
     |> waiting_ids_for_cancel(runtime_opts)
     |> Enum.reduce(0, fn id, acc ->
-      case Endurant.cancel(id, runtime_opts) do
+      case Endurant.cancel(Keyword.fetch!(runtime_opts, :instance), id) do
         :ok -> acc + 1
         _ -> acc
       end
@@ -489,22 +465,20 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
   end
 
   @spec waiting_ids_for_cancel(non_neg_integer(), keyword()) :: [binary()]
-  defp waiting_ids_for_cancel(0, _runtime_opts), do: []
+  defp waiting_ids_for_cancel(0, _runtime_opts) do
+    []
+  end
 
   defp waiting_ids_for_cancel(limit, runtime_opts) do
     repo = Keyword.fetch!(runtime_opts, :repo)
     prefix = Keyword.get(runtime_opts, :prefix, "public")
-
-    sql = """
-    SELECT id
-    FROM #{prefix}.endurant_executions
-    WHERE status = 'waiting'::#{prefix}.endurant_execution_status
-    ORDER BY inserted_at ASC
-    LIMIT $1
-    """
-
-    repo.query!(sql, [limit], log: false).rows
-    |> Enum.map(fn [id] -> to_app_id(id) end)
+    sql = "SELECT id
+FROM #{prefix}.endurant_executions
+WHERE status = 'waiting'::#{prefix}.endurant_execution_status
+ORDER BY inserted_at ASC
+LIMIT $1
+"
+    repo.query!(sql, [limit], log: false).rows |> Enum.map(fn [id] -> to_app_id(id) end)
   end
 
   @spec parked_count(String.t(), [atom()]) :: non_neg_integer()
@@ -523,14 +497,16 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
   end
 
   @spec measure_signal_resume_latencies(pos_integer(), keyword()) :: [float()]
-  defp measure_signal_resume_latencies(0, _runtime_opts), do: []
+  defp measure_signal_resume_latencies(0, _runtime_opts) do
+    []
+  end
 
   @spec measure_signal_resume_latencies(pos_integer(), keyword()) :: [float()]
   defp measure_signal_resume_latencies(sample_size, runtime_opts) do
     ids = waiting_ids(sample_size, runtime_opts)
 
     Enum.each(ids, fn id ->
-      :ok = Endurant.signal(id, "go", %{bench: true}, runtime_opts)
+      :ok = Endurant.signal(Keyword.fetch!(runtime_opts, :instance), id, "go", %{bench: true})
     end)
 
     signal_events = last_signal_events!(ids, runtime_opts)
@@ -542,7 +518,7 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
           :error -> Mix.raise("missing signal event for #{id}")
         end
 
-      wait_resume_started_latency!(id, signal_seq, signal_at, runtime_opts, 30_000)
+      wait_resume_started_latency!(id, signal_seq, signal_at, runtime_opts, 30000)
     end)
   end
 
@@ -550,40 +526,34 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
   defp waiting_ids(limit, runtime_opts) do
     repo = Keyword.fetch!(runtime_opts, :repo)
     prefix = Keyword.get(runtime_opts, :prefix, "public")
-
-    sql = """
-    SELECT id
-    FROM #{prefix}.endurant_executions
-    WHERE status = 'waiting'::#{prefix}.endurant_execution_status
-    AND waiting_until IS NULL
-    ORDER BY inserted_at ASC
-    LIMIT $1
-    """
-
-    repo.query!(sql, [limit], log: false).rows
-    |> Enum.map(fn [id] -> to_app_id(id) end)
+    sql = "SELECT id
+FROM #{prefix}.endurant_executions
+WHERE status = 'waiting'::#{prefix}.endurant_execution_status
+AND waiting_until IS NULL
+ORDER BY inserted_at ASC
+LIMIT $1
+"
+    repo.query!(sql, [limit], log: false).rows |> Enum.map(fn [id] -> to_app_id(id) end)
   end
 
   @spec last_signal_events!([binary()], keyword()) :: %{
           binary() => {non_neg_integer(), NaiveDateTime.t()}
         }
-  defp last_signal_events!([], _runtime_opts), do: %{}
+  defp last_signal_events!([], _runtime_opts) do
+    %{}
+  end
 
   defp last_signal_events!(execution_ids, runtime_opts) do
     repo = Keyword.fetch!(runtime_opts, :repo)
     prefix = Keyword.get(runtime_opts, :prefix, "public")
-
     db_ids = Enum.map(execution_ids, &to_db_id/1)
     placeholders = db_ids |> Enum.with_index(1) |> Enum.map(fn {_id, idx} -> "$#{idx}" end)
-
-    sql = """
-    SELECT DISTINCT ON (execution_id) execution_id, sequence, inserted_at
-    FROM #{prefix}.endurant_events
-    WHERE execution_id IN (#{Enum.join(placeholders, ", ")})
-    AND type = 'signal_received'::#{prefix}.endurant_event_type
-    ORDER BY execution_id ASC, sequence DESC
-    """
-
+    sql = "SELECT DISTINCT ON (execution_id) execution_id, sequence, inserted_at
+FROM #{prefix}.endurant_events
+WHERE execution_id IN (#{Enum.join(placeholders, ", ")})
+AND type = 'signal_received'::#{prefix}.endurant_event_type
+ORDER BY execution_id ASC, sequence DESC
+"
     rows = repo.query!(sql, db_ids, log: false).rows
 
     rows_map =
@@ -634,20 +604,18 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
   defp do_wait_resume_started_latency(db_id, signal_seq, signal_at, runtime_opts, deadline) do
     repo = Keyword.fetch!(runtime_opts, :repo)
     prefix = Keyword.get(runtime_opts, :prefix, "public")
-
-    sql = """
-    SELECT inserted_at
-    FROM #{prefix}.endurant_events
-    WHERE execution_id = $1
-    AND type = 'execution_started'::#{prefix}.endurant_event_type
-    AND sequence > $2
-    ORDER BY sequence ASC
-    LIMIT 1
-    """
+    sql = "SELECT inserted_at
+FROM #{prefix}.endurant_events
+WHERE execution_id = $1
+AND type = 'execution_started'::#{prefix}.endurant_event_type
+AND sequence > $2
+ORDER BY sequence ASC
+LIMIT 1
+"
 
     case repo.query!(sql, [db_id, signal_seq], log: false).rows do
       [[started_at]] when is_struct(started_at, NaiveDateTime) ->
-        NaiveDateTime.diff(started_at, signal_at, :microsecond) / 1_000.0
+        NaiveDateTime.diff(started_at, signal_at, :microsecond) / 1000.0
 
       _ ->
         if System.monotonic_time(:millisecond) >= deadline do
@@ -679,8 +647,7 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
           pos_integer(),
           non_neg_integer(),
           non_neg_integer()
-        ) ::
-          :ok
+        ) :: :ok
   defp print_header(
          steps,
          batch,
@@ -707,7 +674,6 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
     )
 
     Mix.shell().info("")
-
     :ok
   end
 
@@ -744,7 +710,9 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
   end
 
   @spec percentile([float()], pos_integer()) :: float()
-  defp percentile([], _p), do: 0.0
+  defp percentile([], _p) do
+    0.0
+  end
 
   defp percentile(values, p) do
     sorted = Enum.sort(values)
@@ -753,38 +721,65 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
   end
 
   @spec fmt(number()) :: String.t()
-  defp fmt(value) when is_number(value), do: :erlang.float_to_binary(value * 1.0, decimals: 2)
+  defp fmt(value) when is_number(value) do
+    :erlang.float_to_binary(value * 1.0, decimals: 2)
+  end
 
   @spec pad(String.t(), pos_integer()) :: String.t()
-  defp pad(value, width), do: String.pad_trailing(value, width)
+  defp pad(value, width) do
+    String.pad_trailing(value, width)
+  end
 
   @spec positive(term(), pos_integer()) :: pos_integer()
-  defp positive(value, _default) when is_integer(value) and value > 0, do: value
-  defp positive(_value, default), do: default
+  defp positive(value, _default) when is_integer(value) and value > 0 do
+    value
+  end
+
+  defp positive(_value, default) do
+    default
+  end
 
   @spec non_negative(term(), non_neg_integer()) :: non_neg_integer()
-  defp non_negative(value, _default) when is_integer(value) and value >= 0, do: value
-  defp non_negative(_value, default), do: default
+  defp non_negative(value, _default) when is_integer(value) and value >= 0 do
+    value
+  end
+
+  defp non_negative(_value, default) do
+    default
+  end
 
   @spec percent(term(), non_neg_integer()) :: non_neg_integer()
-  defp percent(value, _default) when is_integer(value) and value >= 0 and value <= 100, do: value
-  defp percent(_value, default), do: default
+  defp percent(value, _default) when is_integer(value) and value >= 0 and value <= 100 do
+    value
+  end
+
+  defp percent(_value, default) do
+    default
+  end
 
   @spec build_queues(pos_integer()) :: [atom()]
-  defp build_queues(1), do: [:perf]
+  defp build_queues(1) do
+    [:perf]
+  end
 
   defp build_queues(count) when is_integer(count) and count > 1 do
     Enum.map(1..count, fn idx -> String.to_atom("perf_#{idx}") end)
   end
 
   @spec helper_module() :: module()
-  defp helper_module, do: Module.concat([Endurant, TestSupport, PostgresHelper])
+  defp helper_module do
+    Module.concat([Endurant, TestSupport, PostgresHelper])
+  end
 
   @spec helper_repo() :: module()
-  defp helper_repo, do: Module.concat([helper_module(), Repo])
+  defp helper_repo do
+    Module.concat([helper_module(), Repo])
+  end
 
   @spec helper_call!(atom(), [term()]) :: term()
-  defp helper_call!(function, args), do: apply(helper_module(), function, args)
+  defp helper_call!(function, args) do
+    apply(helper_module(), function, args)
+  end
 
   @spec ensure_pg_stat_statements(module()) :: boolean()
   defp ensure_pg_stat_statements(repo) do
@@ -831,9 +826,7 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
         pad("operation", 23) <>
         pad("origin", 17) <>
         pad("calls", 10) <>
-        pad("total_ms", 12) <>
-        pad("mean_ms", 11) <>
-        pad("queryid", 22) <> "query"
+        pad("total_ms", 12) <> pad("mean_ms", 11) <> pad("queryid", 22) <> "query"
     )
 
     rows
@@ -849,8 +842,7 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
           pad("#{calls}", 10) <>
           pad(fmt_number(row_total_ms), 12) <>
           pad(fmt_number(mean_ms), 11) <>
-          pad("#{query_id}", 22) <>
-          query_snippet(query, prefix, 90)
+          pad("#{query_id}", 22) <> query_snippet(query, prefix, 90)
       )
     end)
 
@@ -867,22 +859,19 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
         _ -> "total_exec_time DESC"
       end
 
-    filtered_sql = """
-    SELECT queryid, calls, total_exec_time, mean_exec_time, query
-    FROM pg_stat_statements
-    WHERE query ILIKE $1
-    AND query NOT ILIKE '%pg_stat_statements%'
-    ORDER BY #{order_by}
-    LIMIT $2
-    """
-
-    global_sql = """
-    SELECT queryid, calls, total_exec_time, mean_exec_time, query
-    FROM pg_stat_statements
-    WHERE query NOT ILIKE '%pg_stat_statements%'
-    ORDER BY #{order_by}
-    LIMIT $1
-    """
+    filtered_sql = "SELECT queryid, calls, total_exec_time, mean_exec_time, query
+FROM pg_stat_statements
+WHERE query ILIKE $1
+AND query NOT ILIKE '%pg_stat_statements%'
+ORDER BY #{order_by}
+LIMIT $2
+"
+    global_sql = "SELECT queryid, calls, total_exec_time, mean_exec_time, query
+FROM pg_stat_statements
+WHERE query NOT ILIKE '%pg_stat_statements%'
+ORDER BY #{order_by}
+LIMIT $1
+"
 
     case repo.query(filtered_sql, ["%" <> prefix <> ".%", limit], log: false) do
       {:ok, %{rows: []}} ->
@@ -961,7 +950,9 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
     end
   end
 
-  defp statement_label(_query, _prefix), do: "other SQL"
+  defp statement_label(_query, _prefix) do
+    "other SQL"
+  end
 
   @spec statement_origin(String.t()) :: String.t()
   defp statement_origin(operation) do
@@ -997,17 +988,27 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
     end
   end
 
-  defp query_snippet(query, _prefix, _max_len), do: inspect(query)
+  defp query_snippet(query, _prefix, _max_len) do
+    inspect(query)
+  end
 
   @spec format_db_error(term()) :: String.t()
-  defp format_db_error(%{__struct__: _} = error), do: Exception.message(error)
-  defp format_db_error(error), do: inspect(error)
+  defp format_db_error(%{__struct__: _} = error) do
+    Exception.message(error)
+  end
+
+  defp format_db_error(error) do
+    inspect(error)
+  end
 
   @spec fmt_number(number() | term()) :: String.t()
-  defp fmt_number(value) when is_number(value),
-    do: :erlang.float_to_binary(value * 1.0, decimals: 2)
+  defp fmt_number(value) when is_number(value) do
+    :erlang.float_to_binary(value * 1.0, decimals: 2)
+  end
 
-  defp fmt_number(value), do: inspect(value)
+  defp fmt_number(value) do
+    inspect(value)
+  end
 
   @spec to_db_id(binary()) :: binary()
   defp to_db_id(id) do
@@ -1033,7 +1034,6 @@ defmodule Endurant.Perf.WaitingSlowWorkflow do
   workflow do
     queue("perf")
     unique_id(fn input -> "perf-waiting:#{input.id}" end)
-
     @impl true
     @spec run(Endurant.Workflow.version(), Endurant.Workflow.input()) ::
             Endurant.Workflow.result()
@@ -1080,7 +1080,6 @@ defmodule Endurant.Perf.WaitingSlowTimeWorkflow do
   workflow do
     queue("perf")
     unique_id(fn input -> "perf-waiting:#{input.id}" end)
-
     @impl true
     @spec run(Endurant.Workflow.version(), Endurant.Workflow.input()) ::
             Endurant.Workflow.result()

@@ -3,7 +3,6 @@ defmodule Endurant.Integration.RetryPolicyTest do
 
   defmodule RetryProbe do
     use Agent
-
     @spec start_link(keyword()) :: Agent.on_start()
     def start_link(opts) do
       name = Keyword.fetch!(opts, :name)
@@ -16,10 +15,14 @@ defmodule Endurant.Integration.RetryPolicyTest do
     end
 
     @spec fail_always(term()) :: no_return()
-    def fail_always(_key), do: raise("always fail")
+    def fail_always(_key) do
+      raise "always fail"
+    end
 
     @spec fail_once(term()) :: no_return()
-    def fail_once(_key), do: raise("fail once")
+    def fail_once(_key) do
+      raise "fail once"
+    end
 
     @spec fail_twice_then_ok(term()) :: map() | no_return()
     def fail_twice_then_ok(key) do
@@ -30,7 +33,7 @@ defmodule Endurant.Integration.RetryPolicyTest do
         end)
 
       if attempt <= 2 do
-        raise("fail twice")
+        raise "fail twice"
       else
         %{ok: true, key: key}
       end
@@ -43,7 +46,7 @@ defmodule Endurant.Integration.RetryPolicyTest do
     :ok
   end
 
-  test "max attempts exhausted marks execution failed", %{runtime_opts: runtime_opts} do
+  test("max attempts exhausted marks execution failed", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.RetryPolicyTest.ExhaustedWorkflow do
@@ -72,20 +75,23 @@ defmodule Endurant.Integration.RetryPolicyTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.RetryPolicyTest.ExhaustedWorkflow,
-               %{id: "re-1"},
-               runtime_opts
+               %{id: "re-1"}
              )
 
     assert {:ok, %{status: :failed}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.count(events, &(&1.type == :task_failed)) == 2
     assert Enum.any?(events, &(&1.type == :execution_failed))
   end
 
-  test "max attempts controls retry count", %{runtime_opts: runtime_opts} do
+  test("max attempts controls retry count", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.RetryPolicyTest.RetryableFalseWorkflow do
@@ -101,14 +107,8 @@ defmodule Endurant.Integration.RetryPolicyTest do
             task(
               nil,
               "failing_step",
-              fn _ ->
-                Endurant.Integration.RetryPolicyTest.RetryProbe.fail_once(input["id"])
-              end,
-              retry: [
-                max_attempts: 5,
-                backoff: :constant,
-                base_ms: 10
-              ]
+              fn _ -> Endurant.Integration.RetryPolicyTest.RetryProbe.fail_once(input["id"]) end,
+              retry: [max_attempts: 5, backoff: :constant, base_ms: 10]
             )
           end
         end
@@ -118,19 +118,22 @@ defmodule Endurant.Integration.RetryPolicyTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.RetryPolicyTest.RetryableFalseWorkflow,
-               %{id: "rf-1"},
-               runtime_opts
+               %{id: "rf-1"}
              )
 
     assert {:ok, %{status: :failed}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.count(events, &(&1.type == :task_failed)) == 5
   end
 
-  test "exponential backoff emits increasing retry waits", %{runtime_opts: runtime_opts} do
+  test("exponential backoff emits increasing retry waits", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.RetryPolicyTest.ExponentialWorkflow do
@@ -149,7 +152,7 @@ defmodule Endurant.Integration.RetryPolicyTest do
               fn _ ->
                 Endurant.Integration.RetryPolicyTest.RetryProbe.fail_twice_then_ok(input["id"])
               end,
-              retry: [max_attempts: 3, backoff: :exponential, base_ms: 40, max_ms: 1_000]
+              retry: [max_attempts: 3, backoff: :exponential, base_ms: 40, max_ms: 1000]
             )
           end
         end
@@ -159,13 +162,16 @@ defmodule Endurant.Integration.RetryPolicyTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.RetryPolicyTest.ExponentialWorkflow,
-               %{id: "rx-1"},
-               runtime_opts
+               %{id: "rx-1"}
              )
 
     assert {:ok, %{status: :completed}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
 
@@ -178,6 +184,6 @@ defmodule Endurant.Integration.RetryPolicyTest do
       end)
       |> Enum.map(fn event -> event.payload["delay_ms"] || event.payload[:delay_ms] end)
 
-    assert retry_wait_delays == [40, 80]
+    assert retry_wait_delays == ~c"(P"
   end
 end

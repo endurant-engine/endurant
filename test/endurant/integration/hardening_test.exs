@@ -3,7 +3,6 @@ defmodule Endurant.Integration.HardeningTest do
 
   defmodule Probe do
     use Agent
-
     @spec start_link(keyword()) :: Agent.on_start()
     def start_link(opts) do
       name = Keyword.fetch!(opts, :name)
@@ -24,7 +23,7 @@ defmodule Endurant.Integration.HardeningTest do
         end)
 
       if attempt == 1 do
-        raise("fail once")
+        raise "fail once"
       else
         %{ok: true, key: key}
       end
@@ -39,14 +38,16 @@ defmodule Endurant.Integration.HardeningTest do
         end)
 
       if attempt <= 2 do
-        raise("fail twice")
+        raise "fail twice"
       else
         %{ok: true, key: key}
       end
     end
 
     @spec fail_always(term()) :: no_return()
-    def fail_always(_key), do: raise("always fail")
+    def fail_always(_key) do
+      raise "always fail"
+    end
   end
 
   setup do
@@ -55,9 +56,9 @@ defmodule Endurant.Integration.HardeningTest do
     :ok
   end
 
-  test "cancel during retry sleep finishes cancelled and does not retry task", %{
+  test("cancel during retry sleep finishes cancelled and does not retry task", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.HardeningTest.CancelDuringRetryWorkflow do
@@ -73,9 +74,7 @@ defmodule Endurant.Integration.HardeningTest do
             task(
               nil,
               "unstable",
-              fn _ ->
-                Endurant.Integration.HardeningTest.Probe.fail_once_then_ok(input["id"])
-              end,
+              fn _ -> Endurant.Integration.HardeningTest.Probe.fail_once_then_ok(input["id"]) end,
               retry: [max_attempts: 2, backoff: :constant, base_ms: 500]
             )
           end
@@ -86,24 +85,26 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.HardeningTest.CancelDuringRetryWorkflow,
-               %{id: "cdr-1"},
-               runtime_opts
+               %{id: "cdr-1"}
              )
 
     assert :execution_waiting =
-             wait_for_event(execution.id, :execution_waiting, 5_000, runtime_opts)
+             wait_for_event(execution.id, :execution_waiting, 5000, runtime_opts)
 
-    assert :ok = Endurant.cancel(execution.id, runtime_opts)
-    assert :cancelled = wait_for_status(execution.id, :cancelled, 5_000, runtime_opts)
-
+    assert :ok = Endurant.cancel(Keyword.fetch!(runtime_opts, :instance), execution.id)
+    assert :cancelled = wait_for_status(execution.id, :cancelled, 5000, runtime_opts)
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.count(events, &(&1.type == :task_started)) == 1
   end
 
-  test "cancel near task completion yields single cancelled terminal", %{
+  test("cancel near task completion yields single cancelled terminal", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.HardeningTest.CancelNearFinishWorkflow do
@@ -128,13 +129,16 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.HardeningTest.CancelNearFinishWorkflow,
-               %{id: "cnf-1"},
-               runtime_opts
+               %{id: "cnf-1"}
              )
 
     [claimed] =
-      Endurant.Executions.claim_pending(:manual, 1, "test-worker:cnf", 30_000, runtime_opts)
+      Endurant.Executions.claim_pending(:manual, 1, "test-worker:cnf", 30000, runtime_opts)
 
     Task.start(fn ->
       Endurant.Executor.run(
@@ -143,19 +147,16 @@ defmodule Endurant.Integration.HardeningTest do
       )
     end)
 
-    assert :task_started = wait_for_event(execution.id, :task_started, 5_000, runtime_opts)
+    assert :task_started = wait_for_event(execution.id, :task_started, 5000, runtime_opts)
     Process.sleep(250)
-    assert :ok = Endurant.cancel(execution.id, runtime_opts)
-    assert :cancelled = wait_for_status(execution.id, :cancelled, 5_000, runtime_opts)
-
+    assert :ok = Endurant.cancel(Keyword.fetch!(runtime_opts, :instance), execution.id)
+    assert :cancelled = wait_for_status(execution.id, :cancelled, 5000, runtime_opts)
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     refute Enum.any?(events, &(&1.type == :execution_completed))
     assert Enum.any?(events, &(&1.type == :execution_cancelled))
   end
 
-  test "lock expiry during retry wait recovers and completes", %{
-    runtime_opts: runtime_opts
-  } do
+  test("lock expiry during retry wait recovers and completes", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.HardeningTest.RetryRecoveryWorkflow do
@@ -184,18 +185,21 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.HardeningTest.RetryRecoveryWorkflow,
-               %{id: "rr-1"},
-               runtime_opts
+               %{id: "rr-1"}
              )
 
     assert :execution_waiting =
-             wait_for_event(execution.id, :execution_waiting, 5_000, runtime_opts)
+             wait_for_event(execution.id, :execution_waiting, 5000, runtime_opts)
 
     force_wait_ready_and_lock_expired!(execution.id, runtime_opts)
 
     assert {:ok, %{status: :completed}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.any?(events, &(&1.type == :execution_resumed))
@@ -205,7 +209,7 @@ defmodule Endurant.Integration.HardeningTest do
     end
   end
 
-  test "duplicate recovery ticks do not duplicate abandoned event", %{runtime_opts: runtime_opts} do
+  test("duplicate recovery ticks do not duplicate abandoned event", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.HardeningTest.RecoveryIdempotencyWorkflow do
@@ -219,7 +223,7 @@ defmodule Endurant.Integration.HardeningTest do
           @impl Endurant.Workflow
           def run(_version, input) do
             task(nil, "slow", fn _ ->
-              Process.sleep(1_500)
+              Process.sleep(1500)
               %{id: input["id"], ok: true}
             end)
           end
@@ -230,12 +234,15 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.HardeningTest.RecoveryIdempotencyWorkflow,
-               %{id: "ri-1"},
-               runtime_opts
+               %{id: "ri-1"}
              )
 
-    assert :running = wait_for_status(execution.id, :running, 2_000, runtime_opts)
+    assert :running = wait_for_status(execution.id, :running, 2000, runtime_opts)
     force_lock_expired!(execution.id, runtime_opts)
 
     tasks =
@@ -243,18 +250,17 @@ defmodule Endurant.Integration.HardeningTest do
         Task.async(fn -> Endurant.Executions.recover_expired_locks(100, runtime_opts) end)
       end
 
-    _ = Enum.map(tasks, &Task.await(&1, 2_000))
-
+    _ = Enum.map(tasks, &Task.await(&1, 2000))
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.count(events, &(&1.type == :execution_abandoned)) <= 1
     assert_abandoned_has_timestamp!(events)
   end
 
-  test "waiting lock expiry emits abandoned event and keeps waiting status", %{
+  test("waiting lock expiry emits abandoned event and keeps waiting status", %{
     runtime_opts: runtime_opts,
     engine_name: engine_name
-  } do
-    reset_queue_manager_executors!(engine_name, 5_000)
+  }) do
+    reset_queue_manager_executors!(engine_name, 5000)
 
     workflow_module =
       quote do
@@ -278,30 +284,32 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.HardeningTest.WaitingOrphanWorkflow,
-               %{id: "wo-1"},
-               runtime_opts
+               %{id: "wo-1"}
              )
 
     assert :execution_waiting =
-             wait_for_event(execution.id, :execution_waiting, 5_000, runtime_opts)
+             wait_for_event(execution.id, :execution_waiting, 5000, runtime_opts)
 
-    assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
+    assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
     kill_parked_executor!(execution.id, engine_name)
     force_lock_expired!(execution.id, runtime_opts)
     _ = Endurant.Executions.recover_expired_locks(100, runtime_opts)
 
     assert :execution_abandoned =
-             wait_for_event(execution.id, :execution_abandoned, 5_000, runtime_opts)
+             wait_for_event(execution.id, :execution_abandoned, 5000, runtime_opts)
 
-    assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
-
+    assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.any?(events, &(&1.type == :execution_abandoned))
     assert_abandoned_has_timestamp!(events)
   end
 
-  test "event append race keeps contiguous sequences", %{runtime_opts: runtime_opts} do
+  test("event append race keeps contiguous sequences", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.HardeningTest.SignalRaceWorkflow do
@@ -325,32 +333,39 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.HardeningTest.SignalRaceWorkflow,
-               %{id: "sr-1"},
-               runtime_opts
+               %{id: "sr-1"}
              )
 
     _ =
       for i <- 1..20 do
-        Task.start(fn -> Endurant.signal(execution.id, "go", %{n: i}, runtime_opts) end)
+        Task.start(fn ->
+          Endurant.signal(Keyword.fetch!(runtime_opts, :instance), execution.id, "go", %{n: i})
+        end)
       end
 
     _ =
       for i <- 1..20 do
-        Task.start(fn -> Endurant.signal(execution.id, "go2", %{n: i}, runtime_opts) end)
+        Task.start(fn ->
+          Endurant.signal(Keyword.fetch!(runtime_opts, :instance), execution.id, "go2", %{n: i})
+        end)
       end
 
     assert {:ok, %{status: :completed}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
-    events = Endurant.events(execution.id, runtime_opts)
+    events = Endurant.events(Keyword.fetch!(runtime_opts, :instance), execution.id)
     sequences = Enum.map(events, & &1.sequence)
     assert sequences == Enum.to_list(1..length(sequences))
   end
 
-  test "late cancel after retry exhausted returns not_active and emits no cancel events", %{
+  test("late cancel after retry exhausted returns not_active and emits no cancel events", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.HardeningTest.ExhaustedThenCancelWorkflow do
@@ -366,9 +381,7 @@ defmodule Endurant.Integration.HardeningTest do
             task(
               nil,
               "always_fail",
-              fn _ ->
-                Endurant.Integration.HardeningTest.Probe.fail_always(input["id"])
-              end,
+              fn _ -> Endurant.Integration.HardeningTest.Probe.fail_always(input["id"]) end,
               retry: [max_attempts: 2, backoff: :constant, base_ms: 20]
             )
           end
@@ -379,22 +392,26 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.HardeningTest.ExhaustedThenCancelWorkflow,
-               %{id: "ec-1"},
-               runtime_opts
+               %{id: "ec-1"}
              )
 
     assert {:ok, %{status: :failed}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
-    assert {:error, :not_active} = Endurant.cancel(execution.id, runtime_opts)
+    assert {:error, :not_active} =
+             Endurant.cancel(Keyword.fetch!(runtime_opts, :instance), execution.id)
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     refute Enum.any?(events, &(&1.type == :cancel_requested))
     refute Enum.any?(events, &(&1.type == :execution_cancelled))
   end
 
-  test "task event guard halt does not mark execution failed", %{runtime_opts: runtime_opts} do
+  test("task event guard halt does not mark execution failed", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.HardeningTest.GuardHaltWorkflow do
@@ -419,13 +436,16 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.HardeningTest.GuardHaltWorkflow,
-               %{id: "gh-1"},
-               runtime_opts
+               %{id: "gh-1"}
              )
 
     [claimed] =
-      Endurant.Executions.claim_pending(:manual, 1, "test-worker:gh", 30_000, runtime_opts)
+      Endurant.Executions.claim_pending(:manual, 1, "test-worker:gh", 30000, runtime_opts)
 
     Task.start(fn ->
       Endurant.Executor.run(
@@ -434,10 +454,9 @@ defmodule Endurant.Integration.HardeningTest do
       )
     end)
 
-    assert :task_started = wait_for_event(execution.id, :task_started, 5_000, runtime_opts)
+    assert :task_started = wait_for_event(execution.id, :task_started, 5000, runtime_opts)
     force_cancelled_state!(execution.id, runtime_opts)
-    assert :cancelled = wait_for_status(execution.id, :cancelled, 5_000, runtime_opts)
-
+    assert :cancelled = wait_for_status(execution.id, :cancelled, 5000, runtime_opts)
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     refute Enum.any?(events, &(&1.type == :execution_failed))
   end
@@ -450,7 +469,7 @@ defmodule Endurant.Integration.HardeningTest do
 
   @spec do_wait_for_status(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_status(execution_id, expected_status, deadline, runtime_opts) do
-    case Endurant.execution(execution_id, runtime_opts) do
+    case Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution_id) do
       %{status: ^expected_status} ->
         expected_status
 
@@ -472,7 +491,7 @@ defmodule Endurant.Integration.HardeningTest do
 
   @spec do_wait_for_event(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_event(execution_id, expected_type, deadline, runtime_opts) do
-    events = Endurant.events(execution_id, runtime_opts)
+    events = Endurant.events(Keyword.fetch!(runtime_opts, :instance), execution_id)
 
     if Enum.any?(events, &(&1.type == expected_type)) do
       expected_type
@@ -518,14 +537,13 @@ defmodule Endurant.Integration.HardeningTest do
     prefix = Keyword.fetch!(runtime_opts, :prefix)
 
     PostgresHelper.Repo.query!(
-      """
-      UPDATE #{prefix}.endurant_executions
-      SET
-        waiting_until = timezone('UTC', now()) - interval '1 second',
-        locked_until = timezone('UTC', now()) - interval '1 second',
-        updated_at = timezone('UTC', now())
-      WHERE id = $1
-      """,
+      "UPDATE #{prefix}.endurant_executions
+SET
+  waiting_until = timezone('UTC', now()) - interval '1 second',
+  locked_until = timezone('UTC', now()) - interval '1 second',
+  updated_at = timezone('UTC', now())
+WHERE id = $1
+",
       [to_db_id(execution_id)]
     )
 
@@ -537,16 +555,15 @@ defmodule Endurant.Integration.HardeningTest do
     prefix = Keyword.fetch!(runtime_opts, :prefix)
 
     PostgresHelper.Repo.query!(
-      """
-      UPDATE #{prefix}.endurant_executions
-      SET
-        status = 'cancelled'::#{prefix}.endurant_execution_status,
-        locked_by = NULL,
-        locked_until = NULL,
-        waiting_until = NULL,
-        updated_at = timezone('UTC', now())
-      WHERE id = $1
-      """,
+      "UPDATE #{prefix}.endurant_executions
+SET
+  status = 'cancelled'::#{prefix}.endurant_execution_status,
+  locked_by = NULL,
+  locked_until = NULL,
+  waiting_until = NULL,
+  updated_at = timezone('UTC', now())
+WHERE id = $1
+",
       [to_db_id(execution_id)]
     )
 
@@ -562,7 +579,7 @@ defmodule Endurant.Integration.HardeningTest do
   end
 
   @spec kill_parked_executor!(binary(), String.t(), pos_integer()) :: :ok
-  defp kill_parked_executor!(execution_id, engine_name, timeout_ms \\ 2_000) do
+  defp kill_parked_executor!(execution_id, engine_name, timeout_ms \\ 2000) do
     manager_name = Endurant.Supervisor.queue_manager_name(engine_name, :orders)
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     pid = find_parked_executor_pid!(manager_name, execution_id, deadline)
@@ -579,7 +596,6 @@ defmodule Endurant.Integration.HardeningTest do
   @spec find_parked_executor_pid!(term(), binary(), integer()) :: pid()
   defp find_parked_executor_pid!(manager_name, execution_id, deadline_ms) do
     state = :sys.get_state(manager_name)
-
     match = Enum.find(state.parked, fn {_ref, info} -> info.execution_id == execution_id end)
 
     case match do
@@ -602,17 +618,15 @@ defmodule Endurant.Integration.HardeningTest do
     state = :sys.get_state(manager_name)
 
     pids =
-      (state.running
-       |> Map.values()
-       |> Enum.map(& &1.pid)) ++
-        (state.parked
-         |> Map.values()
-         |> Enum.map(& &1.pid))
+      (state.running |> Map.values() |> Enum.map(& &1.pid)) ++
+        (state.parked |> Map.values() |> Enum.map(& &1.pid))
 
     pids
     |> Enum.uniq()
     |> Enum.each(fn pid ->
-      if is_pid(pid) and Process.alive?(pid), do: Process.exit(pid, :kill)
+      if is_pid(pid) and Process.alive?(pid) do
+        Process.exit(pid, :kill)
+      end
     end)
 
     deadline = System.monotonic_time(:millisecond) + timeout_ms

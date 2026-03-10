@@ -1,7 +1,7 @@
 defmodule Endurant.Integration.WaitingTest do
   use Endurant.TestSupport.IntegrationCase
 
-  test "time-based waiting resumes execution after delay", %{runtime_opts: runtime_opts} do
+  test("time-based waiting resumes execution after delay", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.WaitingTest.DelayWorkflow do
@@ -24,19 +24,22 @@ defmodule Endurant.Integration.WaitingTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.WaitingTest.DelayWorkflow,
-               %{id: "d-1"},
-               runtime_opts
+               %{id: "d-1"}
              )
 
     assert {:ok, %{status: :completed, result: %{id: "d-1", done: true}}} =
-             PostgresHelper.wait_for_execution!(execution.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
 
     assert {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert :execution_waiting in Enum.map(events, & &1.type)
   end
 
-  test "signal-based waiting resumes when signal is written", %{runtime_opts: runtime_opts} do
+  test("signal-based waiting resumes when signal is written", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.WaitingTest.SignalWorkflow do
@@ -59,30 +62,36 @@ defmodule Endurant.Integration.WaitingTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.WaitingTest.SignalWorkflow,
-               %{id: "s-1"},
-               runtime_opts
+               %{id: "s-1"}
              )
 
-    assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
+    assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
 
     assert :ok =
              Endurant.signal(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                execution.id,
                "approval_requested",
-               %{approved: true},
-               runtime_opts
+               %{approved: true}
              )
 
     assert {:ok, %{status: :completed, result: result}} =
-             PostgresHelper.wait_for_execution!(execution.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
 
     assert result == %{id: "s-1", approval: %{approved: true}}
   end
 
-  test "multiple same signals sent before wait are consumed in order", %{
+  test("multiple same signals sent before wait are consumed in order", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.WaitingTest.SignalQueueWorkflow do
@@ -107,29 +116,38 @@ defmodule Endurant.Integration.WaitingTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.WaitingTest.SignalQueueWorkflow,
-               %{id: "sq-1"},
-               runtime_opts
+               %{id: "sq-1"}
              )
 
     assert :ok =
              Endurant.signal(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                execution.id,
                "approval_requested",
-               %{n: 1},
-               runtime_opts
+               %{n: 1}
              )
 
     assert :ok =
              Endurant.signal(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                execution.id,
                "approval_requested",
-               %{n: 2},
-               runtime_opts
+               %{n: 2}
              )
 
     assert {:ok, %{status: :completed, result: result}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     assert result == %{id: "sq-1", approvals: [%{n: 1}, %{n: 2}]}
   end
@@ -142,7 +160,7 @@ defmodule Endurant.Integration.WaitingTest do
 
   @spec do_wait_for_status(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_status(execution_id, expected_status, deadline, runtime_opts) do
-    case Endurant.execution(execution_id, runtime_opts) do
+    case Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution_id) do
       %{status: ^expected_status} ->
         expected_status
 

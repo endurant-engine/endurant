@@ -3,7 +3,10 @@ defmodule Endurant.QueueManager do
 
   use GenServer
 
+  alias Endurant.Registry
+
   defstruct [
+    :instance,
     :queue,
     :opts,
     tick: 0,
@@ -13,6 +16,7 @@ defmodule Endurant.QueueManager do
   ]
 
   @type state :: %__MODULE__{
+          instance: atom() | String.t(),
           queue: atom(),
           opts: keyword(),
           tick: non_neg_integer(),
@@ -33,13 +37,24 @@ defmodule Endurant.QueueManager do
   def init(opts) do
     Process.flag(:trap_exit, true)
 
+    instance = Keyword.fetch!(opts, :instance)
+    queue = Keyword.fetch!(opts, :queue)
+
     state = %__MODULE__{
-      queue: Keyword.fetch!(opts, :queue),
+      instance: instance,
+      queue: queue,
       opts: Keyword.get(opts, :opts, [])
     }
 
+    :ok = Registry.put_queue_manager(instance, queue, self())
     send(self(), :tick)
     {:ok, state}
+  end
+
+  @impl true
+  def terminate(_reason, %__MODULE__{instance: instance, queue: queue}) do
+    Registry.delete_queue_manager(instance, queue, self())
+    :ok
   end
 
   @impl true
@@ -51,7 +66,7 @@ defmodule Endurant.QueueManager do
 
     _ = Endurant.Executions.recover_expired_locks(recovery_limit(state.opts), recover_opts)
     state = promote_db_ready_waiters(state)
-    worker_id = worker_id(state.queue)
+    worker_id = worker_id(state.instance, state.queue)
     {state, _resumed} = resume_ready_waiters(state, worker_id)
 
     capacity_after_resume = max(limit(state.opts) - map_size(state.running), 0)
@@ -352,6 +367,10 @@ defmodule Endurant.QueueManager do
     end
   end
 
-  @spec worker_id(atom()) :: String.t()
-  defp worker_id(queue), do: "#{node()}:#{queue}"
+  @spec worker_id(atom() | String.t(), atom()) :: String.t()
+  defp worker_id(instance, queue), do: "#{instance_tag(instance)}:#{node()}:#{queue}"
+
+  @spec instance_tag(atom() | String.t()) :: String.t()
+  defp instance_tag(instance) when is_binary(instance), do: instance
+  defp instance_tag(instance) when is_atom(instance), do: inspect(instance)
 end

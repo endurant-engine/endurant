@@ -1,7 +1,7 @@
 defmodule Endurant.Integration.NestedTaskTest do
   use Endurant.TestSupport.IntegrationCase
 
-  test "task can be called from nested workflow functions", %{runtime_opts: runtime_opts} do
+  test("task can be called from nested workflow functions", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.NestedTaskTest.NestedWorkflow do
@@ -36,16 +36,18 @@ defmodule Endurant.Integration.NestedTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.NestedTaskTest.NestedWorkflow,
-               %{id: "n-1", user_id: "u-42"},
-               runtime_opts
+               %{id: "n-1", user_id: "u-42"}
              )
 
     assert {:ok, %{status: :completed, result: result}} =
-             PostgresHelper.wait_for_execution!(execution.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
 
     assert result == %{id: "n-1", user_id: "u-42", premium: true}
-
     assert {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
 
     assert Enum.map(events, & &1.type) == [

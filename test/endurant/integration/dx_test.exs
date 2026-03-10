@@ -1,9 +1,9 @@
 defmodule Endurant.Integration.DXTest do
   use Endurant.TestSupport.IntegrationCase
 
-  test "workflow DX: define, insert, await, replay, and inspect history", %{
+  test("workflow DX: define, insert, await, replay, and inspect history", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.DXTest.OrderWorkflow do
@@ -53,13 +53,12 @@ defmodule Endurant.Integration.DXTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.DXTest.OrderWorkflow,
-               %{
-                 order_id: "o-123",
-                 user_id: "u-7",
-                 items: ["book", "pen"]
-               },
-               runtime_opts
+               %{order_id: "o-123", user_id: "u-7", items: ["book", "pen"]}
              )
 
     assert execution.workflow_module == "Endurant.Integration.DXTest.OrderWorkflow"
@@ -68,7 +67,7 @@ defmodule Endurant.Integration.DXTest do
     assert execution.version == "1"
 
     assert {:ok, %{status: :completed, result: result}} =
-             PostgresHelper.wait_for_execution!(execution.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
 
     assert result == %{
              order_id: "o-123",
@@ -78,7 +77,6 @@ defmodule Endurant.Integration.DXTest do
 
     assert {:ok, replayed} = PostgresHelper.replay(execution.id, runtime_opts)
     assert replayed == result
-
     assert {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
 
     assert Enum.map(events, & &1.type) == [

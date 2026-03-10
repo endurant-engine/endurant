@@ -2,35 +2,26 @@ defmodule Endurant do
   @moduledoc """
   Public API for running Endurant and interacting with workflow executions.
 
-  ## Overview
+  Endurant is instance-addressed. The default instance name is `Endurant`.
+  Public operations can be called against the default instance, or with an
+  explicit instance as the first argument.
 
-  Endurant is started as a supervisor with one or more queue managers.
-  Workflow executions are inserted with `insert/3` and external events can be
-  delivered with `signal/4`.
+      Endurant.insert(MyApp.Workflows.OrderWorkflow, %{order_id: "o-123"})
+      Endurant.signal(execution_id, "approval_requested", %{approved: true})
+      Endurant.execution(execution_id)
+      Endurant.events(execution_id)
 
-  ## Basic Usage
-
-  Start Endurant with a queue:
-
-      {:ok, _pid} =
-        Endurant.start_link(
-          name: "my_endurant",
-          queues: [default: [limit: 10]]
-        )
-
-  Insert a workflow execution:
-
-      {:ok, execution} =
-        Endurant.insert(MyApp.Workflows.OrderWorkflow, %{order_id: "o-123"})
-
-  Deliver a signal to a running/waiting execution:
-
-      :ok =
-        Endurant.signal(execution.id, "approval_requested", %{approved: true})
+      Endurant.insert(MyEndurant, MyApp.Workflows.OrderWorkflow, %{order_id: "o-123"})
+      Endurant.signal(MyEndurant, execution_id, "approval_requested", %{approved: true})
   """
 
-  @typedoc "Name for the top-level Endurant supervisor instance."
-  @type start_name :: String.t()
+  alias Endurant.Config
+  alias Endurant.Registry
+
+  @default_instance Endurant
+
+  @typedoc "Name for the top-level Endurant instance."
+  @type start_name :: Config.instance_name()
 
   @typedoc """
   Queue runtime options.
@@ -50,17 +41,14 @@ defmodule Endurant do
   @typedoc "Queue definitions passed to `start_link/1`."
   @type queues_option :: keyword(queue_options())
 
-  @type start_option :: {:name, start_name()} | {:queues, queues_option()}
+  @type start_option ::
+          {:name, start_name()}
+          | {:repo, module()}
+          | {:prefix, String.t()}
+          | {:queue_defaults, keyword()}
+          | {:queues, queues_option()}
   @type start_options :: [start_option()]
-
-  @typedoc """
-  Runtime options used for insert/signal operations.
-
-  Supported keys:
-  - `:repo` Ecto repo module used for persistence.
-  - `:prefix` database schema prefix.
-  """
-  @type runtime_options :: keyword()
+  @type instance_name :: Config.instance_name()
 
   @type insert_result :: {:ok, map()} | {:error, :unique_conflict}
   @type signal_result :: :ok | {:error, :not_found | :not_active}
@@ -73,13 +61,24 @@ defmodule Endurant do
 
   ## Options
 
-  - `:name` non-empty string name for the Endurant instance (required).
+  - `:name` non-empty string or atom instance name (defaults to `Endurant`).
+  - `:repo` Ecto repo module for this instance.
+  - `:prefix` database schema prefix (default `"public"`).
+  - `:queue_defaults` queue defaults merged into each queue config.
   - `:queues` queue definitions and queue options.
+
+  Any option not passed directly can come from application config:
+
+      config :endurant, Endurant,
+        repo: MyApp.Repo,
+        prefix: "public",
+        queues: [default: [limit: 10]]
 
   ## Examples
 
       Endurant.start_link(
-        name: "my_endurant",
+        repo: MyApp.Repo,
+        prefix: "public",
         queues: [
           default: [limit: 10, poll_interval: 200],
           emails: [limit: 5, poll_interval: 100]
@@ -88,148 +87,148 @@ defmodule Endurant do
   """
   @spec start_link(start_options()) :: Supervisor.on_start()
   def start_link(opts) when is_list(opts) do
-    Endurant.Supervisor.start_link(opts)
+    name = Keyword.get(opts, :name, @default_instance)
+
+    name
+    |> config_opts_from_env()
+    |> Keyword.merge(opts)
+    |> Keyword.put(:name, name)
+    |> Endurant.Supervisor.start_link()
   end
 
   @doc """
-  Inserts a workflow execution request.
-
-  Uses default runtime options.
+  Inserts a workflow execution request targeting the default instance.
   """
   @spec insert(module(), map()) :: insert_result()
   def insert(workflow_module, input) when is_atom(workflow_module) and is_map(input) do
-    insert(workflow_module, input, [])
+    insert(@default_instance, workflow_module, input)
   end
 
   @doc """
-  Inserts a workflow execution request with runtime options.
-
-  ## Options
-
-  - `:repo` Ecto repo module.
-  - `:prefix` database schema prefix.
-
-  ## Examples
-
-      Endurant.insert(MyApp.Workflows.OrderWorkflow, %{order_id: "o-123"})
-
-      Endurant.insert(
-        MyApp.Workflows.OrderWorkflow,
-        %{order_id: "o-123"},
-        repo: MyApp.Repo,
-        prefix: "public"
-      )
+  Inserts a workflow execution request targeting an instance.
   """
-  @spec insert(module(), map(), runtime_options()) :: insert_result()
-  def insert(workflow_module, input, opts)
-      when is_atom(workflow_module) and is_map(input) and is_list(opts) do
-    Endurant.Executions.insert(workflow_module, input, opts)
+  @spec insert(instance_name(), module(), map()) :: insert_result()
+  def insert(instance, workflow_module, input)
+      when (is_atom(instance) or is_binary(instance)) and is_atom(workflow_module) and
+             is_map(input) do
+    Endurant.Executions.insert(workflow_module, input, instance_runtime_opts!(instance))
   end
 
   @doc """
-  Records a signal and wakes a waiting execution, when applicable.
-
-  Uses default runtime options.
+  Records a signal targeting an instance.
   """
+  @spec signal(binary(), String.t()) :: signal_result()
+  def signal(execution_id, signal) when is_binary(execution_id) and is_binary(signal) do
+    signal(@default_instance, execution_id, signal, %{})
+  end
+
   @spec signal(binary(), String.t(), map()) :: signal_result()
-  def signal(execution_id, signal, payload \\ %{})
+  def signal(execution_id, signal, payload)
       when is_binary(execution_id) and is_binary(signal) and is_map(payload) do
-    signal(execution_id, signal, payload, [])
+    signal(@default_instance, execution_id, signal, payload)
   end
 
   @doc """
-  Records a signal for an execution with runtime options.
-
-  ## Options
-
-  - `:repo` Ecto repo module.
-  - `:prefix` database schema prefix.
-
-  ## Examples
-
-      Endurant.signal(execution_id, "approval_requested", %{approved: true})
-
-      Endurant.signal(
-        execution_id,
-        "approval_requested",
-        %{approved: true},
-        repo: MyApp.Repo,
-        prefix: "public"
-      )
+  Records a signal targeting an instance.
   """
-  @spec signal(binary(), String.t(), map(), runtime_options()) :: signal_result()
-  def signal(execution_id, signal, payload, opts)
-      when is_binary(execution_id) and is_binary(signal) and is_map(payload) and
-             is_list(opts) do
-    Endurant.Executions.record_signal(execution_id, signal, payload, opts)
+  @spec signal(instance_name(), binary(), String.t()) :: signal_result()
+  def signal(instance, execution_id, signal)
+      when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) and
+             is_binary(signal) do
+    signal(instance, execution_id, signal, %{})
+  end
+
+  @spec signal(instance_name(), binary(), String.t(), map()) :: signal_result()
+  def signal(instance, execution_id, signal, payload)
+      when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) and
+             is_binary(signal) and is_map(payload) do
+    Endurant.Executions.record_signal(
+      execution_id,
+      signal,
+      payload,
+      instance_runtime_opts!(instance)
+    )
   end
 
   @doc """
-  Requests cancellation of an execution.
-
-  Uses default runtime options.
+  Requests cancellation of an execution targeting the default instance.
   """
   @spec cancel(binary()) :: cancel_result()
   def cancel(execution_id) when is_binary(execution_id) do
-    cancel(execution_id, [])
+    cancel(@default_instance, execution_id)
   end
 
   @doc """
-  Requests cancellation of an execution with runtime options.
-
-  ## Options
-
-  - `:repo` Ecto repo module.
-  - `:prefix` database schema prefix.
+  Requests cancellation of an execution targeting an instance.
   """
-  @spec cancel(binary(), runtime_options()) :: cancel_result()
-  def cancel(execution_id, opts) when is_binary(execution_id) and is_list(opts) do
-    Endurant.Executions.cancel(execution_id, opts)
+  @spec cancel(instance_name(), binary()) :: cancel_result()
+  def cancel(instance, execution_id)
+      when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) do
+    Endurant.Executions.cancel(execution_id, instance_runtime_opts!(instance))
   end
 
   @doc """
-  Fetches one execution by id.
-
-  Uses default runtime options.
+  Fetches one execution by id targeting the default instance.
   """
   @spec execution(binary()) :: execution_result()
   def execution(execution_id) when is_binary(execution_id) do
-    execution(execution_id, [])
+    execution(@default_instance, execution_id)
   end
 
   @doc """
-  Fetches one execution by id with runtime options.
-
-  ## Options
-
-  - `:repo` Ecto repo module.
-  - `:prefix` database schema prefix.
+  Fetches one execution by id targeting an instance.
   """
-  @spec execution(binary(), runtime_options()) :: execution_result()
-  def execution(execution_id, opts) when is_binary(execution_id) and is_list(opts) do
-    Endurant.Executions.get(execution_id, opts)
+  @spec execution(instance_name(), binary()) :: execution_result()
+  def execution(instance, execution_id)
+      when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) do
+    Endurant.Executions.get(execution_id, instance_runtime_opts!(instance))
   end
 
   @doc """
-  Lists all events for an execution in sequence order.
-
-  Uses default runtime options.
+  Lists all events for an execution targeting the default instance.
   """
   @spec events(binary()) :: events_result()
   def events(execution_id) when is_binary(execution_id) do
-    events(execution_id, [])
+    events(@default_instance, execution_id)
   end
 
   @doc """
-  Lists all events for an execution with runtime options.
-
-  ## Options
-
-  - `:repo` Ecto repo module.
-  - `:prefix` database schema prefix.
+  Lists all events for an execution targeting an instance.
   """
-  @spec events(binary(), runtime_options()) :: events_result()
-  def events(execution_id, opts) when is_binary(execution_id) and is_list(opts) do
-    Endurant.Events.list(execution_id, opts)
+  @spec events(instance_name(), binary()) :: events_result()
+  def events(instance, execution_id)
+      when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) do
+    Endurant.Events.list(execution_id, instance_runtime_opts!(instance))
+  end
+
+  @spec instance_runtime_opts!(instance_name()) :: keyword()
+  defp instance_runtime_opts!(instance) do
+    case Registry.fetch_config(instance) do
+      {:ok, %Config{} = config} ->
+        Config.runtime_opts(config)
+
+      :error ->
+        raise ArgumentError,
+              "endurant instance #{inspect(instance)} is not running on node #{inspect(node())}"
+    end
+  end
+
+  @spec config_opts_from_env(instance_name()) :: keyword()
+  defp config_opts_from_env(instance) when is_binary(instance), do: []
+
+  defp config_opts_from_env(instance) do
+    case Application.get_env(:endurant, instance, []) do
+      env_opts when is_list(env_opts) ->
+        if Keyword.keyword?(env_opts) do
+          env_opts
+        else
+          raise ArgumentError,
+                "application config for #{inspect(instance)} must be a keyword list, got: #{inspect(env_opts)}"
+        end
+
+      other ->
+        raise ArgumentError,
+              "application config for #{inspect(instance)} must be a keyword list, got: #{inspect(other)}"
+    end
   end
 end

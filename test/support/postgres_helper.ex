@@ -89,9 +89,14 @@ defmodule Endurant.TestSupport.PostgresHelper do
     :ok
   end
 
-  @spec runtime_opts(String.t()) :: keyword()
-  def runtime_opts(prefix) do
-    [repo: Repo, prefix: prefix]
+  @spec runtime_opts(String.t(), term() | nil) :: keyword()
+  def runtime_opts(prefix, instance \\ nil) do
+    base = [repo: Repo, prefix: prefix]
+
+    case instance do
+      nil -> base
+      _ -> Keyword.put(base, :instance, instance)
+    end
   end
 
   @spec wait_for_execution!(binary(), timeout(), keyword()) ::
@@ -107,7 +112,7 @@ defmodule Endurant.TestSupport.PostgresHelper do
   @spec do_wait(binary(), integer(), non_neg_integer(), non_neg_integer(), keyword()) ::
           {:ok, %{status: :completed | :failed, result: term()}} | no_return()
   defp do_wait(execution_id, deadline, poll_ms, timeout_ms, opts) do
-    case Endurant.execution(execution_id, opts) do
+    case Endurant.execution(instance_from_opts!(opts), execution_id) do
       %{status: :completed} ->
         case replay(execution_id, opts) do
           {:ok, result} ->
@@ -139,14 +144,14 @@ defmodule Endurant.TestSupport.PostgresHelper do
 
   @spec history(binary(), keyword()) :: {:ok, [Endurant.Events.event()]}
   def history(execution_id, opts \\ []) do
-    {:ok, Endurant.events(execution_id, opts)}
+    {:ok, Endurant.events(instance_from_opts!(opts), execution_id)}
   end
 
   @spec replay(binary(), keyword()) :: {:ok, term()} | {:error, :not_completed}
   def replay(execution_id, opts \\ []) do
     completion_event =
       execution_id
-      |> Endurant.events(opts)
+      |> then(&Endurant.events(instance_from_opts!(opts), &1))
       |> Enum.reverse()
       |> Enum.find(&(&1.type == :execution_completed))
 
@@ -163,7 +168,7 @@ defmodule Endurant.TestSupport.PostgresHelper do
   defp failure_result(execution_id, opts) do
     failure =
       execution_id
-      |> Endurant.events(opts)
+      |> then(&Endurant.events(instance_from_opts!(opts), &1))
       |> Enum.reverse()
       |> Enum.find(&(&1.type == :execution_failed))
 
@@ -178,6 +183,11 @@ defmodule Endurant.TestSupport.PostgresHelper do
   defp payload_result(%{"result" => result}), do: atomize(result)
   defp payload_result(%{result: result}), do: atomize(result)
   defp payload_result(payload), do: atomize(payload)
+
+  @spec instance_from_opts!(keyword()) :: term()
+  defp instance_from_opts!(opts) do
+    Keyword.fetch!(opts, :instance)
+  end
 
   @spec atomize(term()) :: term()
   defp atomize(%{} = map) do
