@@ -32,15 +32,22 @@ defmodule Endurant.Supervisor do
 
     :ok = Registry.put_config(config)
 
-    children =
-      Enum.map(config.queues, fn {queue, queue_opts} ->
-        %{
-          id: {:queue_manager, queue},
-          start:
-            {Endurant.QueueManager, :start_link,
-             [[instance: config.name, queue: queue, opts: queue_opts]]}
-        }
-      end)
+    children = [
+      %{
+        id: :scheduler,
+        start:
+          {Endurant.Scheduler, :start_link,
+           [[instance: config.name, repo: config.repo, prefix: config.prefix]]}
+      }
+      | Enum.map(config.queues, fn {queue, queue_opts} ->
+          %{
+            id: {:queue_manager, queue},
+            start:
+              {Endurant.QueueManager, :start_link,
+               [[instance: config.name, queue: queue, opts: queue_opts]]}
+          }
+        end)
+    ]
 
     Supervisor.init(children, strategy: :one_for_one)
   end

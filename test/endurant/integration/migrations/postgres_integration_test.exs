@@ -88,12 +88,14 @@ defmodule Endurant.Migrations.PostgresIntegrationTest do
 
     assert table_exists?("endurant_executions")
     assert table_exists?("endurant_events")
+    assert table_exists?("endurant_settings")
 
     Application.put_env(:endurant, :down_version, 1)
     assert :ok = Ecto.Migrator.down(MigrationRepo, @base_version + 1, StepMigration)
 
     refute table_exists?("endurant_executions")
     refute table_exists?("endurant_events")
+    refute table_exists?("endurant_settings")
   end
 
   defp migrated_version do

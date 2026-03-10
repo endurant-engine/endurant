@@ -172,6 +172,28 @@ defmodule Endurant.Migrations.Postgres.V01 do
       )
     )
 
+    create_if_not_exists table(:endurant_settings, primary_key: false, prefix: prefix) do
+      add(:id, :text, primary_key: true)
+      add(:value, :map, null: false, default: %{})
+
+      add(:inserted_at, :utc_datetime_usec,
+        null: false,
+        default: fragment("timezone('UTC', now())")
+      )
+
+      add(:updated_at, :utc_datetime_usec,
+        null: false,
+        default: fragment("timezone('UTC', now())")
+      )
+    end
+
+    create_if_not_exists(
+      index(:endurant_settings, [:updated_at],
+        name: :endurant_settings_updated_at_idx,
+        prefix: prefix
+      )
+    )
+
     create_if_not_exists table(:endurant_events, primary_key: false, prefix: prefix) do
       add(:id, :bigserial, primary_key: true)
 
@@ -206,6 +228,15 @@ defmodule Endurant.Migrations.Postgres.V01 do
   def down(%{prefix: prefix, quoted_prefix: quoted}) do
     drop_if_exists(index(:endurant_events, [:execution_id, :sequence], prefix: prefix))
     drop_if_exists(table(:endurant_events, prefix: prefix))
+
+    drop_if_exists(
+      index(:endurant_settings, [:updated_at],
+        name: :endurant_settings_updated_at_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(table(:endurant_settings, prefix: prefix))
 
     drop_if_exists(
       index(:endurant_executions, [:queue, :locked_until, :id],
