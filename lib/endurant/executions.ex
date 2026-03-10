@@ -4,6 +4,23 @@ defmodule Endurant.Executions do
   alias Endurant.Events
 
   @default_prefix "public"
+  @default_list_limit 50
+  @max_list_limit 1000
+
+  @open_status_strings ["pending", "running", "waiting", "continuable", "abandoned", "cancelling"]
+  @terminal_status_strings ["completed", "failed", "cancelled"]
+  @all_status_strings @open_status_strings ++ @terminal_status_strings
+
+  @type execution_status ::
+          :pending
+          | :running
+          | :waiting
+          | :continuable
+          | :abandoned
+          | :cancelling
+          | :completed
+          | :failed
+          | :cancelled
 
   @type execution :: %{
           id: binary(),
@@ -11,6 +28,22 @@ defmodule Endurant.Executions do
           input: map(),
           status: atom(),
           version: String.t()
+        }
+
+  @type execution_summary :: %{
+          id: binary(),
+          unique_id: String.t(),
+          queue: String.t(),
+          workflow: String.t(),
+          input: map(),
+          status: execution_status(),
+          version: String.t(),
+          waiting_until: NaiveDateTime.t() | DateTime.t() | nil,
+          locked_by: String.t() | nil,
+          locked_until: NaiveDateTime.t() | DateTime.t() | nil,
+          completed_at: NaiveDateTime.t() | DateTime.t() | nil,
+          inserted_at: NaiveDateTime.t() | DateTime.t(),
+          updated_at: NaiveDateTime.t() | DateTime.t()
         }
   @type claim_ready_branch :: :continuable | :waiting_ready
   @type recover_runnable_branch :: :running | :continuable | :waiting_ready
@@ -152,6 +185,89 @@ defmodule Endurant.Executions do
       _ ->
         nil
     end
+  end
+
+  @doc """
+  Lists executions with optional filters.
+
+  Supported filters:
+    * `:status` - status atom/string or list of statuses.
+    * `:queue` - queue atom/string or list of queues.
+    * `:workflow` - workflow module/string or list.
+    * `:execution_id` - one execution id.
+    * `:execution_ids` - list of execution ids.
+    * `:unique_id` - exact unique id match.
+    * `:inserted_after` / `:inserted_before` - timestamp filters.
+    * `:updated_after` / `:updated_before` - timestamp filters.
+    * `:open` - include open lifecycle statuses.
+    * `:terminal` - include terminal lifecycle statuses.
+    * `:cursor` - keyset cursor `%{inserted_at: ..., id: ...}` or `{inserted_at, id}`.
+    * `:order` - `:asc | :desc` (default `:desc`) by `inserted_at, id`.
+    * `:limit` - max rows (default `50`, max `1000`).
+  """
+  @spec list(keyword(), keyword()) :: [execution_summary()]
+  def list(filters \\ [], opts \\ []) when is_list(filters) and is_list(opts) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    limit = normalize_list_limit!(filters)
+    order_direction = normalize_order_direction!(filters)
+
+    {clauses, params, next_index} = build_list_clauses(filters, prefix)
+    where_sql = where_sql(clauses)
+
+    sql = """
+    SELECT
+      id,
+      unique_id,
+      queue,
+      workflow_name,
+      version,
+      input,
+      status::text,
+      waiting_until,
+      locked_by,
+      locked_until,
+      completed_at,
+      inserted_at,
+      updated_at
+    FROM #{prefix}.endurant_executions
+    #{where_sql}
+    ORDER BY inserted_at #{order_direction}, id #{order_direction}
+    LIMIT $#{next_index}
+    """
+
+    query!(repo, sql, params ++ [limit]).rows
+    |> Enum.map(fn [
+                     id,
+                     unique_id,
+                     queue,
+                     workflow_name,
+                     version,
+                     input,
+                     status,
+                     waiting_until,
+                     locked_by,
+                     locked_until,
+                     completed_at,
+                     inserted_at,
+                     updated_at
+                   ] ->
+      %{
+        id: to_app_id(id),
+        unique_id: unique_id,
+        queue: queue,
+        workflow: workflow_name,
+        input: input || %{},
+        status: parse_status(status),
+        version: version,
+        waiting_until: waiting_until,
+        locked_by: locked_by,
+        locked_until: locked_until,
+        completed_at: completed_at,
+        inserted_at: inserted_at,
+        updated_at: updated_at
+      }
+    end)
   end
 
   @doc """
@@ -1799,6 +1915,380 @@ defmodule Endurant.Executions do
         MapSet.put(acc, to_app_id(id))
       end)
     end
+  end
+
+  @spec build_list_clauses(keyword(), String.t()) :: {[String.t()], list(), pos_integer()}
+  defp build_list_clauses(filters, prefix) do
+    {clauses, params, next_index} = {[], [], 1}
+    statuses = normalize_status_filter!(filters)
+    queues = normalize_value_filter!(filters, :queue, &normalize_queue_value!/1)
+    workflows = normalize_value_filter!(filters, :workflow, &normalize_workflow_value!/1)
+    execution_ids = normalize_execution_ids_filter!(filters)
+
+    {clauses, params, next_index} =
+      maybe_add_any_clause(
+        clauses,
+        params,
+        next_index,
+        "status",
+        statuses,
+        "#{prefix}.endurant_execution_status"
+      )
+
+    {clauses, params, next_index} =
+      maybe_add_any_clause(clauses, params, next_index, "queue", queues, "text")
+
+    {clauses, params, next_index} =
+      maybe_add_any_clause(clauses, params, next_index, "workflow_name", workflows, "text")
+
+    {clauses, params, next_index} =
+      maybe_add_any_clause(
+        clauses,
+        params,
+        next_index,
+        "id",
+        Enum.map(execution_ids, &to_db_id/1),
+        "uuid"
+      )
+
+    {clauses, params, next_index} =
+      maybe_add_unique_id_clause(clauses, params, next_index, Keyword.get(filters, :unique_id))
+
+    {clauses, params, next_index} =
+      maybe_add_time_clause(
+        clauses,
+        params,
+        next_index,
+        "inserted_at",
+        ">=",
+        Keyword.get(filters, :inserted_after),
+        :inserted_after
+      )
+
+    {clauses, params, next_index} =
+      maybe_add_time_clause(
+        clauses,
+        params,
+        next_index,
+        "inserted_at",
+        "<",
+        Keyword.get(filters, :inserted_before),
+        :inserted_before
+      )
+
+    {clauses, params, next_index} =
+      maybe_add_time_clause(
+        clauses,
+        params,
+        next_index,
+        "updated_at",
+        ">=",
+        Keyword.get(filters, :updated_after),
+        :updated_after
+      )
+
+    {clauses, params, next_index} =
+      maybe_add_time_clause(
+        clauses,
+        params,
+        next_index,
+        "updated_at",
+        "<",
+        Keyword.get(filters, :updated_before),
+        :updated_before
+      )
+
+    maybe_add_cursor_clause(
+      clauses,
+      params,
+      next_index,
+      Keyword.get(filters, :cursor),
+      normalize_order_direction!(filters)
+    )
+  end
+
+  @spec maybe_add_any_clause(
+          [String.t()],
+          list(),
+          pos_integer(),
+          String.t(),
+          [term()],
+          String.t()
+        ) ::
+          {[String.t()], list(), pos_integer()}
+  defp maybe_add_any_clause(clauses, params, next_index, _column, [], _type_name),
+    do: {clauses, params, next_index}
+
+  defp maybe_add_any_clause(clauses, params, next_index, column, values, type_name) do
+    {
+      clauses ++ ["#{column} = ANY($#{next_index}::#{type_name}[])"],
+      params ++ [values],
+      next_index + 1
+    }
+  end
+
+  @spec maybe_add_unique_id_clause([String.t()], list(), pos_integer(), term()) ::
+          {[String.t()], list(), pos_integer()}
+  defp maybe_add_unique_id_clause(clauses, params, next_index, nil),
+    do: {clauses, params, next_index}
+
+  defp maybe_add_unique_id_clause(clauses, params, next_index, unique_id)
+       when is_binary(unique_id) do
+    {clauses ++ ["unique_id = $#{next_index}"], params ++ [unique_id], next_index + 1}
+  end
+
+  defp maybe_add_unique_id_clause(_clauses, _params, _next_index, other) do
+    raise ArgumentError, ":unique_id must be a binary, got: #{inspect(other)}"
+  end
+
+  @spec maybe_add_time_clause(
+          [String.t()],
+          list(),
+          pos_integer(),
+          String.t(),
+          String.t(),
+          term(),
+          atom()
+        ) :: {[String.t()], list(), pos_integer()}
+  defp maybe_add_time_clause(clauses, params, next_index, _column, _operator, nil, _filter_key),
+    do: {clauses, params, next_index}
+
+  defp maybe_add_time_clause(
+         clauses,
+         params,
+         next_index,
+         column,
+         operator,
+         filter_value,
+         filter_key
+       ) do
+    timestamp = normalize_filter_timestamp!(filter_value, filter_key)
+
+    {
+      clauses ++ ["#{column} #{operator} $#{next_index}"],
+      params ++ [timestamp],
+      next_index + 1
+    }
+  end
+
+  @spec maybe_add_cursor_clause([String.t()], list(), pos_integer(), term(), String.t()) ::
+          {[String.t()], list(), pos_integer()}
+  defp maybe_add_cursor_clause(clauses, params, next_index, cursor, order_direction) do
+    case normalize_cursor_filter!(cursor) do
+      nil ->
+        {clauses, params, next_index}
+
+      {inserted_at, execution_id} ->
+        operator =
+          if order_direction == "DESC" do
+            "<"
+          else
+            ">"
+          end
+
+        clause = "(inserted_at, id) #{operator} ($#{next_index}, $#{next_index + 1})"
+
+        {
+          clauses ++ [clause],
+          params ++ [inserted_at, to_db_id(execution_id)],
+          next_index + 2
+        }
+    end
+  end
+
+  @spec where_sql([String.t()]) :: String.t()
+  defp where_sql([]), do: ""
+
+  defp where_sql(clauses) do
+    "WHERE " <> Enum.join(clauses, " AND ")
+  end
+
+  @spec normalize_list_limit!(keyword()) :: pos_integer()
+  defp normalize_list_limit!(filters) do
+    case Keyword.get(filters, :limit, @default_list_limit) do
+      value when is_integer(value) and value > 0 ->
+        min(value, @max_list_limit)
+
+      other ->
+        raise ArgumentError, ":limit must be a positive integer, got: #{inspect(other)}"
+    end
+  end
+
+  @spec normalize_order_direction!(keyword()) :: String.t()
+  defp normalize_order_direction!(filters) do
+    case Keyword.get(filters, :order, :desc) do
+      :desc -> "DESC"
+      "desc" -> "DESC"
+      :asc -> "ASC"
+      "asc" -> "ASC"
+      other -> raise ArgumentError, ":order must be :asc or :desc, got: #{inspect(other)}"
+    end
+  end
+
+  @spec normalize_status_filter!(keyword()) :: [String.t()]
+  defp normalize_status_filter!(filters) do
+    explicit_statuses = normalize_value_filter!(filters, :status, &normalize_status_string!/1)
+    open? = normalize_boolean_filter!(filters, :open)
+    terminal? = normalize_boolean_filter!(filters, :terminal)
+
+    statuses =
+      explicit_statuses ++
+        if(open?, do: @open_status_strings, else: []) ++
+        if(terminal?, do: @terminal_status_strings, else: [])
+
+    statuses =
+      statuses
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    if statuses == Enum.sort(@all_status_strings) do
+      []
+    else
+      statuses
+    end
+  end
+
+  @spec normalize_boolean_filter!(keyword(), atom()) :: boolean()
+  defp normalize_boolean_filter!(filters, key) do
+    case Keyword.get(filters, key, false) do
+      true -> true
+      false -> false
+      nil -> false
+      other -> raise ArgumentError, "#{inspect(key)} must be boolean, got: #{inspect(other)}"
+    end
+  end
+
+  @spec normalize_value_filter!(keyword(), atom(), (term() -> term())) :: [term()]
+  defp normalize_value_filter!(filters, key, normalizer) do
+    case Keyword.get(filters, key) do
+      nil ->
+        []
+
+      values when is_list(values) ->
+        values
+        |> Enum.map(normalizer)
+        |> Enum.uniq()
+
+      value ->
+        [normalizer.(value)]
+    end
+  end
+
+  @spec normalize_execution_ids_filter!(keyword()) :: [binary()]
+  defp normalize_execution_ids_filter!(filters) do
+    ids =
+      [Keyword.get(filters, :execution_id)] ++
+        case Keyword.get(filters, :execution_ids) do
+          nil -> []
+          values when is_list(values) -> values
+          other -> raise ArgumentError, ":execution_ids must be a list, got: #{inspect(other)}"
+        end
+
+    ids
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(fn
+      value when is_binary(value) ->
+        value
+
+      other ->
+        raise ArgumentError, "execution id filters must be binaries, got: #{inspect(other)}"
+    end)
+    |> Enum.uniq()
+  end
+
+  @spec normalize_status_string!(term()) :: String.t()
+  defp normalize_status_string!(status) when is_atom(status) do
+    normalize_status_string!(Atom.to_string(status))
+  end
+
+  defp normalize_status_string!(status) when is_binary(status) do
+    if status in @all_status_strings do
+      status
+    else
+      raise ArgumentError, "unknown status filter: #{inspect(status)}"
+    end
+  end
+
+  defp normalize_status_string!(other) do
+    raise ArgumentError, "status filter must be atom or binary, got: #{inspect(other)}"
+  end
+
+  @spec normalize_queue_value!(term()) :: String.t()
+  defp normalize_queue_value!(queue) when is_atom(queue), do: Atom.to_string(queue)
+  defp normalize_queue_value!(queue) when is_binary(queue), do: queue
+
+  defp normalize_queue_value!(other) do
+    raise ArgumentError, "queue filter must be atom, binary, or list, got: #{inspect(other)}"
+  end
+
+  @spec normalize_workflow_value!(term()) :: String.t()
+  defp normalize_workflow_value!(workflow) when is_atom(workflow), do: inspect(workflow)
+  defp normalize_workflow_value!(workflow) when is_binary(workflow), do: workflow
+
+  defp normalize_workflow_value!(other) do
+    raise ArgumentError, "workflow filter must be module or binary, got: #{inspect(other)}"
+  end
+
+  @spec normalize_cursor_filter!(term()) :: {NaiveDateTime.t(), binary()} | nil
+  defp normalize_cursor_filter!(nil), do: nil
+
+  defp normalize_cursor_filter!({inserted_at, execution_id}) do
+    {normalize_filter_timestamp!(inserted_at, :cursor),
+     normalize_execution_id!(execution_id, :cursor)}
+  end
+
+  defp normalize_cursor_filter!(cursor) when is_map(cursor) do
+    inserted_at = Map.get(cursor, :inserted_at) || Map.get(cursor, "inserted_at")
+
+    execution_id =
+      Map.get(cursor, :id) || Map.get(cursor, "id") || Map.get(cursor, :execution_id) ||
+        Map.get(cursor, "execution_id")
+
+    if is_nil(inserted_at) or is_nil(execution_id) do
+      raise ArgumentError, ":cursor map must include :inserted_at and :id"
+    end
+
+    {normalize_filter_timestamp!(inserted_at, :cursor),
+     normalize_execution_id!(execution_id, :cursor)}
+  end
+
+  defp normalize_cursor_filter!(other) do
+    raise ArgumentError,
+          ":cursor must be %{inserted_at: ..., id: ...} or {inserted_at, id}, got: #{inspect(other)}"
+  end
+
+  @spec normalize_execution_id!(term(), atom()) :: binary()
+  defp normalize_execution_id!(execution_id, _filter_key) when is_binary(execution_id),
+    do: execution_id
+
+  defp normalize_execution_id!(other, filter_key) do
+    raise ArgumentError,
+          "#{inspect(filter_key)} execution id must be a binary, got: #{inspect(other)}"
+  end
+
+  @spec normalize_filter_timestamp!(term(), atom()) :: NaiveDateTime.t()
+  defp normalize_filter_timestamp!(%NaiveDateTime{} = timestamp, _filter_key), do: timestamp
+
+  defp normalize_filter_timestamp!(%DateTime{} = timestamp, _filter_key) do
+    DateTime.to_naive(timestamp)
+  end
+
+  defp normalize_filter_timestamp!(timestamp, _filter_key) when is_binary(timestamp) do
+    case DateTime.from_iso8601(timestamp) do
+      {:ok, value, _offset} ->
+        DateTime.to_naive(value)
+
+      {:error, _reason} ->
+        case NaiveDateTime.from_iso8601(timestamp) do
+          {:ok, value} -> value
+          {:error, _} -> raise ArgumentError, "invalid ISO8601 timestamp: #{inspect(timestamp)}"
+        end
+    end
+  end
+
+  defp normalize_filter_timestamp!(other, filter_key) do
+    raise ArgumentError,
+          "#{inspect(filter_key)} must be DateTime, NaiveDateTime, or ISO8601 string, got: #{inspect(other)}"
   end
 
   @spec query!(module(), iodata(), list()) :: map()

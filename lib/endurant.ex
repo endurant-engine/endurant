@@ -54,6 +54,7 @@ defmodule Endurant do
   @type signal_result :: :ok | {:error, :not_found | :not_active}
   @type cancel_result :: :ok | {:error, :not_found | :not_active}
   @type execution_result :: map() | nil
+  @type executions_result :: [map()]
   @type events_result :: [Endurant.Events.event()]
 
   @doc """
@@ -182,6 +183,28 @@ defmodule Endurant do
   def execution(instance, execution_id)
       when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) do
     Endurant.Executions.get(execution_id, instance_runtime_opts!(instance))
+  end
+
+  @doc """
+  Lists executions from the default instance using optional filters.
+  """
+  @spec executions() :: executions_result()
+  def executions do
+    executions(@default_instance, [])
+  end
+
+  @spec executions(keyword()) :: executions_result()
+  def executions(filters) when is_list(filters) do
+    executions(@default_instance, filters)
+  end
+
+  @doc """
+  Lists executions from an instance using optional filters.
+  """
+  @spec executions(instance_name(), keyword()) :: executions_result()
+  def executions(instance, filters)
+      when (is_atom(instance) or is_binary(instance)) and is_list(filters) do
+    Endurant.Executions.list(filters, instance_runtime_opts!(instance))
   end
 
   @doc """

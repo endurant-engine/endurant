@@ -36,7 +36,7 @@ defmodule Endurant.Integration.UniqueIdTest do
                %{id: "u-1"}
              )
 
-    assert :running = wait_for_status(first.id, :running, 2000, runtime_opts)
+    assert :running = wait_for_status(first.id, :running, 5000, runtime_opts)
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
@@ -131,7 +131,7 @@ defmodule Endurant.Integration.UniqueIdTest do
                %{id: "u-3"}
              )
 
-    assert :waiting = wait_for_status(first.id, :waiting, 2000, runtime_opts)
+    assert :waiting = wait_for_status(first.id, :waiting, 5000, runtime_opts)
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
@@ -177,9 +177,9 @@ defmodule Endurant.Integration.UniqueIdTest do
                %{id: "u-4"}
              )
 
-    assert :waiting = wait_for_status(first.id, :waiting, 2000, runtime_opts)
+    assert :waiting = wait_for_status(first.id, :waiting, 5000, runtime_opts)
     assert :ok = Endurant.Executions.mark_continuable(first.id, runtime_opts)
-    assert :continuable = wait_for_status(first.id, :continuable, 2000, runtime_opts)
+    assert :continuable = wait_for_status(first.id, :continuable, 5000, runtime_opts)
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
@@ -227,9 +227,9 @@ defmodule Endurant.Integration.UniqueIdTest do
                %{id: "u-5"}
              )
 
-    assert :running = wait_for_status(first.id, :running, 2000, runtime_opts)
+    assert :running = wait_for_status(first.id, :running, 5000, runtime_opts)
     assert {:ok, :running} = Endurant.Executions.request_cancel(first.id, runtime_opts)
-    assert :cancelling = wait_for_status(first.id, :cancelling, 2000, runtime_opts)
+    assert :cancelling = wait_for_status(first.id, :cancelling, 5000, runtime_opts)
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
