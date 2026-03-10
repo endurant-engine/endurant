@@ -30,6 +30,7 @@ defmodule Endurant.Workflow do
   """
 
   @runtime_key :endurant_workflow_runtime
+  alias Endurant.Events
   alias Endurant.Executions
 
   defmodule AsyncHandle do
@@ -78,7 +79,9 @@ defmodule Endurant.Workflow do
           queue: 1,
           unique_id: 1,
           sleep: 2,
-          execution_id: 0
+          execution_id: 0,
+          history_length: 0,
+          history_size: 0
         ]
 
       import Endurant.Workflow.Tasks,
@@ -292,6 +295,42 @@ defmodule Endurant.Workflow do
   @spec execution_id() :: binary()
   def execution_id do
     runtime!().execution_id
+  end
+
+  @doc """
+  Returns current workflow history event count.
+
+  Available only while running inside the workflow executor.
+  """
+  @spec history_length() :: non_neg_integer()
+  def history_length do
+    runtime = runtime!()
+
+    case Events.history_length(runtime.execution_id, runtime.opts) do
+      event_count when is_integer(event_count) and event_count >= 0 ->
+        event_count
+
+      _ ->
+        Map.get(runtime, :history_length, 0)
+    end
+  end
+
+  @doc """
+  Returns current workflow history size in bytes.
+
+  Available only while running inside the workflow executor.
+  """
+  @spec history_size() :: non_neg_integer()
+  def history_size do
+    runtime = runtime!()
+
+    case Events.history_size(runtime.execution_id, runtime.opts) do
+      history_size_bytes when is_integer(history_size_bytes) and history_size_bytes >= 0 ->
+        history_size_bytes
+
+      _ ->
+        Map.get(runtime, :history_size_bytes, 0)
+    end
   end
 
   @doc false

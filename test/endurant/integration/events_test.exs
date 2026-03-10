@@ -148,6 +148,23 @@ defmodule Endurant.Integration.EventsTest do
     assert MapSet.size(MapSet.new(sequences)) == 10
   end
 
+  test "append allocates from next_event_sequence and advances counters", %{
+    runtime_opts: runtime_opts
+  } do
+    execution_id = insert_execution!(runtime_opts)
+    set_execution_counters!(execution_id, 5, 10, runtime_opts)
+
+    assert :ok = Endurant.Events.append(execution_id, :task_started, %{task: "s"}, runtime_opts)
+
+    events = Endurant.Events.list(execution_id, runtime_opts)
+    assert Enum.map(events, & &1.sequence) == [5]
+
+    assert %{next_event_sequence: 6, history_size_bytes: history_size_bytes} =
+             execution_counters!(execution_id, runtime_opts)
+
+    assert history_size_bytes > 10
+  end
+
   @spec insert_execution!(keyword(), keyword()) :: binary()
   defp insert_execution!(opts, overrides \\ []) do
     repo = Keyword.fetch!(opts, :repo)
@@ -174,6 +191,54 @@ defmodule Endurant.Integration.EventsTest do
 
     repo.query!(sql, [db_id, unique_id, status, locked_by, locked_until], log: false)
     execution_id
+  end
+
+  @spec set_execution_counters!(binary(), pos_integer(), non_neg_integer(), keyword()) :: :ok
+  defp set_execution_counters!(execution_id, next_event_sequence, history_size_bytes, opts)
+       when is_integer(next_event_sequence) and next_event_sequence >= 1 and
+              is_integer(history_size_bytes) and history_size_bytes >= 0 do
+    repo = Keyword.fetch!(opts, :repo)
+    prefix = Keyword.fetch!(opts, :prefix)
+
+    sql = """
+    UPDATE #{prefix}.endurant_executions
+    SET next_event_sequence = $2,
+        history_size_bytes = $3
+    WHERE id = $1
+    """
+
+    repo.query!(sql, [to_db_id(execution_id), next_event_sequence, history_size_bytes],
+      log: false
+    )
+
+    :ok
+  end
+
+  @spec execution_counters!(binary(), keyword()) :: %{
+          next_event_sequence: pos_integer(),
+          history_size_bytes: non_neg_integer()
+        }
+  defp execution_counters!(execution_id, opts) do
+    repo = Keyword.fetch!(opts, :repo)
+    prefix = Keyword.fetch!(opts, :prefix)
+
+    sql = """
+    SELECT next_event_sequence, history_size_bytes
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    LIMIT 1
+    """
+
+    case repo.query!(sql, [to_db_id(execution_id)], log: false).rows do
+      [[next_event_sequence, history_size_bytes]] ->
+        %{
+          next_event_sequence: next_event_sequence,
+          history_size_bytes: history_size_bytes
+        }
+
+      _ ->
+        flunk("execution counters not found for #{inspect(execution_id)}")
+    end
   end
 
   @spec to_db_id(binary()) :: binary()

@@ -34,7 +34,7 @@ defmodule Endurant.Events do
     type = normalize_type(type)
     payload = payload || %{}
 
-    do_append(repo, prefix, execution_id, type, payload, 0)
+    do_append(repo, prefix, execution_id, type, payload)
   end
 
   @doc """
@@ -62,7 +62,7 @@ defmodule Endurant.Events do
     type = normalize_type(type)
     payload = payload || %{}
 
-    do_append_if_running(repo, prefix, execution_id, worker_id, type, payload, 0)
+    do_append_if_running(repo, prefix, execution_id, worker_id, type, payload)
   end
 
   @doc """
@@ -136,6 +136,58 @@ defmodule Endurant.Events do
     end)
   end
 
+  @doc """
+  Returns event history length for an execution.
+  """
+  @spec history_length(binary(), keyword()) :: non_neg_integer() | nil
+  def history_length(execution_id, opts \\ []) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    execution_id = to_db_id(execution_id)
+
+    sql = """
+    SELECT next_event_sequence
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [execution_id]).rows do
+      [[next_event_sequence]]
+      when is_integer(next_event_sequence) and next_event_sequence >= 1 ->
+        next_event_sequence - 1
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc """
+  Returns event history size in bytes for an execution.
+  """
+  @spec history_size(binary(), keyword()) :: non_neg_integer() | nil
+  def history_size(execution_id, opts \\ []) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    execution_id = to_db_id(execution_id)
+
+    sql = """
+    SELECT history_size_bytes
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [execution_id]).rows do
+      [[history_size_bytes]]
+      when is_integer(history_size_bytes) and history_size_bytes >= 0 ->
+        history_size_bytes
+
+      _ ->
+        nil
+    end
+  end
+
   @spec normalize_type(atom() | String.t()) :: String.t()
   defp normalize_type(type) when is_atom(type), do: Atom.to_string(type)
   defp normalize_type(type) when is_binary(type), do: type
@@ -145,21 +197,27 @@ defmodule Endurant.Events do
     repo.query!(sql, params, log: false)
   end
 
-  @max_append_retries 5
-
-  @spec do_append(module(), String.t(), binary(), String.t(), map(), non_neg_integer()) :: :ok
-  defp do_append(repo, prefix, execution_id, type, payload, retries)
-       when retries <= @max_append_retries do
+  @spec do_append(module(), String.t(), binary(), String.t(), map()) :: :ok
+  defp do_append(repo, prefix, execution_id, type, payload) do
     lock_sql = lock_execution_for_append_sql(prefix)
-    insert_sql = insert_event_with_max_sequence_sql(prefix)
+    insert_sql = insert_event_with_sequence_and_size_sql(prefix)
+    update_sql = update_execution_event_stats_sql(prefix)
 
     case repo.transaction(
            fn ->
-             case query!(repo, lock_sql, [execution_id]).num_rows do
-               1 ->
-                 case query!(repo, insert_sql, [execution_id, type, payload]).num_rows do
-                   1 -> :ok
-                   _ -> repo.rollback(:execution_not_found)
+             case query!(repo, lock_sql, [execution_id]).rows do
+               [[next_event_sequence]]
+               when is_integer(next_event_sequence) and next_event_sequence >= 1 ->
+                 case query!(repo, insert_sql, [execution_id, next_event_sequence, type, payload]).rows do
+                   [[history_size_delta]]
+                   when is_integer(history_size_delta) and history_size_delta >= 0 ->
+                     case query!(repo, update_sql, [execution_id, history_size_delta]).num_rows do
+                       1 -> :ok
+                       _ -> repo.rollback(:execution_not_found)
+                     end
+
+                   _ ->
+                     repo.rollback(:execution_not_found)
                  end
 
                _ ->
@@ -174,13 +232,6 @@ defmodule Endurant.Events do
       {:error, :execution_not_found} ->
         raise ArgumentError, "execution not found: #{inspect(to_app_id(execution_id))}"
     end
-  rescue
-    error ->
-      if unique_sequence_violation?(error) and retries < @max_append_retries do
-        do_append(repo, prefix, execution_id, type, payload, retries + 1)
-      else
-        reraise(error, __STACKTRACE__)
-      end
   end
 
   @spec do_append_if_running(
@@ -189,22 +240,29 @@ defmodule Endurant.Events do
           binary(),
           String.t(),
           String.t(),
-          map(),
-          non_neg_integer()
+          map()
         ) ::
           :ok | {:error, :not_running}
-  defp do_append_if_running(repo, prefix, execution_id, worker_id, type, payload, retries)
-       when retries <= @max_append_retries do
+  defp do_append_if_running(repo, prefix, execution_id, worker_id, type, payload) do
     lock_sql = lock_execution_for_owned_append_sql(prefix)
-    insert_sql = insert_event_with_max_sequence_sql(prefix)
+    insert_sql = insert_event_with_sequence_and_size_sql(prefix)
+    update_sql = update_execution_event_stats_sql(prefix)
 
     case repo.transaction(
            fn ->
-             case query!(repo, lock_sql, [execution_id, worker_id]).num_rows do
-               1 ->
-                 case query!(repo, insert_sql, [execution_id, type, payload]).num_rows do
-                   1 -> :ok
-                   _ -> repo.rollback(:not_running)
+             case query!(repo, lock_sql, [execution_id, worker_id]).rows do
+               [[next_event_sequence]]
+               when is_integer(next_event_sequence) and next_event_sequence >= 1 ->
+                 case query!(repo, insert_sql, [execution_id, next_event_sequence, type, payload]).rows do
+                   [[history_size_delta]]
+                   when is_integer(history_size_delta) and history_size_delta >= 0 ->
+                     case query!(repo, update_sql, [execution_id, history_size_delta]).num_rows do
+                       1 -> :ok
+                       _ -> repo.rollback(:not_running)
+                     end
+
+                   _ ->
+                     repo.rollback(:not_running)
                  end
 
                _ ->
@@ -216,27 +274,12 @@ defmodule Endurant.Events do
       {:ok, :ok} -> :ok
       {:error, :not_running} -> {:error, :not_running}
     end
-  rescue
-    error ->
-      if unique_sequence_violation?(error) and retries < @max_append_retries do
-        do_append_if_running(
-          repo,
-          prefix,
-          execution_id,
-          worker_id,
-          type,
-          payload,
-          retries + 1
-        )
-      else
-        reraise(error, __STACKTRACE__)
-      end
   end
 
   @spec lock_execution_for_append_sql(String.t()) :: String.t()
   defp lock_execution_for_append_sql(prefix) do
     """
-    SELECT id
+    SELECT next_event_sequence
     FROM #{prefix}.endurant_executions
     WHERE id = $1
     FOR UPDATE
@@ -246,7 +289,7 @@ defmodule Endurant.Events do
   @spec lock_execution_for_owned_append_sql(String.t()) :: String.t()
   defp lock_execution_for_owned_append_sql(prefix) do
     """
-    SELECT id
+    SELECT next_event_sequence
     FROM #{prefix}.endurant_executions
     WHERE id = $1
     AND status = 'running'::#{prefix}.endurant_execution_status
@@ -257,32 +300,30 @@ defmodule Endurant.Events do
     """
   end
 
-  @spec insert_event_with_max_sequence_sql(String.t()) :: String.t()
-  defp insert_event_with_max_sequence_sql(prefix) do
+  @spec insert_event_with_sequence_and_size_sql(String.t()) :: String.t()
+  defp insert_event_with_sequence_and_size_sql(prefix) do
     """
     INSERT INTO #{prefix}.endurant_events (execution_id, sequence, type, payload, inserted_at)
-    SELECT
+    VALUES (
       $1,
-      COALESCE(MAX(sequence) + 1, 1),
-      $2::#{prefix}.endurant_event_type,
-      $3,
+      $2,
+      $3::#{prefix}.endurant_event_type,
+      $4,
       timezone('UTC', now())
-    FROM #{prefix}.endurant_events
-    WHERE execution_id = $1
+    )
+    RETURNING pg_column_size(ROW(id, execution_id, sequence, type, payload, inserted_at))::bigint
     """
   end
 
-  @spec unique_sequence_violation?(Exception.t()) :: boolean()
-  defp unique_sequence_violation?(%{
-         __struct__: Postgrex.Error,
-         postgres: %{
-           code: :unique_violation,
-           constraint: "endurant_events_execution_id_sequence_index"
-         }
-       }),
-       do: true
-
-  defp unique_sequence_violation?(_), do: false
+  @spec update_execution_event_stats_sql(String.t()) :: String.t()
+  defp update_execution_event_stats_sql(prefix) do
+    """
+    UPDATE #{prefix}.endurant_executions
+    SET next_event_sequence = next_event_sequence + 1,
+        history_size_bytes = history_size_bytes + $2::bigint
+    WHERE id = $1
+    """
+  end
 
   @spec parse_type(String.t()) :: atom()
   defp parse_type(type) do

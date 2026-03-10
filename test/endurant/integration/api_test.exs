@@ -237,7 +237,8 @@ defmodule Endurant.Integration.ApiTest do
 
   defp stop_if_alive(_), do: :ok
 
-  @spec wait_for_status!(Endurant.Config.instance_name(), binary(), [atom()], non_neg_integer()) :: :ok
+  @spec wait_for_status!(Endurant.Config.instance_name(), binary(), [atom()], non_neg_integer()) ::
+          :ok
   defp wait_for_status!(instance, execution_id, allowed_statuses, timeout_ms)
        when is_list(allowed_statuses) and is_integer(timeout_ms) and timeout_ms >= 0 do
     poll_ms = 25
@@ -270,7 +271,14 @@ defmodule Endurant.Integration.ApiTest do
         end
 
       _ ->
-        wait_for_next_status_poll(instance, execution_id, allowed_statuses, poll_ms, deadline, timeout_ms)
+        wait_for_next_status_poll(
+          instance,
+          execution_id,
+          allowed_statuses,
+          poll_ms,
+          deadline,
+          timeout_ms
+        )
     end
   end
 
