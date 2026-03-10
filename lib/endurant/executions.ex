@@ -27,7 +27,9 @@ defmodule Endurant.Executions do
           workflow: module() | String.t(),
           input: map(),
           status: atom(),
-          version: String.t()
+          version: String.t(),
+          next_event_sequence: pos_integer(),
+          history_size_bytes: non_neg_integer()
         }
 
   @type execution_summary :: %{
@@ -38,6 +40,8 @@ defmodule Endurant.Executions do
           input: map(),
           status: execution_status(),
           version: String.t(),
+          next_event_sequence: pos_integer(),
+          history_size_bytes: non_neg_integer(),
           waiting_until: NaiveDateTime.t() | DateTime.t() | nil,
           locked_by: String.t() | nil,
           locked_until: NaiveDateTime.t() | DateTime.t() | nil,
@@ -166,20 +170,22 @@ defmodule Endurant.Executions do
     execution_id = to_db_id(execution_id)
 
     sql = """
-    SELECT id, workflow_name, input, status::text, version
+    SELECT id, workflow_name, input, status::text, version, next_event_sequence, history_size_bytes
     FROM #{prefix}.endurant_executions
     WHERE id = $1
     LIMIT 1
     """
 
     case query!(repo, sql, [execution_id]).rows do
-      [[id, workflow_name, input, status, version]] ->
+      [[id, workflow_name, input, status, version, next_event_sequence, history_size_bytes]] ->
         %{
           id: to_app_id(id),
           workflow: workflow_name,
           input: input || %{},
           status: parse_status(status),
-          version: version
+          version: version,
+          next_event_sequence: next_event_sequence,
+          history_size_bytes: history_size_bytes
         }
 
       _ ->
@@ -224,6 +230,8 @@ defmodule Endurant.Executions do
       version,
       input,
       status::text,
+      next_event_sequence,
+      history_size_bytes,
       waiting_until,
       locked_by,
       locked_until,
@@ -245,6 +253,8 @@ defmodule Endurant.Executions do
                      version,
                      input,
                      status,
+                     next_event_sequence,
+                     history_size_bytes,
                      waiting_until,
                      locked_by,
                      locked_until,
@@ -260,6 +270,8 @@ defmodule Endurant.Executions do
         input: input || %{},
         status: parse_status(status),
         version: version,
+        next_event_sequence: next_event_sequence,
+        history_size_bytes: history_size_bytes,
         waiting_until: waiting_until,
         locked_by: locked_by,
         locked_until: locked_until,

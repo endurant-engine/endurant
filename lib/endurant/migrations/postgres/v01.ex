@@ -55,6 +55,8 @@ defmodule Endurant.Migrations.Postgres.V01 do
       add(:version, :text, null: false, default: "1")
       add(:input, :map, null: false)
       add(:status, :"#{quoted}.endurant_execution_status", null: false)
+      add(:next_event_sequence, :bigint, null: false, default: 1)
+      add(:history_size_bytes, :bigint, null: false, default: 0)
       add(:waiting_until, :utc_datetime_usec)
       add(:locked_by, :text)
       add(:locked_until, :utc_datetime_usec)

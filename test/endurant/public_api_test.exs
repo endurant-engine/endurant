@@ -19,6 +19,9 @@ defmodule Endurant.PublicApiTest do
         {:cancel, 2},
         {:execution, 1},
         {:execution, 2},
+        {:executions, 0},
+        {:executions, 1},
+        {:executions, 2},
         {:events, 1},
         {:events, 2}
       ])

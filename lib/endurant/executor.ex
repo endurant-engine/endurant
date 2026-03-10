@@ -121,6 +121,9 @@ defmodule Endurant.Executor do
     task_results = task_results_from_history(history)
     {signal_queues, loaded_signal_seq} = signal_state_from_history(history)
 
+    {history_length, history_size_bytes, next_event_sequence} =
+      initial_history_counters(execution, history)
+
     runtime = %{
       execution_id: execution.id,
       worker_id: worker_id,
@@ -129,7 +132,10 @@ defmodule Endurant.Executor do
       task_failures: task_failures_from_history(history),
       waits: waits_from_history(history),
       signal_queues: signal_queues,
-      loaded_signal_seq: loaded_signal_seq
+      loaded_signal_seq: loaded_signal_seq,
+      history_length: history_length,
+      history_size_bytes: history_size_bytes,
+      next_event_sequence: next_event_sequence
     }
 
     Workflow.put_runtime(runtime)
@@ -452,6 +458,35 @@ defmodule Endurant.Executor do
           acc
       end
     end)
+  end
+
+  @spec initial_history_counters(Executions.execution(), [Events.event()]) ::
+          {non_neg_integer(), non_neg_integer(), pos_integer()}
+  defp initial_history_counters(execution, history) do
+    next_event_sequence =
+      case Map.get(execution, :next_event_sequence) do
+        value when is_integer(value) and value >= 1 -> value
+        _ -> inferred_next_event_sequence(history)
+      end
+
+    history_size_bytes =
+      case Map.get(execution, :history_size_bytes) do
+        value when is_integer(value) and value >= 0 -> value
+        _ -> 0
+      end
+
+    {next_event_sequence - 1, history_size_bytes, next_event_sequence}
+  end
+
+  @spec inferred_next_event_sequence([Events.event()]) :: pos_integer()
+  defp inferred_next_event_sequence(events) do
+    max_sequence =
+      Enum.reduce(events, 0, fn
+        %{sequence: sequence}, acc when is_integer(sequence) and sequence > acc -> sequence
+        _, acc -> acc
+      end)
+
+    max_sequence + 1
   end
 
   @spec signal_state_from_history([Events.event()]) ::

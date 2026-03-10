@@ -1,18 +1,18 @@
 defmodule Endurant.EventsRetryTest do
   use ExUnit.Case, async: true
 
-  defmodule RetryRepo do
+  defmodule NoRetryRepo do
     def transaction(fun, _opts), do: {:ok, fun.()}
 
     def query!(sql, params, opts) do
-      send(self(), {:retry_repo_query, sql, params, opts})
+      send(self(), {:no_retry_repo_query, sql, params, opts})
 
       cond do
-        String.starts_with?(sql, "SELECT id") ->
-          %{num_rows: 1, rows: [[params |> hd()]]}
+        String.contains?(sql, "SELECT next_event_sequence") ->
+          %{rows: [[1]], num_rows: 1}
 
-        String.starts_with?(sql, "INSERT INTO") and Process.get(:retry_repo_calls, 0) == 0 ->
-          Process.put(:retry_repo_calls, 1)
+        String.contains?(sql, "INSERT INTO") ->
+          Process.put(:insert_attempts, Process.get(:insert_attempts, 0) + 1)
 
           raise %Postgrex.Error{
             message: "duplicate key value violates unique constraint",
@@ -24,63 +24,27 @@ defmodule Endurant.EventsRetryTest do
             }
           }
 
-        String.starts_with?(sql, "INSERT INTO") ->
-          %{num_rows: 1}
-
         true ->
           %{num_rows: 1}
       end
     end
   end
 
-  defmodule WrongConstraintRepo do
-    def transaction(fun, _opts), do: {:ok, fun.()}
-
-    def query!(sql, params, _opts) do
-      if String.starts_with?(sql, "SELECT id") do
-        %{num_rows: 1, rows: [[params |> hd()]]}
-      else
-        raise %Postgrex.Error{
-          message: "duplicate key value violates unique constraint",
-          postgres: %{
-            code: :unique_violation,
-            constraint: "some_other_unique_constraint",
-            severity: "ERROR",
-            pg_code: "23505"
-          }
-        }
-      end
-    end
-  end
-
   setup do
     on_exit(fn ->
-      Process.delete(:retry_repo_calls)
+      Process.delete(:insert_attempts)
     end)
 
     :ok
   end
 
-  test "append retries when unique violation matches sequence constraint" do
-    assert :ok =
-             Endurant.Events.append(
-               Ecto.UUID.generate(),
-               :execution_created,
-               %{},
-               repo: RetryRepo,
-               prefix: "public"
-             )
-
-    assert Process.get(:retry_repo_calls) == 1
-  end
-
-  test "append does not retry for other unique constraints" do
+  test "append does not retry unique violations from insert" do
     try do
       Endurant.Events.append(
         Ecto.UUID.generate(),
         :execution_created,
         %{},
-        repo: WrongConstraintRepo,
+        repo: NoRetryRepo,
         prefix: "public"
       )
 
@@ -88,7 +52,9 @@ defmodule Endurant.EventsRetryTest do
     rescue
       error in Postgrex.Error ->
         assert error.postgres.code == :unique_violation
-        assert error.postgres.constraint == "some_other_unique_constraint"
+        assert error.postgres.constraint == "endurant_events_execution_id_sequence_index"
     end
+
+    assert Process.get(:insert_attempts) == 1
   end
 end
