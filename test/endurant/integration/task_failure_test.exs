@@ -1,7 +1,7 @@
 defmodule Endurant.Integration.TaskFailureTest do
   use Endurant.TestSupport.IntegrationCase
 
-  test "workflow DX: happy path with wait and in-workflow retry", %{runtime_opts: runtime_opts} do
+  test("workflow DX: happy path with wait and in-workflow retry", %{runtime_opts: runtime_opts}) do
     retry_workflow_module =
       quote do
         defmodule Endurant.Integration.TaskFailureTest.WaitRetryWorkflow do
@@ -14,32 +14,21 @@ defmodule Endurant.Integration.TaskFailureTest do
 
           @impl Endurant.Workflow
           def run(_version, input) do
-            user =
-              task(nil, "fetch_user", fn _ ->
-                %{id: input["user_id"], premium: true}
-              end)
-
+            user = task(nil, "fetch_user", fn _ -> %{id: input["user_id"], premium: true} end)
             approval = wait_signal("approval_requested")
 
             invoice =
               task(
                 nil,
                 "issue_invoice",
-                fn _ ->
-                  Endurant.TestSupport.WorkflowHelpers.RetryGate.issue(input["id"])
-                end,
+                fn _ -> Endurant.TestSupport.WorkflowHelpers.RetryGate.issue(input["id"]) end,
                 retry: [max_attempts: 2, backoff: :constant, base_ms: 100]
               )
 
             user_id = Map.get(user, :id) || Map.get(user, "id")
 
             task(nil, "finalize", fn _ ->
-              %{
-                order_id: input["id"],
-                user_id: user_id,
-                approval: approval,
-                invoice: invoice
-              }
+              %{order_id: input["id"], user_id: user_id, approval: approval, invoice: invoice}
             end)
           end
         end
@@ -57,23 +46,29 @@ defmodule Endurant.Integration.TaskFailureTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.TaskFailureTest.WaitRetryWorkflow,
-               %{id: "wr-1", user_id: "u-1"},
-               runtime_opts
+               %{id: "wr-1", user_id: "u-1"}
              )
 
-    assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
+    assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
 
     assert :ok =
              Endurant.signal(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                execution.id,
                "approval_requested",
-               %{approved: true},
-               runtime_opts
+               %{approved: true}
              )
 
     assert {:ok, %{status: :completed, result: result}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     assert result == %{
              order_id: "wr-1",
@@ -83,7 +78,6 @@ defmodule Endurant.Integration.TaskFailureTest do
            }
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
-
     assert :execution_waiting in Enum.map(events, & &1.type)
     assert Enum.count(events, &(&1.type == :task_failed)) >= 1
     assert Enum.count(events, &(&1.type == :task_completed)) >= 3
@@ -97,7 +91,7 @@ defmodule Endurant.Integration.TaskFailureTest do
 
   @spec do_wait_for_status(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_status(execution_id, expected_status, deadline, runtime_opts) do
-    case Endurant.execution(execution_id, runtime_opts) do
+    case Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution_id) do
       %{status: ^expected_status} ->
         expected_status
 

@@ -130,7 +130,7 @@ defmodule Endurant.Workflow.Signals do
     :ok
   end
 
-  @spec queue_manager!(map()) :: pid() | atom() | {:global, term()} | {:via, module(), term()}
+  @spec queue_manager!(map()) :: pid() | atom() | {:via, module(), term()}
   defp queue_manager!(runtime) do
     case Keyword.fetch(runtime.opts, :queue_manager) do
       {:ok, manager} ->

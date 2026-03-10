@@ -1,10 +1,10 @@
 defmodule Endurant.Integration.QueueManagerTest do
   use Endurant.TestSupport.IntegrationCase
 
-  test "parked_limit saturation parks up to limit but additional executions still reach waiting state",
-       %{
-         runtime_opts: runtime_opts
-       } do
+  test(
+    "parked_limit saturation parks up to limit but additional executions still reach waiting state",
+    %{runtime_opts: runtime_opts}
+  ) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.QueueManagerTest.WaitingLimitWorkflow do
@@ -27,37 +27,42 @@ defmodule Endurant.Integration.QueueManagerTest do
 
     assert {:ok, a} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.QueueManagerTest.WaitingLimitWorkflow,
-               %{id: "a"},
-               runtime_opts
+               %{id: "a"}
              )
 
-    assert :waiting = wait_for_status(a.id, :waiting, 2_000, runtime_opts)
+    assert :waiting = wait_for_status(a.id, :waiting, 2000, runtime_opts)
 
     assert {:ok, b} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.QueueManagerTest.WaitingLimitWorkflow,
-               %{id: "b"},
-               runtime_opts
+               %{id: "b"}
              )
 
-    assert :waiting = wait_for_status(b.id, :waiting, 2_000, runtime_opts)
-
-    assert :ok = Endurant.signal(a.id, "go_a", %{}, runtime_opts)
-
-    assert {:ok, %{status: :completed}} =
-             PostgresHelper.wait_for_execution!(a.id, 5_000, runtime_opts)
-
-    assert :waiting = wait_for_status(b.id, :waiting, 2_000, runtime_opts)
-    assert :ok = Endurant.signal(b.id, "go_b", %{}, runtime_opts)
+    assert :waiting = wait_for_status(b.id, :waiting, 2000, runtime_opts)
+    assert :ok = Endurant.signal(Keyword.fetch!(runtime_opts, :instance), a.id, "go_a", %{})
 
     assert {:ok, %{status: :completed}} =
-             PostgresHelper.wait_for_execution!(b.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(a.id, 5000, runtime_opts)
+
+    assert :waiting = wait_for_status(b.id, :waiting, 2000, runtime_opts)
+    assert :ok = Endurant.signal(Keyword.fetch!(runtime_opts, :instance), b.id, "go_b", %{})
+
+    assert {:ok, %{status: :completed}} =
+             PostgresHelper.wait_for_execution!(b.id, 5000, runtime_opts)
   end
 
-  test "ready waiting executions resume before claiming new pending executions", %{
+  test("ready waiting executions resume before claiming new pending executions", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     waiting_workflow_module =
       quote do
         defmodule Endurant.Integration.QueueManagerTest.ResumePriorityWaitingWorkflow do
@@ -71,10 +76,7 @@ defmodule Endurant.Integration.QueueManagerTest do
           @impl Endurant.Workflow
           def run(_version, input) do
             wait_signal("go_#{input["id"]}")
-
-            task(nil, "finish", fn _ ->
-              %{id: input["id"], kind: :waiting}
-            end)
+            task(nil, "finish", fn _ -> %{id: input["id"], kind: :waiting} end)
           end
         end
       end
@@ -101,38 +103,51 @@ defmodule Endurant.Integration.QueueManagerTest do
 
     assert {:ok, waiting_execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.QueueManagerTest.ResumePriorityWaitingWorkflow,
-               %{id: "w1"},
-               runtime_opts
+               %{id: "w1"}
              )
 
-    assert :waiting = wait_for_status(waiting_execution.id, :waiting, 2_000, runtime_opts)
+    assert :waiting = wait_for_status(waiting_execution.id, :waiting, 2000, runtime_opts)
 
     assert {:ok, pending_execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.QueueManagerTest.ResumePriorityPendingWorkflow,
-               %{id: "p1"},
-               runtime_opts
+               %{id: "p1"}
              )
 
-    assert %{status: :pending} = Endurant.execution(pending_execution.id, runtime_opts)
+    assert %{status: :pending} =
+             Endurant.execution(Keyword.fetch!(runtime_opts, :instance), pending_execution.id)
 
-    assert :ok = Endurant.signal(waiting_execution.id, "go_w1", %{}, runtime_opts)
+    assert :ok =
+             Endurant.signal(
+               Keyword.fetch!(runtime_opts, :instance),
+               waiting_execution.id,
+               "go_w1",
+               %{}
+             )
 
     assert {:ok, %{status: :completed}} =
-             PostgresHelper.wait_for_execution!(waiting_execution.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(waiting_execution.id, 5000, runtime_opts)
 
     assert {:ok, %{status: :completed}} =
-             PostgresHelper.wait_for_execution!(pending_execution.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(pending_execution.id, 5000, runtime_opts)
 
     _ = event_inserted_at!(waiting_execution.id, :execution_completed, runtime_opts)
     _ = event_inserted_at!(pending_execution.id, :execution_started, runtime_opts)
   end
 
-  test "queue manager recovers waiting/running execution when executor process dies", %{
+  test("queue manager recovers waiting/running execution when executor process dies", %{
     runtime_opts: runtime_opts,
     engine_name: engine_name
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.QueueManagerTest.RecoveryWorkflow do
@@ -146,7 +161,7 @@ defmodule Endurant.Integration.QueueManagerTest do
           @impl Endurant.Workflow
           def run(_version, input) do
             task(nil, "long_step", fn _ ->
-              Process.sleep(2_000)
+              Process.sleep(2000)
               %{id: input["id"], ok: true}
             end)
           end
@@ -157,31 +172,32 @@ defmodule Endurant.Integration.QueueManagerTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.QueueManagerTest.RecoveryWorkflow,
-               %{id: "r1"},
-               runtime_opts
+               %{id: "r1"}
              )
 
-    assert :running = wait_for_status(execution.id, :running, 2_000, runtime_opts)
-
+    assert :running = wait_for_status(execution.id, :running, 2000, runtime_opts)
     queue_manager = queue_manager_pid!(engine_name)
     executor_pid = running_executor_pid!(queue_manager, execution.id)
     Process.exit(executor_pid, :kill)
-
     force_lock_expired!(execution.id, runtime_opts)
 
     assert {:ok, %{status: :completed, result: %{id: "r1", ok: true}}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.any?(events, &(&1.type == :execution_abandoned))
     assert Enum.any?(events, &(&1.type == :execution_resumed))
   end
 
-  test "expired waiting execution stays waiting until ready, then is abandoned and resumed", %{
+  test("expired waiting execution stays waiting until ready, then is abandoned and resumed", %{
     runtime_opts: runtime_opts,
     engine_name: engine_name
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.QueueManagerTest.WaitingRecoveryWorkflow do
@@ -204,25 +220,29 @@ defmodule Endurant.Integration.QueueManagerTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.QueueManagerTest.WaitingRecoveryWorkflow,
-               %{id: "wr1"},
-               runtime_opts
+               %{id: "wr1"}
              )
 
-    assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
-
+    assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
     queue_manager = queue_manager_pid!(engine_name)
     waiting_executor = parked_executor_pid!(queue_manager, execution.id)
     Process.exit(waiting_executor, :kill)
     force_lock_expired!(execution.id, runtime_opts)
-
     Process.sleep(150)
-    assert %{status: :waiting} = Endurant.execution(execution.id, runtime_opts)
 
-    assert :ok = Endurant.signal(execution.id, "go_wr1", %{}, runtime_opts)
+    assert %{status: :waiting} =
+             Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution.id)
+
+    assert :ok =
+             Endurant.signal(Keyword.fetch!(runtime_opts, :instance), execution.id, "go_wr1", %{})
 
     assert {:ok, %{status: :completed, result: %{id: "wr1", ok: true}}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.any?(events, &(&1.type == :execution_abandoned))
@@ -237,7 +257,7 @@ defmodule Endurant.Integration.QueueManagerTest do
 
   @spec do_wait_for_status(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_status(execution_id, expected_status, deadline, runtime_opts) do
-    case Endurant.execution(execution_id, runtime_opts) do
+    case Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution_id) do
       %{status: ^expected_status} ->
         expected_status
 
@@ -259,7 +279,7 @@ defmodule Endurant.Integration.QueueManagerTest do
 
   @spec running_executor_pid!(pid(), binary()) :: pid()
   defp running_executor_pid!(queue_manager, execution_id) when is_pid(queue_manager) do
-    deadline = System.monotonic_time(:millisecond) + 2_000
+    deadline = System.monotonic_time(:millisecond) + 2000
     do_find_running_executor_pid(queue_manager, execution_id, deadline)
   end
 
@@ -283,7 +303,7 @@ defmodule Endurant.Integration.QueueManagerTest do
 
   @spec parked_executor_pid!(pid(), binary()) :: pid()
   defp parked_executor_pid!(queue_manager, execution_id) when is_pid(queue_manager) do
-    deadline = System.monotonic_time(:millisecond) + 2_000
+    deadline = System.monotonic_time(:millisecond) + 2000
     do_find_parked_executor_pid(queue_manager, execution_id, deadline)
   end
 
@@ -328,14 +348,9 @@ defmodule Endurant.Integration.QueueManagerTest do
     {:ok, events} = PostgresHelper.history(execution_id, runtime_opts)
 
     case Enum.find(events, &(&1.type == event_type)) do
-      %{inserted_at: %NaiveDateTime{} = inserted_at} ->
-        inserted_at
-
-      %{inserted_at: %DateTime{} = inserted_at} ->
-        DateTime.to_naive(inserted_at)
-
-      nil ->
-        flunk("event #{inspect(event_type)} not found for execution #{execution_id}")
+      %{inserted_at: %NaiveDateTime{} = inserted_at} -> inserted_at
+      %{inserted_at: %DateTime{} = inserted_at} -> DateTime.to_naive(inserted_at)
+      nil -> flunk("event #{inspect(event_type)} not found for execution #{execution_id}")
     end
   end
 end

@@ -1,9 +1,9 @@
 defmodule Endurant.Integration.UniqueIdTest do
   use Endurant.TestSupport.IntegrationCase
 
-  test "insert conflicts while execution with same unique_id is open", %{
+  test("insert conflicts while execution with same unique_id is open", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.UniqueIdTest.OpenConflictWorkflow do
@@ -28,24 +28,30 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:ok, first} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.UniqueIdTest.OpenConflictWorkflow,
-               %{id: "u-1"},
-               runtime_opts
+               %{id: "u-1"}
              )
 
-    assert :running = wait_for_status(first.id, :running, 2_000, runtime_opts)
+    assert :running = wait_for_status(first.id, :running, 2000, runtime_opts)
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.UniqueIdTest.OpenConflictWorkflow,
-               %{id: "u-1"},
-               runtime_opts
+               %{id: "u-1"}
              )
   end
 
-  test "insert succeeds again after previous execution with same unique_id is completed", %{
+  test("insert succeeds again after previous execution with same unique_id is completed", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.UniqueIdTest.ReinsertAfterTerminalWorkflow do
@@ -67,28 +73,34 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:ok, first} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.UniqueIdTest.ReinsertAfterTerminalWorkflow,
-               %{id: "u-2"},
-               runtime_opts
+               %{id: "u-2"}
              )
 
     assert {:ok, %{status: :completed, result: %{id: "u-2", ok: true}}} =
-             PostgresHelper.wait_for_execution!(first.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(first.id, 5000, runtime_opts)
 
     assert {:ok, second} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.UniqueIdTest.ReinsertAfterTerminalWorkflow,
-               %{id: "u-2"},
-               runtime_opts
+               %{id: "u-2"}
              )
 
     assert is_binary(second.id)
     assert second.id != first.id
   end
 
-  test "insert conflicts while execution with same unique_id is waiting", %{
+  test("insert conflicts while execution with same unique_id is waiting", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.UniqueIdTest.WaitingConflictWorkflow do
@@ -111,24 +123,30 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:ok, first} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.UniqueIdTest.WaitingConflictWorkflow,
-               %{id: "u-3"},
-               runtime_opts
+               %{id: "u-3"}
              )
 
-    assert :waiting = wait_for_status(first.id, :waiting, 2_000, runtime_opts)
+    assert :waiting = wait_for_status(first.id, :waiting, 2000, runtime_opts)
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.UniqueIdTest.WaitingConflictWorkflow,
-               %{id: "u-3"},
-               runtime_opts
+               %{id: "u-3"}
              )
   end
 
-  test "insert conflicts while execution with same unique_id is continuable", %{
+  test("insert conflicts while execution with same unique_id is continuable", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.UniqueIdTest.ContinuableConflictWorkflow do
@@ -151,27 +169,32 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:ok, first} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.UniqueIdTest.ContinuableConflictWorkflow,
-               %{id: "u-4"},
-               runtime_opts
+               %{id: "u-4"}
              )
 
-    assert :waiting = wait_for_status(first.id, :waiting, 2_000, runtime_opts)
-
+    assert :waiting = wait_for_status(first.id, :waiting, 2000, runtime_opts)
     assert :ok = Endurant.Executions.mark_continuable(first.id, runtime_opts)
-    assert :continuable = wait_for_status(first.id, :continuable, 2_000, runtime_opts)
+    assert :continuable = wait_for_status(first.id, :continuable, 2000, runtime_opts)
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.UniqueIdTest.ContinuableConflictWorkflow,
-               %{id: "u-4"},
-               runtime_opts
+               %{id: "u-4"}
              )
   end
 
-  test "insert conflicts while execution with same unique_id is cancelling", %{
+  test("insert conflicts while execution with same unique_id is cancelling", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.UniqueIdTest.CancellingConflictWorkflow do
@@ -185,7 +208,7 @@ defmodule Endurant.Integration.UniqueIdTest do
           @impl Endurant.Workflow
           def run(_version, input) do
             task(nil, "long_running", fn _ ->
-              Process.sleep(2_000)
+              Process.sleep(2000)
               %{id: input["id"], ok: true}
             end)
           end
@@ -196,20 +219,26 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:ok, first} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.UniqueIdTest.CancellingConflictWorkflow,
-               %{id: "u-5"},
-               runtime_opts
+               %{id: "u-5"}
              )
 
-    assert :running = wait_for_status(first.id, :running, 2_000, runtime_opts)
+    assert :running = wait_for_status(first.id, :running, 2000, runtime_opts)
     assert {:ok, :running} = Endurant.Executions.request_cancel(first.id, runtime_opts)
-    assert :cancelling = wait_for_status(first.id, :cancelling, 2_000, runtime_opts)
+    assert :cancelling = wait_for_status(first.id, :cancelling, 2000, runtime_opts)
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.UniqueIdTest.CancellingConflictWorkflow,
-               %{id: "u-5"},
-               runtime_opts
+               %{id: "u-5"}
              )
   end
 
@@ -221,7 +250,7 @@ defmodule Endurant.Integration.UniqueIdTest do
 
   @spec do_wait_for_status(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_status(execution_id, expected_status, deadline, runtime_opts) do
-    case Endurant.execution(execution_id, runtime_opts) do
+    case Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution_id) do
       %{status: ^expected_status} ->
         expected_status
 

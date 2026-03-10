@@ -2,17 +2,8 @@ defmodule Mix.Tasks.Perf.General do
   @moduledoc false
   use Mix.Task
   require Logger
-
   @shortdoc "Run a general Endurant performance benchmark"
-
-  @switches [
-    count: :integer,
-    repeats: :integer,
-    limit: :integer,
-    poll: :integer,
-    lease: :integer
-  ]
-
+  @switches count: :integer, repeats: :integer, limit: :integer, poll: :integer, lease: :integer
   @impl Mix.Task
   @spec run([String.t()]) :: :ok
   def run(args) do
@@ -23,17 +14,14 @@ defmodule Mix.Tasks.Perf.General do
     _ = Mix.Task.run("app.start")
     previous_level = Logger.level()
     Logger.configure(level: :info)
-
     {opts, _, _} = OptionParser.parse(args, strict: @switches)
-    count = positive(Keyword.get(opts, :count, 1_000), 1_000)
+    count = positive(Keyword.get(opts, :count, 1000), 1000)
     repeats = positive(Keyword.get(opts, :repeats, 5), 5)
     limit = positive(Keyword.get(opts, :limit, 8), 8)
     poll_interval = positive(Keyword.get(opts, :poll, 50), 50)
-    lease_ms = positive(Keyword.get(opts, :lease, 30_000), 30_000)
+    lease_ms = positive(Keyword.get(opts, :lease, 30000), 30000)
     prefix = "perf_general_#{System.system_time(:millisecond)}"
-
     helper_call!(:start_repo!, [])
-
     {:ok, repo_pid} = helper_repo().start_link()
 
     try do
@@ -46,28 +34,29 @@ defmodule Mix.Tasks.Perf.General do
 
           queue_opts = [
             limit: limit,
-            parked_limit: max(count * 2, 1_000),
+            parked_limit: max(count * 2, 1000),
             poll_interval: poll_interval,
             lease_ms: lease_ms
           ]
 
           supervisor_name = "perf_general_engine_#{run_idx}"
+          repo = Keyword.fetch!(runtime_opts, :repo)
+          prefix = Keyword.fetch!(runtime_opts, :prefix)
 
           {:ok, supervisor_pid} =
             Endurant.start_link(
               name: supervisor_name,
-              queues: [perf: queue_opts ++ runtime_opts]
+              repo: repo,
+              prefix: prefix,
+              queues: [perf: queue_opts]
             )
 
           started_at = System.monotonic_time(:millisecond)
-
           insert_all!(workflow_module, count, runtime_opts)
           wait_for_completed!(count, workflow_module, runtime_opts, 120_000)
-
           finished_at = System.monotonic_time(:millisecond)
           duration_ms = max(finished_at - started_at, 1)
-          throughput = count * 1_000 / duration_ms
-
+          throughput = count * 1000 / duration_ms
           latencies_ms = completion_latencies_ms(workflow_module, runtime_opts)
           service_latencies_ms = service_latencies_ms(workflow_module, runtime_opts)
           p50_ms = percentile(latencies_ms, 50)
@@ -76,7 +65,6 @@ defmodule Mix.Tasks.Perf.General do
           svc_p50_ms = percentile(service_latencies_ms, 50)
           svc_p95_ms = percentile(service_latencies_ms, 95)
           svc_p99_ms = percentile(service_latencies_ms, 99)
-
           _ = Supervisor.stop(supervisor_pid)
 
           %{
@@ -107,9 +95,6 @@ defmodule Mix.Tasks.Perf.General do
     if prefix_ready?(prefix) do
       helper_call!(:truncate_prefix!, [prefix])
     else
-      # `prepare_prefix!` uses Ecto.Migrator with a fixed version.
-      # If that version is already marked as up from an earlier interrupted run,
-      # `prepare_prefix!` may no-op for a fresh prefix. Force a cleanup/down first.
       helper_call!(:cleanup_prefix!, [prefix])
       helper_call!(:prepare_prefix!, [prefix])
     end
@@ -121,11 +106,8 @@ defmodule Mix.Tasks.Perf.General do
   defp prefix_ready?(prefix) do
     repo = helper_repo()
 
-    sql = """
-    SELECT
-      to_regclass($1) IS NOT NULL AS executions_exists,
-      to_regclass($2) IS NOT NULL AS events_exists
-    """
+    sql =
+      "SELECT\n  to_regclass($1) IS NOT NULL AS executions_exists,\n  to_regclass($2) IS NOT NULL AS events_exists\n"
 
     executions_table = "#{prefix}.endurant_executions"
     events_table = "#{prefix}.endurant_events"
@@ -139,7 +121,7 @@ defmodule Mix.Tasks.Perf.General do
   @spec insert_all!(module(), pos_integer(), keyword()) :: :ok
   defp insert_all!(workflow_module, count, runtime_opts) do
     Enum.each(1..count, fn id ->
-      case Endurant.insert(workflow_module, %{id: id}, runtime_opts) do
+      case Endurant.insert(Keyword.fetch!(runtime_opts, :instance), workflow_module, %{id: id}) do
         {:ok, _execution} -> :ok
         {:error, reason} -> Mix.raise("insert failed for id=#{id}: #{inspect(reason)}")
       end
@@ -175,13 +157,11 @@ defmodule Mix.Tasks.Perf.General do
   defp completed_count(workflow_name, runtime_opts) do
     repo = Keyword.fetch!(runtime_opts, :repo)
     prefix = Keyword.get(runtime_opts, :prefix, "public")
-
-    sql = """
-    SELECT COUNT(*)
-    FROM #{prefix}.endurant_executions e
-    WHERE e.workflow_name = $1
-    AND e.status = 'completed'::#{prefix}.endurant_execution_status
-    """
+    sql = "SELECT COUNT(*)
+FROM #{prefix}.endurant_executions e
+WHERE e.workflow_name = $1
+AND e.status = 'completed'::#{prefix}.endurant_execution_status
+"
 
     case repo.query!(sql, [workflow_name], log: false).rows do
       [[count]] when is_integer(count) -> count
@@ -195,17 +175,17 @@ defmodule Mix.Tasks.Perf.General do
     prefix = Keyword.get(runtime_opts, :prefix, "public")
     workflow_name = inspect(workflow_module)
 
-    sql = """
-    SELECT EXTRACT(EPOCH FROM (completed.inserted_at - created.inserted_at)) * 1000.0 AS latency_ms
-    FROM #{prefix}.endurant_executions e
-    JOIN #{prefix}.endurant_events created
-      ON created.execution_id = e.id
-      AND created.type = 'execution_created'::#{prefix}.endurant_event_type
-    JOIN #{prefix}.endurant_events completed
-      ON completed.execution_id = e.id
-      AND completed.type = 'execution_completed'::#{prefix}.endurant_event_type
-    WHERE e.workflow_name = $1
-    """
+    sql =
+      "SELECT EXTRACT(EPOCH FROM (completed.inserted_at - created.inserted_at)) * 1000.0 AS latency_ms
+FROM #{prefix}.endurant_executions e
+JOIN #{prefix}.endurant_events created
+  ON created.execution_id = e.id
+  AND created.type = 'execution_created'::#{prefix}.endurant_event_type
+JOIN #{prefix}.endurant_events completed
+  ON completed.execution_id = e.id
+  AND completed.type = 'execution_completed'::#{prefix}.endurant_event_type
+WHERE e.workflow_name = $1
+"
 
     repo.query!(sql, [workflow_name], log: false).rows
     |> Enum.map(fn [latency_ms] -> as_float(latency_ms) end)
@@ -218,17 +198,17 @@ defmodule Mix.Tasks.Perf.General do
     prefix = Keyword.get(runtime_opts, :prefix, "public")
     workflow_name = inspect(workflow_module)
 
-    sql = """
-    SELECT EXTRACT(EPOCH FROM (completed.inserted_at - started.inserted_at)) * 1000.0 AS latency_ms
-    FROM #{prefix}.endurant_executions e
-    JOIN #{prefix}.endurant_events started
-      ON started.execution_id = e.id
-      AND started.type = 'execution_started'::#{prefix}.endurant_event_type
-    JOIN #{prefix}.endurant_events completed
-      ON completed.execution_id = e.id
-      AND completed.type = 'execution_completed'::#{prefix}.endurant_event_type
-    WHERE e.workflow_name = $1
-    """
+    sql =
+      "SELECT EXTRACT(EPOCH FROM (completed.inserted_at - started.inserted_at)) * 1000.0 AS latency_ms
+FROM #{prefix}.endurant_executions e
+JOIN #{prefix}.endurant_events started
+  ON started.execution_id = e.id
+  AND started.type = 'execution_started'::#{prefix}.endurant_event_type
+JOIN #{prefix}.endurant_events completed
+  ON completed.execution_id = e.id
+  AND completed.type = 'execution_completed'::#{prefix}.endurant_event_type
+WHERE e.workflow_name = $1
+"
 
     repo.query!(sql, [workflow_name], log: false).rows
     |> Enum.map(fn [latency_ms] -> as_float(latency_ms) end)
@@ -236,13 +216,26 @@ defmodule Mix.Tasks.Perf.General do
   end
 
   @spec as_float(term()) :: float()
-  defp as_float(value) when is_float(value), do: value
-  defp as_float(%Decimal{} = value), do: Decimal.to_float(value)
-  defp as_float(value) when is_integer(value), do: value * 1.0
-  defp as_float(_), do: 0.0
+  defp as_float(value) when is_float(value) do
+    value
+  end
+
+  defp as_float(%Decimal{} = value) do
+    Decimal.to_float(value)
+  end
+
+  defp as_float(value) when is_integer(value) do
+    value * 1.0
+  end
+
+  defp as_float(_) do
+    0.0
+  end
 
   @spec percentile([float()], pos_integer()) :: float()
-  defp percentile([], _p), do: 0.0
+  defp percentile([], _p) do
+    0.0
+  end
 
   defp percentile(values, p) when is_list(values) and is_integer(p) and p > 0 do
     size = length(values)
@@ -254,9 +247,7 @@ defmodule Mix.Tasks.Perf.General do
   defp print_summary(count, repeats, limit, poll_interval, results) do
     Mix.shell().info("")
     Mix.shell().info("Endurant General Performance Benchmark")
-
     Mix.shell().info("count=#{count} repeats=#{repeats} limit=#{limit} poll=#{poll_interval}ms")
-
     Mix.shell().info("")
 
     Mix.shell().info(
@@ -301,36 +292,48 @@ defmodule Mix.Tasks.Perf.General do
   end
 
   @spec median([map()], (map() -> float())) :: float()
-  defp median([], _extractor), do: 0.0
+  defp median([], _extractor) do
+    0.0
+  end
 
   defp median(rows, extractor) do
-    values =
-      rows
-      |> Enum.map(extractor)
-      |> Enum.sort()
-
+    values = rows |> Enum.map(extractor) |> Enum.sort()
     Enum.at(values, div(length(values), 2), 0.0)
   end
 
   @spec format_float(number()) :: String.t()
-  defp format_float(value) when is_number(value),
-    do: :erlang.float_to_binary(value * 1.0, decimals: 2)
+  defp format_float(value) when is_number(value) do
+    :erlang.float_to_binary(value * 1.0, decimals: 2)
+  end
 
   @spec pad(String.t(), pos_integer()) :: String.t()
-  defp pad(value, width) when is_binary(value), do: String.pad_trailing(value, width)
+  defp pad(value, width) when is_binary(value) do
+    String.pad_trailing(value, width)
+  end
 
   @spec positive(term(), pos_integer()) :: pos_integer()
-  defp positive(value, _default) when is_integer(value) and value > 0, do: value
-  defp positive(_value, default), do: default
+  defp positive(value, _default) when is_integer(value) and value > 0 do
+    value
+  end
+
+  defp positive(_value, default) do
+    default
+  end
 
   @spec helper_module() :: module()
-  defp helper_module, do: Module.concat([Endurant, TestSupport, PostgresHelper])
+  defp helper_module do
+    Module.concat([Endurant, TestSupport, PostgresHelper])
+  end
 
   @spec helper_repo() :: module()
-  defp helper_repo, do: Module.concat([helper_module(), Repo])
+  defp helper_repo do
+    Module.concat([helper_module(), Repo])
+  end
 
   @spec helper_call!(atom(), [term()]) :: term()
-  defp helper_call!(function, args), do: apply(helper_module(), function, args)
+  defp helper_call!(function, args) do
+    apply(helper_module(), function, args)
+  end
 end
 
 defmodule Endurant.Perf.GeneralWorkflow do
@@ -340,14 +343,11 @@ defmodule Endurant.Perf.GeneralWorkflow do
   workflow do
     queue("perf")
     unique_id(fn input -> "perf-general:#{input.id}" end)
-
     @impl true
     @spec run(Endurant.Workflow.version(), Endurant.Workflow.input()) ::
             Endurant.Workflow.result()
     def run(_version, input) do
-      task(nil, "step_1", fn _ ->
-        input.id + 1
-      end)
+      task(nil, "step_1", fn _ -> input.id + 1 end)
     end
   end
 end

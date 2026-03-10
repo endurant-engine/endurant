@@ -1,7 +1,7 @@
 defmodule Endurant.Integration.SignalSemanticsTest do
   use Endurant.TestSupport.IntegrationCase
 
-  test "signals sent after wait starts are consumed in order", %{runtime_opts: runtime_opts} do
+  test("signals sent after wait starts are consumed in order", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.SignalSemanticsTest.AfterWaitWorkflow do
@@ -25,38 +25,47 @@ defmodule Endurant.Integration.SignalSemanticsTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.SignalSemanticsTest.AfterWaitWorkflow,
-               %{id: "aw-1"},
-               runtime_opts
+               %{id: "aw-1"}
              )
 
-    assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
+    assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
 
     assert :ok =
              Endurant.signal(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                execution.id,
                "approval_requested",
-               %{n: 1},
-               runtime_opts
+               %{n: 1}
              )
 
     assert :ok =
              Endurant.signal(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                execution.id,
                "approval_requested",
-               %{n: 2},
-               runtime_opts
+               %{n: 2}
              )
 
     assert {:ok, %{status: :completed, result: result}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     assert result == %{id: "aw-1", approvals: [%{n: 1}, %{n: 2}]}
   end
 
-  test "signal to completed execution returns not_active and is not appended", %{
+  test("signal to completed execution returns not_active and is not appended", %{
     runtime_opts: runtime_opts
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.SignalSemanticsTest.CompletedSignalWorkflow do
@@ -78,22 +87,30 @@ defmodule Endurant.Integration.SignalSemanticsTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.SignalSemanticsTest.CompletedSignalWorkflow,
-               %{id: "sc-1"},
-               runtime_opts
+               %{id: "sc-1"}
              )
 
     assert {:ok, %{status: :completed}} =
-             PostgresHelper.wait_for_execution!(execution.id, 5_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
 
     assert {:error, :not_active} =
-             Endurant.signal(execution.id, "after_done", %{n: 1}, runtime_opts)
+             Endurant.signal(
+               Keyword.fetch!(runtime_opts, :instance),
+               execution.id,
+               "after_done",
+               %{n: 1}
+             )
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     refute Enum.any?(events, &(&1.type == :signal_received))
   end
 
-  test "does not spam execution_waiting for repeated signal waits", %{runtime_opts: runtime_opts} do
+  test("does not spam execution_waiting for repeated signal waits", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.SignalSemanticsTest.WaitEventSpamWorkflow do
@@ -123,24 +140,29 @@ defmodule Endurant.Integration.SignalSemanticsTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.SignalSemanticsTest.WaitEventSpamWorkflow,
-               %{id: "spam-1"},
-               runtime_opts
+               %{id: "spam-1"}
              )
 
-    assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
+    assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
 
     assert :ok =
              Endurant.signal(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                execution.id,
                "user_message",
-               %{text: "Hi"},
-               runtime_opts
+               %{text: "Hi"}
              )
 
-    assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
+    assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
     Process.sleep(300)
-
     {:ok, mid_events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.count(mid_events, &(&1.type == :execution_waiting)) == 2
     assert Enum.count(mid_events, &(&1.type == :task_started)) == 1
@@ -148,23 +170,26 @@ defmodule Endurant.Integration.SignalSemanticsTest do
 
     assert :ok =
              Endurant.signal(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                execution.id,
                "user_message",
-               %{text: "Again"},
-               runtime_opts
+               %{text: "Again"}
              )
 
     assert {:ok, %{status: :completed}} =
-             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     {:ok, final_events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.count(final_events, &(&1.type == :execution_waiting)) == 2
   end
 
-  test "crash during task then restart resumes and completes with queued signal", %{
+  test("crash during task then restart resumes and completes with queued signal", %{
     runtime_opts: runtime_opts,
     engine_name: engine_name
-  } do
+  }) do
     workflow_module =
       quote do
         defmodule Endurant.Integration.SignalSemanticsTest.CrashDuringTaskWorkflow do
@@ -180,7 +205,7 @@ defmodule Endurant.Integration.SignalSemanticsTest do
             payload = wait_signal("user_message")
 
             task(nil, "assistant_reply:1", fn _ ->
-              Process.sleep(5_000)
+              Process.sleep(5000)
               %{content: payload["text"] || payload[:text] || ""}
             end)
 
@@ -193,19 +218,25 @@ defmodule Endurant.Integration.SignalSemanticsTest do
 
     assert {:ok, execution} =
              Endurant.insert(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                Endurant.Integration.SignalSemanticsTest.CrashDuringTaskWorkflow,
-               %{id: "crash-1"},
-               runtime_opts
+               %{id: "crash-1"}
              )
 
-    assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
+    assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
 
     assert :ok =
              Endurant.signal(
+               Keyword.fetch!(
+                 runtime_opts,
+                 :instance
+               ),
                execution.id,
                "user_message",
-               %{text: "resume me"},
-               runtime_opts
+               %{text: "resume me"}
              )
 
     assert :ok =
@@ -215,11 +246,11 @@ defmodule Endurant.Integration.SignalSemanticsTest do
                  event.type == :task_started and
                    payload_value(event.payload, "task") == "assistant_reply:1"
                end,
-               2_000,
+               2000,
                runtime_opts
              )
 
-    pid = :global.whereis_name({:endurant_supervisor, engine_name})
+    pid = Endurant.Supervisor.supervisor_pid(engine_name)
 
     if is_pid(pid) do
       Process.exit(pid, :kill)
@@ -229,11 +260,10 @@ defmodule Endurant.Integration.SignalSemanticsTest do
     end
 
     force_lock_expired!(execution.id, runtime_opts)
-
-    assert :ok = wait_for_process_up(engine_name, 2_000)
+    assert :ok = wait_for_process_up(engine_name, 2000)
 
     assert {:ok, %{status: :completed, result: %{id: "crash-1", ok: true}}} =
-             PostgresHelper.wait_for_execution!(execution.id, 10_000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 10000, runtime_opts)
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.any?(events, &(&1.type == :execution_abandoned))
@@ -250,7 +280,7 @@ defmodule Endurant.Integration.SignalSemanticsTest do
 
   @spec do_wait_for_status(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_status(execution_id, expected_status, deadline, runtime_opts) do
-    case Endurant.execution(execution_id, runtime_opts) do
+    case Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution_id) do
       %{status: ^expected_status} ->
         expected_status
 
@@ -309,7 +339,7 @@ defmodule Endurant.Integration.SignalSemanticsTest do
 
   @spec do_wait_for_process_up(String.t(), integer()) :: :ok
   defp do_wait_for_process_up(name, deadline) do
-    if is_pid(:global.whereis_name({:endurant_supervisor, name})) do
+    if is_pid(Endurant.Supervisor.supervisor_pid(name)) do
       :ok
     else
       if System.monotonic_time(:millisecond) >= deadline do
@@ -322,12 +352,19 @@ defmodule Endurant.Integration.SignalSemanticsTest do
   end
 
   @spec payload_value(map() | nil, String.t()) :: term()
-  defp payload_value(nil, _key), do: nil
+  defp payload_value(nil, _key) do
+    nil
+  end
 
-  defp payload_value(map, "task") when is_map(map),
-    do: Map.get(map, "task") || Map.get(map, :task)
+  defp payload_value(map, "task") when is_map(map) do
+    Map.get(map, "task") || Map.get(map, :task)
+  end
 
-  defp payload_value(map, _key) when is_map(map), do: map
+  defp payload_value(map, _key) when is_map(map) do
+    map
+  end
 
-  defp payload_value(_value, _key), do: nil
+  defp payload_value(_value, _key) do
+    nil
+  end
 end

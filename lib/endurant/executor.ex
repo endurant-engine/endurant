@@ -336,7 +336,7 @@ defmodule Endurant.Executor do
     :ok
   end
 
-  @spec queue_manager!(keyword()) :: pid() | atom() | {:global, term()} | {:via, module(), term()}
+  @spec queue_manager!(keyword()) :: pid() | atom() | {:via, module(), term()}
   defp queue_manager!(opts) do
     case Keyword.fetch(opts, :queue_manager) do
       {:ok, manager} ->

@@ -27,15 +27,15 @@ defmodule Endurant.TestSupport.IntegrationCase do
       start_supervised(
         {Endurant.Supervisor,
          name: engine_name,
+         repo: PostgresHelper.Repo,
+         prefix: prefix,
          queues: [
-           orders:
-             [limit: 1, parked_limit: 1, poll_interval: 25] ++
-               PostgresHelper.runtime_opts(prefix)
+           orders: [limit: 1, parked_limit: 1, poll_interval: 25]
          ]}
       )
 
     on_exit(fn ->
-      pid = :global.whereis_name({:endurant_supervisor, engine_name})
+      pid = Endurant.Supervisor.supervisor_pid(engine_name)
 
       if is_pid(pid) do
         Process.exit(pid, :shutdown)
@@ -46,7 +46,9 @@ defmodule Endurant.TestSupport.IntegrationCase do
     end)
 
     {:ok,
-     prefix: prefix, runtime_opts: PostgresHelper.runtime_opts(prefix), engine_name: engine_name}
+     prefix: prefix,
+     runtime_opts: PostgresHelper.runtime_opts(prefix, engine_name),
+     engine_name: engine_name}
   end
 
   setup %{prefix: prefix} do
