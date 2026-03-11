@@ -49,8 +49,12 @@ defmodule Endurant do
           | {:queues, queues_option()}
   @type start_options :: [start_option()]
   @type instance_name :: Config.instance_name()
+  @type schedule_options :: [{:id, binary()}]
 
   @type insert_result :: {:ok, map()} | {:error, :unique_conflict}
+  @type schedule_result :: {:ok, map()} | {:error, :id_conflict | :transient_db}
+  @type scheduled_result :: [map()]
+  @type cancel_scheduled_result :: :ok | {:error, :not_found | :not_pending}
   @type signal_result :: :ok | {:error, :not_found | :not_active}
   @type cancel_result :: :ok | {:error, :not_found | :not_active}
   @type execution_result :: map() | nil
@@ -113,6 +117,86 @@ defmodule Endurant do
       when (is_atom(instance) or is_binary(instance)) and is_atom(workflow_module) and
              is_map(input) do
     Endurant.Executions.insert(workflow_module, input, instance_runtime_opts!(instance))
+  end
+
+  @doc """
+  Schedules a workflow execution on the default instance.
+  """
+  @spec schedule(module(), map(), DateTime.t()) :: schedule_result()
+  def schedule(workflow_module, input, scheduled_at)
+      when is_atom(workflow_module) and is_map(input) and is_struct(scheduled_at, DateTime) do
+    schedule(@default_instance, workflow_module, input, scheduled_at, [])
+  end
+
+  @spec schedule(module(), map(), DateTime.t(), schedule_options()) :: schedule_result()
+  def schedule(workflow_module, input, scheduled_at, opts)
+      when is_atom(workflow_module) and is_map(input) and is_struct(scheduled_at, DateTime) and
+             is_list(opts) do
+    schedule(@default_instance, workflow_module, input, scheduled_at, opts)
+  end
+
+  @doc """
+  Schedules a workflow execution to be dispatched at a future time.
+
+  `scheduled_at` must be a UTC `DateTime`.
+  """
+  @spec schedule(instance_name(), module(), map(), DateTime.t(), schedule_options()) ::
+          schedule_result()
+  def schedule(instance, workflow_module, input, scheduled_at, opts \\ [])
+      when (is_atom(instance) or is_binary(instance)) and is_atom(workflow_module) and
+             is_map(input) and is_struct(scheduled_at, DateTime) and is_list(opts) do
+    runtime_opts = instance_runtime_opts!(instance)
+
+    Endurant.Schedules.insert(
+      workflow_module,
+      input,
+      scheduled_at,
+      Keyword.merge(runtime_opts, opts)
+    )
+  end
+
+  @doc """
+  Lists scheduled rows from the default instance.
+  """
+  @spec scheduled() :: scheduled_result()
+  def scheduled do
+    scheduled(@default_instance, [])
+  end
+
+  @spec scheduled(instance_name()) :: scheduled_result()
+  def scheduled(instance) when is_atom(instance) or is_binary(instance) do
+    scheduled(instance, [])
+  end
+
+  @spec scheduled(keyword()) :: scheduled_result()
+  def scheduled(filters) when is_list(filters) do
+    scheduled(@default_instance, filters)
+  end
+
+  @doc """
+  Lists scheduled rows from an instance.
+  """
+  @spec scheduled(instance_name(), keyword()) :: scheduled_result()
+  def scheduled(instance, filters)
+      when (is_atom(instance) or is_binary(instance)) and is_list(filters) do
+    Endurant.Schedules.list(filters, instance_runtime_opts!(instance))
+  end
+
+  @doc """
+  Cancels one scheduled row on the default instance.
+  """
+  @spec cancel_scheduled(binary()) :: cancel_scheduled_result()
+  def cancel_scheduled(schedule_id) when is_binary(schedule_id) do
+    cancel_scheduled(@default_instance, schedule_id)
+  end
+
+  @doc """
+  Cancels one scheduled row on an instance.
+  """
+  @spec cancel_scheduled(instance_name(), binary()) :: cancel_scheduled_result()
+  def cancel_scheduled(instance, schedule_id)
+      when (is_atom(instance) or is_binary(instance)) and is_binary(schedule_id) do
+    Endurant.Schedules.cancel(schedule_id, instance_runtime_opts!(instance))
   end
 
   @doc """

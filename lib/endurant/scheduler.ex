@@ -3,12 +3,15 @@ defmodule Endurant.Scheduler do
 
   use GenServer
 
+  alias Endurant.Schedules
   alias Endurant.Settings
 
   @default_prefix "public"
   @default_lease_ms 30_000
   @default_heartbeat_ms 10_000
   @default_retry_ms 2_000
+  @default_dispatch_ms 250
+  @default_dispatch_limit 50
 
   defstruct [
     :instance,
@@ -17,6 +20,8 @@ defmodule Endurant.Scheduler do
     :lease_ms,
     :heartbeat_ms,
     :retry_ms,
+    :dispatch_ms,
+    :dispatch_limit,
     :runtime_opts,
     :fence,
     active?: false
@@ -29,6 +34,8 @@ defmodule Endurant.Scheduler do
           lease_ms: pos_integer(),
           heartbeat_ms: pos_integer(),
           retry_ms: pos_integer(),
+          dispatch_ms: pos_integer(),
+          dispatch_limit: pos_integer(),
           runtime_opts: keyword(),
           fence: non_neg_integer() | nil,
           active?: boolean()
@@ -60,6 +67,15 @@ defmodule Endurant.Scheduler do
 
     retry_ms = positive_integer(Keyword.get(opts, :retry_ms, @default_retry_ms), :retry_ms)
 
+    dispatch_ms =
+      positive_integer(Keyword.get(opts, :dispatch_ms, @default_dispatch_ms), :dispatch_ms)
+
+    dispatch_limit =
+      positive_integer(
+        Keyword.get(opts, :dispatch_limit, @default_dispatch_limit),
+        :dispatch_limit
+      )
+
     state = %__MODULE__{
       instance: instance,
       setting_id: Keyword.get(opts, :setting_id, setting_id(instance)),
@@ -67,6 +83,8 @@ defmodule Endurant.Scheduler do
       lease_ms: lease_ms,
       heartbeat_ms: heartbeat_ms,
       retry_ms: retry_ms,
+      dispatch_ms: dispatch_ms,
+      dispatch_limit: dispatch_limit,
       runtime_opts: [repo: repo, prefix: prefix]
     }
 
@@ -111,6 +129,17 @@ defmodule Endurant.Scheduler do
   end
 
   @impl true
+  def handle_info(:dispatch, %__MODULE__{active?: true} = state) do
+    _ = Schedules.dispatch_due(state.dispatch_limit, state.runtime_opts)
+    schedule(:dispatch, state.dispatch_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(:dispatch, %__MODULE__{} = state) do
+    {:noreply, state}
+  end
+
+  @impl true
   def terminate(_reason, %__MODULE__{active?: true} = state) do
     _ = Settings.release_lease(state.setting_id, state.owner, state.runtime_opts)
     :ok
@@ -137,6 +166,7 @@ defmodule Endurant.Scheduler do
     case Settings.claim_lease(state.setting_id, state.owner, state.lease_ms, state.runtime_opts) do
       {:ok, fence} ->
         schedule(:heartbeat, state.heartbeat_ms)
+        schedule(:dispatch, 0)
         %{state | active?: true, fence: fence}
 
       :busy ->

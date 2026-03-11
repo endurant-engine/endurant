@@ -47,6 +47,26 @@ defmodule Endurant.Migrations.Postgres.V01 do
       """)
     end
 
+    unless type_exists?(prefix, "endurant_schedule_overlap_policy") do
+      execute("""
+      CREATE TYPE #{quoted}.endurant_schedule_overlap_policy AS ENUM (
+        'skip'
+      );
+      """)
+    end
+
+    unless type_exists?(prefix, "endurant_scheduled_execution_status") do
+      execute("""
+      CREATE TYPE #{quoted}.endurant_scheduled_execution_status AS ENUM (
+        'pending',
+        'dispatched',
+        'skipped',
+        'failed',
+        'cancelled'
+      );
+      """)
+    end
+
     create_if_not_exists table(:endurant_executions, primary_key: false, prefix: prefix) do
       add(:id, :binary_id, primary_key: true)
       add(:unique_id, :text, null: false)
@@ -172,6 +192,60 @@ defmodule Endurant.Migrations.Postgres.V01 do
       )
     )
 
+    create_if_not_exists table(:endurant_scheduled_executions, primary_key: false, prefix: prefix) do
+      add(:id, :binary_id, primary_key: true)
+      add(:unique_id, :text, null: false)
+      add(:queue, :text, null: false)
+      add(:workflow_name, :text, null: false)
+      add(:version, :text, null: false, default: "1")
+      add(:input, :map, null: false)
+      add(:scheduled_at, :utc_datetime_usec, null: false)
+      add(:overlap_policy, :"#{quoted}.endurant_schedule_overlap_policy", null: false)
+      add(:status, :"#{quoted}.endurant_scheduled_execution_status", null: false)
+
+      add(
+        :dispatched_execution_id,
+        references(:endurant_executions,
+          type: :binary_id,
+          on_delete: :nilify_all,
+          prefix: prefix
+        )
+      )
+
+      add(:inserted_at, :utc_datetime_usec,
+        null: false,
+        default: fragment("timezone('UTC', now())")
+      )
+
+      add(:updated_at, :utc_datetime_usec,
+        null: false,
+        default: fragment("timezone('UTC', now())")
+      )
+    end
+
+    create_if_not_exists(
+      index(:endurant_scheduled_executions, [:status, :scheduled_at, :id],
+        name: :endurant_scheduled_executions_claim_due_idx,
+        where: "status = 'pending'",
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_scheduled_executions, [:unique_id, :status],
+        name: :endurant_scheduled_executions_unique_status_idx,
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_scheduled_executions, [:dispatched_execution_id],
+        name: :endurant_scheduled_executions_dispatched_execution_idx,
+        where: "dispatched_execution_id IS NOT NULL",
+        prefix: prefix
+      )
+    )
+
     create_if_not_exists table(:endurant_settings, primary_key: false, prefix: prefix) do
       add(:id, :text, primary_key: true)
       add(:value, :map, null: false, default: %{})
@@ -228,6 +302,29 @@ defmodule Endurant.Migrations.Postgres.V01 do
   def down(%{prefix: prefix, quoted_prefix: quoted}) do
     drop_if_exists(index(:endurant_events, [:execution_id, :sequence], prefix: prefix))
     drop_if_exists(table(:endurant_events, prefix: prefix))
+
+    drop_if_exists(
+      index(:endurant_scheduled_executions, [:dispatched_execution_id],
+        name: :endurant_scheduled_executions_dispatched_execution_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_scheduled_executions, [:unique_id, :status],
+        name: :endurant_scheduled_executions_unique_status_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_scheduled_executions, [:status, :scheduled_at, :id],
+        name: :endurant_scheduled_executions_claim_due_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(table(:endurant_scheduled_executions, prefix: prefix))
 
     drop_if_exists(
       index(:endurant_settings, [:updated_at],
@@ -318,6 +415,8 @@ defmodule Endurant.Migrations.Postgres.V01 do
 
     execute("DROP INDEX IF EXISTS #{quoted}.endurant_executions_one_open_unique_idx")
     drop_if_exists(table(:endurant_executions, prefix: prefix))
+    execute("DROP TYPE IF EXISTS #{quoted}.endurant_scheduled_execution_status")
+    execute("DROP TYPE IF EXISTS #{quoted}.endurant_schedule_overlap_policy")
     execute("DROP TYPE IF EXISTS #{quoted}.endurant_event_type")
     execute("DROP TYPE IF EXISTS #{quoted}.endurant_execution_status")
 
