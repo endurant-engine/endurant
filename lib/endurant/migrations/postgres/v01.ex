@@ -47,6 +47,35 @@ defmodule Endurant.Migrations.Postgres.V01 do
       """)
     end
 
+    unless type_exists?(prefix, "endurant_schedule_overlap_policy") do
+      execute("""
+      CREATE TYPE #{quoted}.endurant_schedule_overlap_policy AS ENUM (
+        'skip'
+      );
+      """)
+    end
+
+    unless type_exists?(prefix, "endurant_scheduled_execution_status") do
+      execute("""
+      CREATE TYPE #{quoted}.endurant_scheduled_execution_status AS ENUM (
+        'pending',
+        'dispatched',
+        'skipped',
+        'failed',
+        'cancelled'
+      );
+      """)
+    end
+
+    unless type_exists?(prefix, "endurant_cron_schedule_status") do
+      execute("""
+      CREATE TYPE #{quoted}.endurant_cron_schedule_status AS ENUM (
+        'active',
+        'paused'
+      );
+      """)
+    end
+
     create_if_not_exists table(:endurant_executions, primary_key: false, prefix: prefix) do
       add(:id, :binary_id, primary_key: true)
       add(:unique_id, :text, null: false)
@@ -172,6 +201,149 @@ defmodule Endurant.Migrations.Postgres.V01 do
       )
     )
 
+    create_if_not_exists table(:endurant_scheduled_executions, primary_key: false, prefix: prefix) do
+      add(:id, :binary_id, primary_key: true)
+      add(:unique_id, :text, null: false)
+      add(:queue, :text, null: false)
+      add(:workflow_name, :text, null: false)
+      add(:version, :text, null: false, default: "1")
+      add(:input, :map, null: false)
+      add(:scheduled_at, :utc_datetime_usec, null: false)
+      add(:overlap_policy, :"#{quoted}.endurant_schedule_overlap_policy", null: false)
+      add(:status, :"#{quoted}.endurant_scheduled_execution_status", null: false)
+      add(:cron_schedule_id, :binary_id)
+
+      add(
+        :dispatched_execution_id,
+        references(:endurant_executions,
+          type: :binary_id,
+          on_delete: :nilify_all,
+          prefix: prefix
+        )
+      )
+
+      add(:inserted_at, :utc_datetime_usec,
+        null: false,
+        default: fragment("timezone('UTC', now())")
+      )
+
+      add(:updated_at, :utc_datetime_usec,
+        null: false,
+        default: fragment("timezone('UTC', now())")
+      )
+    end
+
+    create_if_not_exists(
+      index(:endurant_scheduled_executions, [:status, :scheduled_at, :id],
+        name: :endurant_scheduled_executions_claim_due_idx,
+        where: "status = 'pending'",
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_scheduled_executions, [:unique_id, :status],
+        name: :endurant_scheduled_executions_unique_status_idx,
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_scheduled_executions, [:dispatched_execution_id],
+        name: :endurant_scheduled_executions_dispatched_execution_idx,
+        where: "dispatched_execution_id IS NOT NULL",
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      unique_index(:endurant_scheduled_executions, [:cron_schedule_id, :scheduled_at],
+        name: :endurant_scheduled_executions_cron_scheduled_unique_idx,
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_scheduled_executions, [:cron_schedule_id, :scheduled_at, :id],
+        name: :endurant_scheduled_executions_cron_recent_idx,
+        where: "cron_schedule_id IS NOT NULL",
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists table(:endurant_cron_schedules, primary_key: false, prefix: prefix) do
+      add(:id, :binary_id, primary_key: true)
+      add(:name, :text)
+      add(:unique_id, :text, null: false)
+      add(:queue, :text, null: false)
+      add(:workflow_name, :text, null: false)
+      add(:version, :text, null: false, default: "1")
+      add(:input, :map, null: false)
+      add(:cron_expr, :text, null: false)
+      add(:timezone, :text, null: false, default: "Etc/UTC")
+      add(:start_at, :utc_datetime_usec, null: false)
+      add(:end_at, :utc_datetime_usec)
+      add(:next_run_at, :utc_datetime_usec, null: false)
+      add(:overlap_policy, :"#{quoted}.endurant_schedule_overlap_policy", null: false)
+      add(:status, :"#{quoted}.endurant_cron_schedule_status", null: false)
+
+      add(:inserted_at, :utc_datetime_usec,
+        null: false,
+        default: fragment("timezone('UTC', now())")
+      )
+
+      add(:updated_at, :utc_datetime_usec,
+        null: false,
+        default: fragment("timezone('UTC', now())")
+      )
+    end
+
+    create_if_not_exists(
+      index(:endurant_cron_schedules, [:status, :next_run_at, :id],
+        name: :endurant_cron_schedules_claim_due_idx,
+        where: "status = 'active'",
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_cron_schedules, [:name],
+        unique: true,
+        name: :endurant_cron_schedules_name_unique_idx,
+        where: "name IS NOT NULL",
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_cron_schedules, [:unique_id, :status],
+        name: :endurant_cron_schedules_unique_status_idx,
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists table(:endurant_settings, primary_key: false, prefix: prefix) do
+      add(:id, :text, primary_key: true)
+      add(:value, :map, null: false, default: %{})
+
+      add(:inserted_at, :utc_datetime_usec,
+        null: false,
+        default: fragment("timezone('UTC', now())")
+      )
+
+      add(:updated_at, :utc_datetime_usec,
+        null: false,
+        default: fragment("timezone('UTC', now())")
+      )
+    end
+
+    create_if_not_exists(
+      index(:endurant_settings, [:updated_at],
+        name: :endurant_settings_updated_at_idx,
+        prefix: prefix
+      )
+    )
+
     create_if_not_exists table(:endurant_events, primary_key: false, prefix: prefix) do
       add(:id, :bigserial, primary_key: true)
 
@@ -206,6 +378,75 @@ defmodule Endurant.Migrations.Postgres.V01 do
   def down(%{prefix: prefix, quoted_prefix: quoted}) do
     drop_if_exists(index(:endurant_events, [:execution_id, :sequence], prefix: prefix))
     drop_if_exists(table(:endurant_events, prefix: prefix))
+
+    drop_if_exists(
+      index(:endurant_cron_schedules, [:unique_id, :status],
+        name: :endurant_cron_schedules_unique_status_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_cron_schedules, [:name],
+        name: :endurant_cron_schedules_name_unique_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_cron_schedules, [:status, :next_run_at, :id],
+        name: :endurant_cron_schedules_claim_due_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(table(:endurant_cron_schedules, prefix: prefix))
+
+    drop_if_exists(
+      index(:endurant_scheduled_executions, [:cron_schedule_id, :scheduled_at, :id],
+        name: :endurant_scheduled_executions_cron_recent_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_scheduled_executions, [:cron_schedule_id, :scheduled_at],
+        name: :endurant_scheduled_executions_cron_scheduled_unique_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_scheduled_executions, [:dispatched_execution_id],
+        name: :endurant_scheduled_executions_dispatched_execution_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_scheduled_executions, [:unique_id, :status],
+        name: :endurant_scheduled_executions_unique_status_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_scheduled_executions, [:status, :scheduled_at, :id],
+        name: :endurant_scheduled_executions_claim_due_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(table(:endurant_scheduled_executions, prefix: prefix))
+
+    drop_if_exists(
+      index(:endurant_settings, [:updated_at],
+        name: :endurant_settings_updated_at_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(table(:endurant_settings, prefix: prefix))
 
     drop_if_exists(
       index(:endurant_executions, [:queue, :locked_until, :id],
@@ -287,6 +528,9 @@ defmodule Endurant.Migrations.Postgres.V01 do
 
     execute("DROP INDEX IF EXISTS #{quoted}.endurant_executions_one_open_unique_idx")
     drop_if_exists(table(:endurant_executions, prefix: prefix))
+    execute("DROP TYPE IF EXISTS #{quoted}.endurant_cron_schedule_status")
+    execute("DROP TYPE IF EXISTS #{quoted}.endurant_scheduled_execution_status")
+    execute("DROP TYPE IF EXISTS #{quoted}.endurant_schedule_overlap_policy")
     execute("DROP TYPE IF EXISTS #{quoted}.endurant_event_type")
     execute("DROP TYPE IF EXISTS #{quoted}.endurant_execution_status")
 

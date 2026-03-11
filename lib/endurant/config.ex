@@ -12,17 +12,19 @@ defmodule Endurant.Config do
           repo: module(),
           prefix: String.t(),
           queues: keyword(keyword()),
-          queue_defaults: keyword()
+          queue_defaults: keyword(),
+          crons: [map()]
         }
 
-  @enforce_keys [:name, :repo, :prefix, :queues, :queue_defaults]
-  defstruct [:name, :repo, :prefix, :queues, :queue_defaults]
+  @enforce_keys [:name, :repo, :prefix, :queues, :queue_defaults, :crons]
+  defstruct [:name, :repo, :prefix, :queues, :queue_defaults, :crons]
 
   @spec new!(keyword()) :: t()
   def new!(opts) when is_list(opts) do
     name = require_name!(opts)
     queue_defaults = queue_defaults!(opts)
     queues = queues!(opts)
+    crons = crons!(opts)
     repo = repo!(opts)
     prefix = prefix!(opts)
 
@@ -42,7 +44,8 @@ defmodule Endurant.Config do
       repo: repo,
       prefix: prefix,
       queues: normalized_queues,
-      queue_defaults: queue_defaults
+      queue_defaults: queue_defaults,
+      crons: crons
     }
   end
 
@@ -88,6 +91,132 @@ defmodule Endurant.Config do
         raise ArgumentError,
               ":queue_defaults must be a keyword list, got: #{inspect(other)}"
     end
+  end
+
+  @spec crons!(keyword()) :: [map()]
+  defp crons!(opts) do
+    case Keyword.get(opts, :crons, []) do
+      crons when is_list(crons) ->
+        normalized = Enum.map(crons, &normalize_cron!/1)
+        validate_unique_cron_names!(normalized)
+        normalized
+
+      other ->
+        raise ArgumentError, ":crons must be a list, got: #{inspect(other)}"
+    end
+  end
+
+  @spec normalize_cron!(term()) :: map()
+  defp normalize_cron!(entry) when is_list(entry) do
+    if Keyword.keyword?(entry) do
+      normalize_cron_map!(Map.new(entry))
+    else
+      raise ArgumentError, "each cron config entry must be a map or keyword list, got: #{inspect(entry)}"
+    end
+  end
+
+  defp normalize_cron!(%{} = entry), do: normalize_cron_map!(entry)
+
+  defp normalize_cron!(other) do
+    raise ArgumentError, "each cron config entry must be a map or keyword list, got: #{inspect(other)}"
+  end
+
+  @spec normalize_cron_map!(map()) :: map()
+  defp normalize_cron_map!(entry) do
+    name = require_non_empty_binary!(Map.get(entry, :name) || Map.get(entry, "name"), :name)
+
+    cron_expr =
+      require_non_empty_binary!(
+        Map.get(entry, :expr) || Map.get(entry, "expr") || Map.get(entry, :cron_expr) ||
+          Map.get(entry, "cron_expr"),
+        :expr
+      )
+
+    workflow =
+      case Map.get(entry, :workflow) || Map.get(entry, "workflow") do
+        workflow when is_atom(workflow) ->
+          workflow
+
+        other ->
+          raise ArgumentError, "cron :workflow must be a module atom, got: #{inspect(other)}"
+      end
+
+    input =
+      case Map.get(entry, :input) || Map.get(entry, "input") || %{} do
+        input when is_map(input) -> input
+        other -> raise ArgumentError, "cron :input must be a map, got: #{inspect(other)}"
+      end
+
+    timezone =
+      case Map.get(entry, :timezone) || Map.get(entry, "timezone") || "Etc/UTC" do
+        timezone when is_binary(timezone) and timezone != "" -> timezone
+        other -> raise ArgumentError, "cron :timezone must be a non-empty string, got: #{inspect(other)}"
+      end
+
+    start_at =
+      case Map.get(entry, :start_at) || Map.get(entry, "start_at") || DateTime.utc_now() do
+        %DateTime{} = dt -> dt
+        other -> raise ArgumentError, "cron :start_at must be DateTime, got: #{inspect(other)}"
+      end
+
+    end_at =
+      case Map.get(entry, :end_at) || Map.get(entry, "end_at") do
+        nil -> nil
+        %DateTime{} = dt -> dt
+        other -> raise ArgumentError, "cron :end_at must be DateTime or nil, got: #{inspect(other)}"
+      end
+
+    status = normalize_cron_status!(Map.get(entry, :status) || Map.get(entry, "status") || :active)
+
+    %{
+      name: name,
+      expr: cron_expr,
+      workflow: workflow,
+      input: input,
+      timezone: timezone,
+      start_at: start_at,
+      end_at: end_at,
+      status: status
+    }
+  end
+
+  @spec normalize_cron_status!(term()) :: :active | :paused
+  defp normalize_cron_status!(:active), do: :active
+  defp normalize_cron_status!(:paused), do: :paused
+  defp normalize_cron_status!("active"), do: :active
+  defp normalize_cron_status!("paused"), do: :paused
+
+  defp normalize_cron_status!(other) do
+    raise ArgumentError, "cron :status must be :active or :paused, got: #{inspect(other)}"
+  end
+
+  @spec validate_unique_cron_names!([map()]) :: :ok
+  defp validate_unique_cron_names!(crons) do
+    duplicates =
+      crons
+      |> Enum.map(&Map.fetch!(&1, :name))
+      |> Enum.group_by(& &1)
+      |> Enum.filter(fn {_name, names} -> length(names) > 1 end)
+      |> Enum.map(&elem(&1, 0))
+
+    if duplicates != [] do
+      raise ArgumentError, "duplicate cron names are not allowed: #{inspect(duplicates)}"
+    end
+
+    :ok
+  end
+
+  @spec require_non_empty_binary!(term(), atom()) :: String.t()
+  defp require_non_empty_binary!(value, field) when is_binary(value) do
+    if String.trim(value) == "" do
+      raise ArgumentError, "cron #{inspect(field)} must be a non-empty string"
+    end
+
+    value
+  end
+
+  defp require_non_empty_binary!(value, field) do
+    raise ArgumentError, "cron #{inspect(field)} must be a non-empty string, got: #{inspect(value)}"
   end
 
   @spec queues!(keyword()) :: keyword(keyword())

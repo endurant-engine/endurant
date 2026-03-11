@@ -4,6 +4,7 @@ defmodule Endurant.Supervisor do
   use Supervisor
 
   alias Endurant.Config
+  alias Endurant.Crons
   alias Endurant.Registry
 
   @spec start_link(keyword()) :: Supervisor.on_start()
@@ -30,19 +31,38 @@ defmodule Endurant.Supervisor do
         raise "endurant instance #{inspect(config.name)} is already started at #{inspect(pid)}"
     end
 
+    sync_config_crons!(config)
     :ok = Registry.put_config(config)
 
-    children =
-      Enum.map(config.queues, fn {queue, queue_opts} ->
-        %{
-          id: {:queue_manager, queue},
-          start:
-            {Endurant.QueueManager, :start_link,
-             [[instance: config.name, queue: queue, opts: queue_opts]]}
-        }
-      end)
+    children = [
+      %{
+        id: :scheduler,
+        start:
+          {Endurant.Scheduler, :start_link,
+           [[instance: config.name, repo: config.repo, prefix: config.prefix]]}
+      }
+      | Enum.map(config.queues, fn {queue, queue_opts} ->
+          %{
+            id: {:queue_manager, queue},
+            start:
+              {Endurant.QueueManager, :start_link,
+               [[instance: config.name, queue: queue, opts: queue_opts]]}
+          }
+        end)
+    ]
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  @spec sync_config_crons!(Config.t()) :: :ok
+  defp sync_config_crons!(%Config{} = config) do
+    case Crons.sync_from_config(config.crons, Config.runtime_opts(config)) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise "failed to sync config crons: #{inspect(reason)}"
+    end
   end
 
   @spec supervisor_name(Config.instance_name()) :: pid() | nil

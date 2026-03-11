@@ -10,6 +10,7 @@ Workflows are defined as Elixir modules and written as code. Executions state is
 - Durable execution with retry support
 - Signal-based waiting for external input
 - Time-based waiting with `sleep/2`
+- One-time future scheduling with `Endurant.schedule/..`
+- Recurring cron scheduling with `Endurant.cron/..`
 - Parallel task patterns with async primitives
 - Event history for debugging and auditing
-

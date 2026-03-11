@@ -55,6 +55,8 @@ defmodule Endurant.MixProject do
       "docs/concepts/tasks.md",
       "docs/concepts/signals.md",
       "docs/concepts/sleep.md",
+      "docs/concepts/schedules.md",
+      "docs/concepts/cron.md",
       "docs/concepts/async.md"
     ]
 
