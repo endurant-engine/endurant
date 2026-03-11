@@ -16,6 +16,7 @@ defmodule Endurant do
   """
 
   alias Endurant.Config
+  alias Endurant.Crons
   alias Endurant.Registry
 
   @default_instance Endurant
@@ -50,11 +51,25 @@ defmodule Endurant do
   @type start_options :: [start_option()]
   @type instance_name :: Config.instance_name()
   @type schedule_options :: [{:id, binary()}]
+  @type cron_options ::
+          [
+            {:id, binary()}
+            | {:name, String.t()}
+            | {:timezone, String.t()}
+            | {:start_at, DateTime.t()}
+            | {:end_at, DateTime.t()}
+          ]
 
   @type insert_result :: {:ok, map()} | {:error, :unique_conflict}
   @type schedule_result :: {:ok, map()} | {:error, :id_conflict | :transient_db}
   @type scheduled_result :: [map()]
   @type cancel_scheduled_result :: :ok | {:error, :not_found | :not_pending}
+  @type cron_result :: {:ok, map()} | {:error, term()}
+  @type crons_result :: [map()]
+  @type cron_fires_result :: [map()]
+  @type pause_cron_result :: :ok | {:error, :not_found | :not_active | :transient_db}
+  @type resume_cron_result :: :ok | {:error, :not_found | :not_paused | :ended | :transient_db}
+  @type cancel_cron_result :: :ok | {:error, :not_found | :transient_db}
   @type signal_result :: :ok | {:error, :not_found | :not_active}
   @type cancel_result :: :ok | {:error, :not_found | :not_active}
   @type execution_result :: map() | nil
@@ -159,27 +174,16 @@ defmodule Endurant do
   Lists scheduled rows from the default instance.
   """
   @spec scheduled() :: scheduled_result()
-  def scheduled do
-    scheduled(@default_instance, [])
-  end
-
   @spec scheduled(instance_name()) :: scheduled_result()
-  def scheduled(instance) when is_atom(instance) or is_binary(instance) do
-    scheduled(instance, [])
-  end
-
   @spec scheduled(keyword()) :: scheduled_result()
-  def scheduled(filters) when is_list(filters) do
-    scheduled(@default_instance, filters)
-  end
-
-  @doc """
-  Lists scheduled rows from an instance.
-  """
   @spec scheduled(instance_name(), keyword()) :: scheduled_result()
-  def scheduled(instance, filters)
-      when (is_atom(instance) or is_binary(instance)) and is_list(filters) do
-    Endurant.Schedules.list(filters, instance_runtime_opts!(instance))
+  def scheduled(instance_or_filters \\ @default_instance, filters \\ [])
+
+  def scheduled(instance_or_filters, filters) when is_list(filters) do
+    {instance, resolved_filters} =
+      normalize_instance_and_filters!(instance_or_filters, filters, :scheduled)
+
+    Endurant.Schedules.list(resolved_filters, instance_runtime_opts!(instance))
   end
 
   @doc """
@@ -197,6 +201,116 @@ defmodule Endurant do
   def cancel_scheduled(instance, schedule_id)
       when (is_atom(instance) or is_binary(instance)) and is_binary(schedule_id) do
     Endurant.Schedules.cancel(schedule_id, instance_runtime_opts!(instance))
+  end
+
+  @doc """
+  Creates a cron schedule on the default instance.
+  """
+  @spec cron(module(), map(), String.t()) :: cron_result()
+  @spec cron(module(), map(), String.t(), cron_options()) :: cron_result()
+  def cron(workflow_module, input, cron_expr)
+      when is_atom(workflow_module) and is_map(input) and is_binary(cron_expr) do
+    cron(workflow_module, input, cron_expr, [])
+  end
+
+  def cron(workflow_module, input, cron_expr, opts)
+      when is_atom(workflow_module) and is_map(input) and is_binary(cron_expr) and
+             is_list(opts) do
+    cron(@default_instance, workflow_module, input, cron_expr, opts)
+  end
+
+  @doc """
+  Creates a cron schedule on an instance.
+  """
+  @spec cron(instance_name(), module(), map(), String.t(), cron_options()) :: cron_result()
+  def cron(instance, workflow_module, input, cron_expr, opts \\ [])
+      when (is_atom(instance) or is_binary(instance)) and is_atom(workflow_module) and
+             is_map(input) and is_binary(cron_expr) and is_list(opts) do
+    runtime_opts = instance_runtime_opts!(instance)
+    Crons.insert(workflow_module, input, cron_expr, Keyword.merge(runtime_opts, opts))
+  end
+
+  @doc """
+  Lists cron schedules from the default instance.
+  """
+  @spec crons() :: crons_result()
+  @spec crons(instance_name()) :: crons_result()
+  @spec crons(keyword()) :: crons_result()
+  @spec crons(instance_name(), keyword()) :: crons_result()
+  def crons(instance_or_filters \\ @default_instance, filters \\ [])
+
+  def crons(instance_or_filters, filters) when is_list(filters) do
+    {instance, resolved_filters} =
+      normalize_instance_and_filters!(instance_or_filters, filters, :crons)
+
+    Crons.list(resolved_filters, instance_runtime_opts!(instance))
+  end
+
+  @doc """
+  Lists recent cron fires for one schedule.
+  """
+  @spec cron_fires(binary()) :: cron_fires_result()
+  def cron_fires(cron_id) when is_binary(cron_id) do
+    Crons.list_fires(cron_id, [], instance_runtime_opts!(@default_instance))
+  end
+
+  @spec cron_fires(instance_name(), binary()) :: cron_fires_result()
+  def cron_fires(instance, cron_id)
+      when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) do
+    Crons.list_fires(cron_id, [], instance_runtime_opts!(instance))
+  end
+
+  @spec cron_fires(binary(), keyword()) :: cron_fires_result()
+  def cron_fires(cron_id, filters) when is_binary(cron_id) and is_list(filters) do
+    Crons.list_fires(cron_id, filters, instance_runtime_opts!(@default_instance))
+  end
+
+  @spec cron_fires(instance_name(), binary(), keyword()) :: cron_fires_result()
+  def cron_fires(instance, cron_id, filters)
+      when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) and is_list(filters) do
+    Crons.list_fires(cron_id, filters, instance_runtime_opts!(instance))
+  end
+
+  @doc """
+  Pauses one cron schedule on the default instance.
+  """
+  @spec pause_cron(binary()) :: pause_cron_result()
+  def pause_cron(cron_id) when is_binary(cron_id) do
+    pause_cron(@default_instance, cron_id)
+  end
+
+  @spec pause_cron(instance_name(), binary()) :: pause_cron_result()
+  def pause_cron(instance, cron_id)
+      when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) do
+    Crons.pause(cron_id, instance_runtime_opts!(instance))
+  end
+
+  @doc """
+  Resumes one paused cron schedule on the default instance.
+  """
+  @spec resume_cron(binary()) :: resume_cron_result()
+  def resume_cron(cron_id) when is_binary(cron_id) do
+    resume_cron(@default_instance, cron_id)
+  end
+
+  @spec resume_cron(instance_name(), binary()) :: resume_cron_result()
+  def resume_cron(instance, cron_id)
+      when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) do
+    Crons.resume(cron_id, instance_runtime_opts!(instance))
+  end
+
+  @doc """
+  Cancels one cron schedule on the default instance.
+  """
+  @spec cancel_cron(binary()) :: cancel_cron_result()
+  def cancel_cron(cron_id) when is_binary(cron_id) do
+    cancel_cron(@default_instance, cron_id)
+  end
+
+  @spec cancel_cron(instance_name(), binary()) :: cancel_cron_result()
+  def cancel_cron(instance, cron_id)
+      when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) do
+    Crons.cancel(cron_id, instance_runtime_opts!(instance))
   end
 
   @doc """
@@ -306,6 +420,22 @@ defmodule Endurant do
   def events(instance, execution_id)
       when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) do
     Endurant.Events.list(execution_id, instance_runtime_opts!(instance))
+  end
+
+  @spec normalize_instance_and_filters!(instance_name() | keyword(), keyword(), atom()) ::
+          {instance_name(), keyword()}
+  defp normalize_instance_and_filters!(instance, filters, _kind)
+       when (is_atom(instance) or is_binary(instance)) and is_list(filters) do
+    {instance, filters}
+  end
+
+  defp normalize_instance_and_filters!(filters, [], _kind) when is_list(filters) do
+    {@default_instance, filters}
+  end
+
+  defp normalize_instance_and_filters!(instance_or_filters, filters, kind) do
+    raise ArgumentError,
+          "invalid #{kind} arguments: #{inspect(instance_or_filters)}, #{inspect(filters)}"
   end
 
   @spec instance_runtime_opts!(instance_name()) :: keyword()

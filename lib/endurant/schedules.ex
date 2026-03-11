@@ -9,6 +9,7 @@ defmodule Endurant.Schedules do
 
   @type schedule :: %{
           id: binary(),
+          cron_schedule_id: binary() | nil,
           unique_id: String.t(),
           queue: String.t(),
           workflow: String.t(),
@@ -40,6 +41,7 @@ defmodule Endurant.Schedules do
     sql = """
     SELECT
       id,
+      cron_schedule_id,
       unique_id,
       queue,
       workflow_name,
@@ -58,6 +60,7 @@ defmodule Endurant.Schedules do
       [
         [
           id,
+          cron_schedule_id,
           unique_id,
           queue,
           workflow_name,
@@ -71,6 +74,7 @@ defmodule Endurant.Schedules do
       ] ->
         %{
           id: to_app_id(id),
+          cron_schedule_id: maybe_to_app_id(cron_schedule_id),
           unique_id: unique_id,
           queue: queue,
           workflow: workflow_name,
@@ -93,15 +97,18 @@ defmodule Endurant.Schedules do
     prefix = Keyword.get(opts, :prefix, @default_prefix)
     limit = positive_integer(Keyword.get(filters, :limit, 100), :limit)
     status_filter = Keyword.get(filters, :status)
+    cron_schedule_id_filter = Keyword.get(filters, :cron_schedule_id)
 
-    {where_sql, params} =
-      case status_filter do
-        nil ->
-          {"", []}
+    {clauses, params} =
+      {[], [], 1}
+      |> maybe_add_status_clause(status_filter, prefix)
+      |> maybe_add_cron_schedule_id_clause(cron_schedule_id_filter)
+      |> finalize_clauses()
 
-        value ->
-          status = normalize_schedule_status_filter!(value)
-          {"WHERE s.status = $1::#{prefix}.endurant_scheduled_execution_status", [status]}
+    where_sql =
+      case clauses do
+        [] -> ""
+        _ -> "WHERE " <> Enum.join(clauses, " AND ")
       end
 
     limit_placeholder = "$#{length(params) + 1}"
@@ -109,6 +116,7 @@ defmodule Endurant.Schedules do
     sql = """
     SELECT
       s.id,
+      s.cron_schedule_id,
       s.unique_id,
       s.queue,
       s.workflow_name,
@@ -127,6 +135,7 @@ defmodule Endurant.Schedules do
     query!(repo, sql, params ++ [limit]).rows
     |> Enum.map(fn [
                      id,
+                     cron_schedule_id,
                      unique_id,
                      queue,
                      workflow_name,
@@ -139,6 +148,7 @@ defmodule Endurant.Schedules do
                    ] ->
       %{
         id: to_app_id(id),
+        cron_schedule_id: maybe_to_app_id(cron_schedule_id),
         unique_id: unique_id,
         queue: queue,
         workflow: workflow_name,
@@ -206,10 +216,12 @@ defmodule Endurant.Schedules do
     workflow_name = inspect(workflow_module)
     version = Map.get(workflow, :version, "1")
     scheduled_at_naive = DateTime.to_naive(scheduled_at)
+    cron_schedule_id = maybe_to_db_id(Keyword.get(opts, :cron_schedule_id))
 
     sql = """
     INSERT INTO #{prefix}.endurant_scheduled_executions (
       id,
+      cron_schedule_id,
       unique_id,
       queue,
       workflow_name,
@@ -229,6 +241,7 @@ defmodule Endurant.Schedules do
       $5,
       $6,
       $7,
+      $8,
       'skip'::#{prefix}.endurant_schedule_overlap_policy,
       'pending'::#{prefix}.endurant_scheduled_execution_status,
       timezone('UTC', now()),
@@ -240,6 +253,7 @@ defmodule Endurant.Schedules do
 
     case query!(repo, sql, [
            to_db_id(schedule_id),
+           cron_schedule_id,
            unique_id,
            queue,
            workflow_name,
@@ -251,6 +265,7 @@ defmodule Endurant.Schedules do
         {:ok,
          %{
            id: to_app_id(id),
+           cron_schedule_id: maybe_to_app_id(cron_schedule_id),
            unique_id: unique_id,
            queue: queue,
            workflow: workflow_name,
@@ -275,6 +290,7 @@ defmodule Endurant.Schedules do
     sql = """
     SELECT
       s.id,
+      s.cron_schedule_id,
       s.unique_id,
       s.queue,
       s.workflow_name,
@@ -294,6 +310,7 @@ defmodule Endurant.Schedules do
     query!(repo, sql, [limit]).rows
     |> Enum.map(fn [
                      id,
+                     cron_schedule_id,
                      unique_id,
                      queue,
                      workflow_name,
@@ -306,6 +323,7 @@ defmodule Endurant.Schedules do
                    ] ->
       %{
         id: to_app_id(id),
+        cron_schedule_id: maybe_to_app_id(cron_schedule_id),
         unique_id: unique_id,
         queue: queue,
         workflow: workflow_name,
@@ -498,6 +516,41 @@ defmodule Endurant.Schedules do
     raise ArgumentError, "invalid schedule status filter: #{inspect(status)}"
   end
 
+  @spec maybe_add_status_clause({[String.t()], list(), pos_integer()}, term(), String.t()) ::
+          {[String.t()], list(), pos_integer()}
+  defp maybe_add_status_clause({clauses, params, index}, nil, _prefix),
+    do: {clauses, params, index}
+
+  defp maybe_add_status_clause({clauses, params, index}, status_filter, prefix) do
+    status = normalize_schedule_status_filter!(status_filter)
+    clause = "s.status = $#{index}::#{prefix}.endurant_scheduled_execution_status"
+    {[clause | clauses], params ++ [status], index + 1}
+  end
+
+  @spec maybe_add_cron_schedule_id_clause({[String.t()], list(), pos_integer()}, term()) ::
+          {[String.t()], list(), pos_integer()}
+  defp maybe_add_cron_schedule_id_clause({clauses, params, index}, nil),
+    do: {clauses, params, index}
+
+  defp maybe_add_cron_schedule_id_clause({clauses, params, index}, :manual) do
+    {["s.cron_schedule_id IS NULL" | clauses], params, index}
+  end
+
+  defp maybe_add_cron_schedule_id_clause({clauses, params, index}, cron_schedule_id)
+       when is_binary(cron_schedule_id) do
+    clause = "s.cron_schedule_id = $#{index}"
+    {[clause | clauses], params ++ [to_db_id(cron_schedule_id)], index + 1}
+  end
+
+  defp maybe_add_cron_schedule_id_clause({_clauses, _params, _index}, value) do
+    raise ArgumentError, "invalid cron_schedule_id filter: #{inspect(value)}"
+  end
+
+  @spec finalize_clauses({[String.t()], list(), pos_integer()}) :: {[String.t()], list()}
+  defp finalize_clauses({clauses, params, _index}) do
+    {Enum.reverse(clauses), params}
+  end
+
   @spec resolve_unique_id(map(), map()) :: String.t()
   defp resolve_unique_id(workflow, input) do
     case Map.get(workflow, :unique_id) do
@@ -561,6 +614,10 @@ defmodule Endurant.Schedules do
   @spec maybe_to_app_id(binary() | nil) :: binary() | nil
   defp maybe_to_app_id(nil), do: nil
   defp maybe_to_app_id(id), do: to_app_id(id)
+
+  @spec maybe_to_db_id(binary() | nil) :: binary() | nil
+  defp maybe_to_db_id(nil), do: nil
+  defp maybe_to_db_id(id), do: to_db_id(id)
 
   @spec to_datetime(DateTime.t() | NaiveDateTime.t() | nil) :: DateTime.t() | nil
   defp to_datetime(nil), do: nil

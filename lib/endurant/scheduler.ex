@@ -3,6 +3,7 @@ defmodule Endurant.Scheduler do
 
   use GenServer
 
+  alias Endurant.Crons
   alias Endurant.Schedules
   alias Endurant.Settings
 
@@ -130,6 +131,7 @@ defmodule Endurant.Scheduler do
 
   @impl true
   def handle_info(:dispatch, %__MODULE__{active?: true} = state) do
+    _ = Crons.dispatch_due(state.dispatch_limit, state.runtime_opts)
     _ = Schedules.dispatch_due(state.dispatch_limit, state.runtime_opts)
     schedule(:dispatch, state.dispatch_ms)
     {:noreply, state}
