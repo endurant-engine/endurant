@@ -52,6 +52,7 @@ defmodule Endurant.Crons do
                  {:error, reason} -> repo.rollback(reason)
                end
              end)
+
              :ok
            end,
            log: false
@@ -229,9 +230,9 @@ defmodule Endurant.Crons do
       {:error, :transient_db}
   end
 
-  @spec cancel(binary(), keyword()) ::
+  @spec delete(binary(), keyword()) ::
           :ok | {:error, :not_found | :transient_db}
-  def cancel(cron_id, opts \\ []) when is_binary(cron_id) and is_list(opts) do
+  def delete(cron_id, opts \\ []) when is_binary(cron_id) and is_list(opts) do
     repo = repo!(opts)
     prefix = Keyword.get(opts, :prefix, @default_prefix)
 

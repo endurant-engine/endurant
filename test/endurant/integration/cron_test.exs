@@ -98,7 +98,7 @@ defmodule Endurant.Integration.CronTest do
            end)
   end
 
-  test "public API lists, pauses, resumes, and cancels cron schedules", %{
+  test "public API lists, pauses, resumes, and deletes cron schedules", %{
     engine_name: engine_name,
     runtime_opts: runtime_opts
   } do
@@ -135,7 +135,7 @@ defmodule Endurant.Integration.CronTest do
              end
            end)
 
-    assert :ok = Endurant.cancel_cron(engine_name, cron.id)
+    assert :ok = Endurant.delete_cron(engine_name, cron.id)
 
     assert wait_until(fn ->
              case Crons.get(cron.id, runtime_opts) do

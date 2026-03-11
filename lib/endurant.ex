@@ -47,6 +47,7 @@ defmodule Endurant do
           | {:repo, module()}
           | {:prefix, String.t()}
           | {:queue_defaults, keyword()}
+          | {:crons, [keyword() | map()]}
           | {:queues, queues_option()}
   @type start_options :: [start_option()]
   @type instance_name :: Config.instance_name()
@@ -69,7 +70,7 @@ defmodule Endurant do
   @type cron_fires_result :: [map()]
   @type pause_cron_result :: :ok | {:error, :not_found | :not_active | :transient_db}
   @type resume_cron_result :: :ok | {:error, :not_found | :not_paused | :ended | :transient_db}
-  @type cancel_cron_result :: :ok | {:error, :not_found | :transient_db}
+  @type delete_cron_result :: :ok | {:error, :not_found | :transient_db}
   @type signal_result :: :ok | {:error, :not_found | :not_active}
   @type cancel_result :: :ok | {:error, :not_found | :not_active}
   @type execution_result :: map() | nil
@@ -85,7 +86,19 @@ defmodule Endurant do
   - `:repo` Ecto repo module for this instance.
   - `:prefix` database schema prefix (default `"public"`).
   - `:queue_defaults` queue defaults merged into each queue config.
+  - `:crons` config-managed cron schedules synced on startup.
   - `:queues` queue definitions and queue options.
+
+  `:crons` entry options:
+
+  - `:name` (required) unique cron name.
+  - `:workflow` (required) workflow module.
+  - `:expr` or `:cron_expr` (required) cron expression.
+  - `:input` map payload (default `%{}`).
+  - `:timezone` IANA timezone (default `"Etc/UTC"`).
+  - `:start_at` UTC datetime lower bound (default `DateTime.utc_now/0`).
+  - `:end_at` optional UTC datetime upper bound.
+  - `:status` `:active | :paused` (default `:active`).
 
   Any option not passed directly can come from application config:
 
@@ -143,6 +156,13 @@ defmodule Endurant do
     schedule(@default_instance, workflow_module, input, scheduled_at, [])
   end
 
+  @doc """
+  Schedules a workflow execution on the default instance with options.
+
+  Supported options:
+
+  - `:id` explicit schedule id (UUID string). Defaults to generated UUID.
+  """
   @spec schedule(module(), map(), DateTime.t(), schedule_options()) :: schedule_result()
   def schedule(workflow_module, input, scheduled_at, opts)
       when is_atom(workflow_module) and is_map(input) and is_struct(scheduled_at, DateTime) and
@@ -154,6 +174,12 @@ defmodule Endurant do
   Schedules a workflow execution to be dispatched at a future time.
 
   `scheduled_at` must be a UTC `DateTime`.
+
+  Supported options:
+
+  - `:id` explicit schedule id (UUID string). Defaults to generated UUID.
+
+  Returns `{:error, :id_conflict}` when the provided id already exists.
   """
   @spec schedule(instance_name(), module(), map(), DateTime.t(), schedule_options()) ::
           schedule_result()
@@ -172,6 +198,12 @@ defmodule Endurant do
 
   @doc """
   Lists scheduled rows from the default instance.
+
+  Supported filters:
+
+  - `:status` one of `:pending | :dispatched | :skipped | :failed | :cancelled`
+  - `:cron_schedule_id` list only rows produced by one cron schedule id
+  - `:limit` positive integer (default `100`)
   """
   @spec scheduled() :: scheduled_result()
   @spec scheduled(instance_name()) :: scheduled_result()
@@ -188,6 +220,8 @@ defmodule Endurant do
 
   @doc """
   Cancels one scheduled row on the default instance.
+
+  A row can only be cancelled while `:pending`.
   """
   @spec cancel_scheduled(binary()) :: cancel_scheduled_result()
   def cancel_scheduled(schedule_id) when is_binary(schedule_id) do
@@ -196,6 +230,12 @@ defmodule Endurant do
 
   @doc """
   Cancels one scheduled row on an instance.
+
+  Returns:
+
+  - `:ok` when cancelled.
+  - `{:error, :not_found}` when id doesn't exist.
+  - `{:error, :not_pending}` when already dispatched/skipped/failed/cancelled.
   """
   @spec cancel_scheduled(instance_name(), binary()) :: cancel_scheduled_result()
   def cancel_scheduled(instance, schedule_id)
@@ -213,6 +253,17 @@ defmodule Endurant do
     cron(workflow_module, input, cron_expr, [])
   end
 
+  @doc """
+  Creates a cron schedule on the default instance with options.
+
+  Supported options:
+
+  - `:id` explicit cron id (UUID string), default generated UUID
+  - `:name` optional unique name
+  - `:timezone` IANA timezone (default `"Etc/UTC"`)
+  - `:start_at` UTC datetime lower bound (default `DateTime.utc_now/0`)
+  - `:end_at` optional UTC datetime upper bound
+  """
   def cron(workflow_module, input, cron_expr, opts)
       when is_atom(workflow_module) and is_map(input) and is_binary(cron_expr) and
              is_list(opts) do
@@ -221,6 +272,9 @@ defmodule Endurant do
 
   @doc """
   Creates a cron schedule on an instance.
+
+  Cron schedule rows have `:active | :paused` status. Runtime dispatch creates
+  fire rows in scheduled executions using overlap policy `:skip`.
   """
   @spec cron(instance_name(), module(), map(), String.t(), cron_options()) :: cron_result()
   def cron(instance, workflow_module, input, cron_expr, opts \\ [])
@@ -232,6 +286,11 @@ defmodule Endurant do
 
   @doc """
   Lists cron schedules from the default instance.
+
+  Supported filters:
+
+  - `:status` `:active | :paused`
+  - `:limit` positive integer (default `100`)
   """
   @spec crons() :: crons_result()
   @spec crons(instance_name()) :: crons_result()
@@ -248,6 +307,12 @@ defmodule Endurant do
 
   @doc """
   Lists recent cron fires for one schedule.
+
+  A fire is a scheduled row generated by cron dispatch.
+
+  Supported filters:
+
+  - `:limit` positive integer (default `100`)
   """
   @spec cron_fires(binary()) :: cron_fires_result()
   def cron_fires(cron_id) when is_binary(cron_id) do
@@ -279,6 +344,15 @@ defmodule Endurant do
     pause_cron(@default_instance, cron_id)
   end
 
+  @doc """
+  Pauses one cron schedule on an instance.
+
+  Returns:
+
+  - `:ok` when paused.
+  - `{:error, :not_found}` when id doesn't exist.
+  - `{:error, :not_active}` when already paused.
+  """
   @spec pause_cron(instance_name(), binary()) :: pause_cron_result()
   def pause_cron(instance, cron_id)
       when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) do
@@ -293,6 +367,16 @@ defmodule Endurant do
     resume_cron(@default_instance, cron_id)
   end
 
+  @doc """
+  Resumes one paused cron schedule on an instance.
+
+  Returns:
+
+  - `:ok` when resumed.
+  - `{:error, :not_found}` when id doesn't exist.
+  - `{:error, :not_paused}` when already active.
+  - `{:error, :ended}` when no future run fits within `end_at`.
+  """
   @spec resume_cron(instance_name(), binary()) :: resume_cron_result()
   def resume_cron(instance, cron_id)
       when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) do
@@ -300,17 +384,23 @@ defmodule Endurant do
   end
 
   @doc """
-  Cancels one cron schedule on the default instance.
+  Deletes one cron schedule on the default instance.
   """
-  @spec cancel_cron(binary()) :: cancel_cron_result()
-  def cancel_cron(cron_id) when is_binary(cron_id) do
-    cancel_cron(@default_instance, cron_id)
+  @spec delete_cron(binary()) :: delete_cron_result()
+  def delete_cron(cron_id) when is_binary(cron_id) do
+    delete_cron(@default_instance, cron_id)
   end
 
-  @spec cancel_cron(instance_name(), binary()) :: cancel_cron_result()
-  def cancel_cron(instance, cron_id)
+  @doc """
+  Deletes one cron schedule on an instance.
+
+  This deletes the cron schedule row. Existing generated fire rows are not
+  deleted.
+  """
+  @spec delete_cron(instance_name(), binary()) :: delete_cron_result()
+  def delete_cron(instance, cron_id)
       when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) do
-    Crons.cancel(cron_id, instance_runtime_opts!(instance))
+    Crons.delete(cron_id, instance_runtime_opts!(instance))
   end
 
   @doc """
