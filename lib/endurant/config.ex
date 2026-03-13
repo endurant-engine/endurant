@@ -6,24 +6,30 @@ defmodule Endurant.Config do
   @default_queue_defaults [limit: 1]
 
   @type instance_name :: atom() | String.t()
+  @type archiver_name :: String.t()
+  @type archiver_options :: keyword()
 
   @type t :: %__MODULE__{
           name: instance_name(),
           repo: module(),
           prefix: String.t(),
           queues: keyword(keyword()),
+          archivers: [{archiver_name(), archiver_options()}],
+          pruner: keyword(),
           queue_defaults: keyword(),
           crons: [map()]
         }
 
-  @enforce_keys [:name, :repo, :prefix, :queues, :queue_defaults, :crons]
-  defstruct [:name, :repo, :prefix, :queues, :queue_defaults, :crons]
+  @enforce_keys [:name, :repo, :prefix, :queues, :archivers, :pruner, :queue_defaults, :crons]
+  defstruct [:name, :repo, :prefix, :queues, :archivers, :pruner, :queue_defaults, :crons]
 
   @spec new!(keyword()) :: t()
   def new!(opts) when is_list(opts) do
     name = require_name!(opts)
     queue_defaults = queue_defaults!(opts)
     queues = queues!(opts)
+    archivers = archivers!(opts)
+    pruner = pruner!(opts)
     crons = crons!(opts)
     repo = repo!(opts)
     prefix = prefix!(opts)
@@ -44,6 +50,8 @@ defmodule Endurant.Config do
       repo: repo,
       prefix: prefix,
       queues: normalized_queues,
+      archivers: archivers,
+      pruner: pruner,
       queue_defaults: queue_defaults,
       crons: crons
     }
@@ -111,14 +119,16 @@ defmodule Endurant.Config do
     if Keyword.keyword?(entry) do
       normalize_cron_map!(Map.new(entry))
     else
-      raise ArgumentError, "each cron config entry must be a map or keyword list, got: #{inspect(entry)}"
+      raise ArgumentError,
+            "each cron config entry must be a map or keyword list, got: #{inspect(entry)}"
     end
   end
 
   defp normalize_cron!(%{} = entry), do: normalize_cron_map!(entry)
 
   defp normalize_cron!(other) do
-    raise ArgumentError, "each cron config entry must be a map or keyword list, got: #{inspect(other)}"
+    raise ArgumentError,
+          "each cron config entry must be a map or keyword list, got: #{inspect(other)}"
   end
 
   @spec normalize_cron_map!(map()) :: map()
@@ -149,8 +159,11 @@ defmodule Endurant.Config do
 
     timezone =
       case Map.get(entry, :timezone) || Map.get(entry, "timezone") || "Etc/UTC" do
-        timezone when is_binary(timezone) and timezone != "" -> timezone
-        other -> raise ArgumentError, "cron :timezone must be a non-empty string, got: #{inspect(other)}"
+        timezone when is_binary(timezone) and timezone != "" ->
+          timezone
+
+        other ->
+          raise ArgumentError, "cron :timezone must be a non-empty string, got: #{inspect(other)}"
       end
 
     start_at =
@@ -161,12 +174,18 @@ defmodule Endurant.Config do
 
     end_at =
       case Map.get(entry, :end_at) || Map.get(entry, "end_at") do
-        nil -> nil
-        %DateTime{} = dt -> dt
-        other -> raise ArgumentError, "cron :end_at must be DateTime or nil, got: #{inspect(other)}"
+        nil ->
+          nil
+
+        %DateTime{} = dt ->
+          dt
+
+        other ->
+          raise ArgumentError, "cron :end_at must be DateTime or nil, got: #{inspect(other)}"
       end
 
-    status = normalize_cron_status!(Map.get(entry, :status) || Map.get(entry, "status") || :active)
+    status =
+      normalize_cron_status!(Map.get(entry, :status) || Map.get(entry, "status") || :active)
 
     %{
       name: name,
@@ -216,7 +235,8 @@ defmodule Endurant.Config do
   end
 
   defp require_non_empty_binary!(value, field) do
-    raise ArgumentError, "cron #{inspect(field)} must be a non-empty string, got: #{inspect(value)}"
+    raise ArgumentError,
+          "cron #{inspect(field)} must be a non-empty string, got: #{inspect(value)}"
   end
 
   @spec queues!(keyword()) :: keyword(keyword())
@@ -256,6 +276,120 @@ defmodule Endurant.Config do
   defp normalize_queue!(queue) do
     raise ArgumentError,
           "queue names must be atoms to avoid dynamic atom creation, got: #{inspect(queue)}"
+  end
+
+  @spec archivers!(keyword()) :: [{archiver_name(), archiver_options()}]
+  defp archivers!(opts) do
+    archivers = Keyword.get(opts, :archivers, [])
+
+    if not Keyword.keyword?(archivers) do
+      raise ArgumentError, ":archivers must be a keyword list, got: #{inspect(archivers)}"
+    end
+
+    normalized =
+      Enum.map(archivers, fn {archiver, archiver_opts} ->
+        normalized_archiver = normalize_archiver_name!(archiver)
+
+        if not (is_list(archiver_opts) and Keyword.keyword?(archiver_opts)) do
+          raise ArgumentError,
+                "archiver options for #{inspect(normalized_archiver)} must be keyword list, got: #{inspect(archiver_opts)}"
+        end
+
+        module = Keyword.get(archiver_opts, :module)
+
+        if not is_atom(module) do
+          raise ArgumentError,
+                "archiver #{inspect(normalized_archiver)} requires :module, got: #{inspect(module)}"
+        end
+
+        validate_archiver_config!(normalized_archiver, archiver_opts)
+
+        {normalized_archiver, archiver_opts}
+      end)
+
+    duplicates =
+      normalized
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.group_by(& &1)
+      |> Enum.filter(fn {_archiver, entries} -> length(entries) > 1 end)
+      |> Enum.map(&elem(&1, 0))
+
+    if duplicates != [] do
+      raise ArgumentError, "duplicate archivers are not allowed: #{inspect(duplicates)}"
+    end
+
+    normalized
+  end
+
+  @spec normalize_archiver_name!(term()) :: String.t()
+  defp normalize_archiver_name!(archiver) when is_atom(archiver) do
+    archiver
+    |> Atom.to_string()
+    |> normalize_archiver_name!()
+  end
+
+  defp normalize_archiver_name!(archiver) when is_binary(archiver) do
+    normalized = String.trim(archiver)
+
+    if normalized == "" do
+      raise ArgumentError, "archiver names must be non-empty strings or atoms"
+    end
+
+    normalized
+  end
+
+  defp normalize_archiver_name!(archiver) do
+    raise ArgumentError,
+          "archiver names must be non-empty strings or atoms, got: #{inspect(archiver)}"
+  end
+
+  @spec validate_archiver_config!(String.t(), keyword()) :: :ok
+  defp validate_archiver_config!(archiver, archiver_opts) do
+    case Keyword.fetch(archiver_opts, :enabled) do
+      {:ok, enabled} when is_boolean(enabled) ->
+        :ok
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "archiver #{inspect(archiver)} :enabled must be a boolean, got: #{inspect(other)}"
+
+      :error ->
+        :ok
+    end
+
+    :ok
+  end
+
+  @spec pruner!(keyword()) :: keyword()
+  defp pruner!(opts) do
+    case Keyword.get(opts, :pruner, enabled: false) do
+      pruner_opts when is_list(pruner_opts) ->
+        if Keyword.keyword?(pruner_opts) do
+          validate_pruner_config!(pruner_opts)
+          pruner_opts
+        else
+          raise ArgumentError, ":pruner must be a keyword list, got: #{inspect(pruner_opts)}"
+        end
+
+      other ->
+        raise ArgumentError, ":pruner must be a keyword list, got: #{inspect(other)}"
+    end
+  end
+
+  @spec validate_pruner_config!(keyword()) :: :ok
+  defp validate_pruner_config!(pruner_opts) do
+    case Keyword.fetch(pruner_opts, :enabled) do
+      {:ok, enabled} when is_boolean(enabled) ->
+        :ok
+
+      {:ok, other} ->
+        raise ArgumentError, ":pruner :enabled must be a boolean, got: #{inspect(other)}"
+
+      :error ->
+        :ok
+    end
+
+    :ok
   end
 
   @spec repo!(keyword()) :: module()

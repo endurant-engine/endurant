@@ -51,13 +51,19 @@ defmodule Endurant.Workflow.Tasks do
                 "task #{inspect(task_key)} exceeded max attempts (#{attempts}/#{max_attempts})"
         end
 
-        :ok = append_task_event(runtime, :task_started, %{task: task_key})
+        task_run_id = new_task_run_id()
+
+        :ok = append_task_event(runtime, :task_started, task_event_payload(task_key, task_run_id))
 
         try do
           result = fun.()
 
           :ok =
-            append_task_event(runtime, :task_completed, %{task: task_key, result: result})
+            append_task_event(
+              runtime,
+              :task_completed,
+              task_event_payload(task_key, task_run_id, %{result: result})
+            )
 
           current_runtime = Workflow.runtime!()
 
@@ -72,6 +78,7 @@ defmodule Endurant.Workflow.Tasks do
             :ok =
               append_task_event(runtime, :task_failed, %{
                 task: task_key,
+                task_run_id: task_run_id,
                 error: format_error(error)
               })
 
@@ -93,6 +100,7 @@ defmodule Endurant.Workflow.Tasks do
             :ok =
               append_task_event(runtime, :task_failed, %{
                 task: task_key,
+                task_run_id: task_run_id,
                 error: %{kind: kind, reason: inspect(reason)}
               })
 
@@ -548,11 +556,13 @@ defmodule Endurant.Workflow.Tasks do
          attempts,
          runtime_opts
        ) do
+    task_run_id = new_task_run_id()
+
     case Events.append_if_running_owned(
            execution_id,
            worker_id,
            :task_started,
-           %{task: task_key},
+           task_event_payload(task_key, task_run_id),
            runtime_opts
          ) do
       {:error, :not_running} ->
@@ -567,7 +577,7 @@ defmodule Endurant.Workflow.Tasks do
                  execution_id,
                  worker_id,
                  :task_completed,
-                 %{task: task_key, result: result},
+                 task_event_payload(task_key, task_run_id, %{result: result}),
                  runtime_opts
                ) do
             :ok ->
@@ -590,7 +600,8 @@ defmodule Endurant.Workflow.Tasks do
               task_opts,
               attempts,
               runtime_opts,
-              {:exception, error}
+              {:exception, error},
+              task_run_id
             )
         catch
           kind, reason ->
@@ -604,7 +615,8 @@ defmodule Endurant.Workflow.Tasks do
               task_opts,
               attempts,
               runtime_opts,
-              {:throw, kind, reason}
+              {:throw, kind, reason},
+              task_run_id
             )
         end
     end
@@ -620,7 +632,8 @@ defmodule Endurant.Workflow.Tasks do
           keyword(),
           non_neg_integer(),
           keyword(),
-          {:exception, Exception.t()} | {:throw, atom(), term()}
+          {:exception, Exception.t()} | {:throw, atom(), term()},
+          String.t()
         ) :: :ok
   defp handle_async_failure(
          owner,
@@ -632,15 +645,18 @@ defmodule Endurant.Workflow.Tasks do
          task_opts,
          attempts,
          runtime_opts,
-         failure
+         failure,
+         task_run_id
        ) do
     payload =
       case failure do
         {:exception, error} ->
-          %{task: task_key, error: format_error(error)}
+          task_event_payload(task_key, task_run_id, %{error: format_error(error)})
 
         {:throw, kind, reason} ->
-          %{task: task_key, error: %{kind: kind, reason: inspect(reason)}}
+          task_event_payload(task_key, task_run_id, %{
+            error: %{kind: kind, reason: inspect(reason)}
+          })
       end
 
     case Events.append_if_running_owned(
@@ -687,6 +703,14 @@ defmodule Endurant.Workflow.Tasks do
   defp async_failure_reason({:throw, kind, reason}) do
     %{kind: kind, reason: inspect(reason)}
   end
+
+  @spec task_event_payload(String.t(), String.t(), map()) :: map()
+  defp task_event_payload(task_key, task_run_id, extra \\ %{}) do
+    Map.merge(%{task: task_key, task_run_id: task_run_id}, extra)
+  end
+
+  @spec new_task_run_id() :: String.t()
+  defp new_task_run_id, do: Ecto.UUID.generate()
 
   # Stream
   @doc """

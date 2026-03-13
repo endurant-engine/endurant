@@ -38,9 +38,33 @@ defmodule Endurant do
   - `:prefix` database schema prefix.
   """
   @type queue_options :: keyword()
+  @type archiver_options ::
+          [
+            {:module, module()}
+            | {:batch_size, pos_integer()}
+            | {:scan_ms, pos_integer()}
+            | {:heartbeat_ms, pos_integer()}
+            | {:retry_ms, pos_integer()}
+            | {:lease_ms, pos_integer()}
+            | {atom(), term()}
+          ]
+  @type pruner_options ::
+          [
+            {:enabled, boolean()}
+            | {:retention_ms, pos_integer()}
+            | {:batch_size, pos_integer()}
+            | {:scan_ms, pos_integer()}
+            | {:heartbeat_ms, pos_integer()}
+            | {:retry_ms, pos_integer()}
+            | {:lease_ms, pos_integer()}
+          ]
 
   @typedoc "Queue definitions passed to `start_link/1`."
   @type queues_option :: keyword(queue_options())
+  @typedoc "Archiver definitions passed to `start_link/1`."
+  @type archivers_option :: keyword(archiver_options())
+  @typedoc "Pruner definition passed to `start_link/1`."
+  @type pruner_option :: pruner_options()
 
   @type start_option ::
           {:name, start_name()}
@@ -48,6 +72,8 @@ defmodule Endurant do
           | {:prefix, String.t()}
           | {:queue_defaults, keyword()}
           | {:crons, [keyword() | map()]}
+          | {:archivers, archivers_option()}
+          | {:pruner, pruner_option()}
           | {:queues, queues_option()}
   @type start_options :: [start_option()]
   @type instance_name :: Config.instance_name()
@@ -87,6 +113,8 @@ defmodule Endurant do
   - `:prefix` database schema prefix (default `"public"`).
   - `:queue_defaults` queue defaults merged into each queue config.
   - `:crons` config-managed cron schedules synced on startup.
+  - `:archivers` archive worker definitions.
+  - `:pruner` archive pruning worker definition.
   - `:queues` queue definitions and queue options.
 
   `:crons` entry options:
@@ -107,11 +135,50 @@ defmodule Endurant do
         prefix: "public",
         queues: [default: [limit: 10]]
 
+  `:archivers` entry options:
+
+  - `:module` required user archiver implementation module.
+  - `:enabled` runtime enabled state synced into `endurant_settings` (default `false`).
+  - `:batch_size` terminal executions scanned per archive pass.
+  - `:scan_ms` archive scan interval in milliseconds.
+  - `:heartbeat_ms` lease heartbeat interval in milliseconds.
+  - `:retry_ms` retry delay after acquisition/init failure in milliseconds.
+  - `:lease_ms` worker lease duration in milliseconds.
+  - any other JSON-compatible option is synced into the archiver settings row and passed
+    through to the archiver callback `opts`.
+  - any other non-JSON option is passed through to the archiver callback `opts` only.
+
+  `:pruner` options:
+
+  - `:enabled` enables the pruning worker (default `false`).
+  - `:retention_ms` minimum age in milliseconds before archived terminal executions are pruned.
+  - `:batch_size` terminal executions pruned per pass.
+  - `:scan_ms` prune scan interval in milliseconds.
+  - `:heartbeat_ms` lease heartbeat interval in milliseconds.
+  - `:retry_ms` retry delay after acquisition failure in milliseconds.
+  - `:lease_ms` worker lease duration in milliseconds.
+
   ## Examples
 
       Endurant.start_link(
         repo: MyApp.Repo,
         prefix: "public",
+        archivers: [
+          clickhouse: [
+            module: Endurant.Archivers.ClickHouse,
+            enabled: true,
+            url: "http://localhost:8123",
+            database: "endurant",
+            batch_size: 1_000,
+            scan_ms: 5_000
+          ]
+        ],
+        pruner: [
+          enabled: true,
+          retention_ms: 86_400_000,
+          batch_size: 500,
+          scan_ms: 30_000
+        ],
         queues: [
           default: [limit: 10, poll_interval: 200],
           emails: [limit: 5, poll_interval: 100]

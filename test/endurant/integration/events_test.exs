@@ -103,6 +103,21 @@ defmodule Endurant.Integration.EventsTest do
     assert Enum.map(events, & &1.type) == [:signal_received, :execution_waiting, :task_completed]
   end
 
+  test "list/2 parses task_interrupted events with payload", %{runtime_opts: runtime_opts} do
+    execution_id = insert_execution!(runtime_opts)
+
+    :ok =
+      Endurant.Events.append(
+        execution_id,
+        :task_interrupted,
+        %{task: "t", task_run_id: "run-1"},
+        runtime_opts
+      )
+
+    assert [%{type: :task_interrupted, payload: %{"task" => "t", "task_run_id" => "run-1"}}] =
+             Endurant.Events.list(execution_id, runtime_opts)
+  end
+
   test "list_after/3 returns only events with sequence greater than checkpoint", %{
     runtime_opts: runtime_opts
   } do

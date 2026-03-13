@@ -41,6 +41,7 @@ defmodule Endurant.Migrations.Postgres.V01 do
         'task_started',
         'task_completed',
         'task_failed',
+        'task_interrupted',
         'signal_received',
         'cancel_requested'
       );
@@ -201,6 +202,14 @@ defmodule Endurant.Migrations.Postgres.V01 do
       )
     )
 
+    create_if_not_exists(
+      index(:endurant_executions, [:completed_at, :id],
+        name: :endurant_executions_archive_scan_idx,
+        where: "status IN ('completed', 'failed', 'cancelled') AND completed_at IS NOT NULL",
+        prefix: prefix
+      )
+    )
+
     create_if_not_exists table(:endurant_scheduled_executions, primary_key: false, prefix: prefix) do
       add(:id, :binary_id, primary_key: true)
       add(:unique_id, :text, null: false)
@@ -344,6 +353,40 @@ defmodule Endurant.Migrations.Postgres.V01 do
       )
     )
 
+    execute("""
+    CREATE INDEX IF NOT EXISTS endurant_settings_archiver_enabled_idx
+    ON #{quoted}.endurant_settings ((value->>'archiver'), (value->>'enabled'))
+    WHERE value ? 'archiver' AND value ? 'enabled'
+    """)
+
+    create_if_not_exists table(:endurant_archive_deliveries, primary_key: false, prefix: prefix) do
+      add(:backend, :text, null: false)
+
+      add(
+        :execution_id,
+        references(:endurant_executions,
+          type: :binary_id,
+          on_delete: :delete_all,
+          prefix: prefix
+        ),
+        null: false
+      )
+    end
+
+    create_if_not_exists(
+      unique_index(:endurant_archive_deliveries, [:backend, :execution_id],
+        name: :endurant_archive_deliveries_backend_execution_unique_idx,
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
+      index(:endurant_archive_deliveries, [:execution_id],
+        name: :endurant_archive_deliveries_execution_idx,
+        prefix: prefix
+      )
+    )
+
     create_if_not_exists table(:endurant_events, primary_key: false, prefix: prefix) do
       add(:id, :bigserial, primary_key: true)
 
@@ -378,6 +421,22 @@ defmodule Endurant.Migrations.Postgres.V01 do
   def down(%{prefix: prefix, quoted_prefix: quoted}) do
     drop_if_exists(index(:endurant_events, [:execution_id, :sequence], prefix: prefix))
     drop_if_exists(table(:endurant_events, prefix: prefix))
+
+    drop_if_exists(
+      index(:endurant_archive_deliveries, [:execution_id],
+        name: :endurant_archive_deliveries_execution_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_archive_deliveries, [:backend, :execution_id],
+        name: :endurant_archive_deliveries_backend_execution_unique_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(table(:endurant_archive_deliveries, prefix: prefix))
 
     drop_if_exists(
       index(:endurant_cron_schedules, [:unique_id, :status],
@@ -446,11 +505,20 @@ defmodule Endurant.Migrations.Postgres.V01 do
       )
     )
 
+    execute("DROP INDEX IF EXISTS #{quoted}.endurant_settings_archiver_enabled_idx")
+
     drop_if_exists(table(:endurant_settings, prefix: prefix))
 
     drop_if_exists(
       index(:endurant_executions, [:queue, :locked_until, :id],
         name: :endurant_executions_recover_cancelling_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists(
+      index(:endurant_executions, [:completed_at, :id],
+        name: :endurant_executions_archive_scan_idx,
         prefix: prefix
       )
     )

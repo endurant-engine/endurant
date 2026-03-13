@@ -85,9 +85,11 @@ defmodule Endurant.TestSupport.PostgresHelper do
   @spec truncate_prefix!(String.t()) :: :ok
   def truncate_prefix!(prefix) do
     Repo.query!("DELETE FROM #{prefix}.endurant_events")
+    Repo.query!("DELETE FROM #{prefix}.endurant_archive_deliveries")
     Repo.query!("DELETE FROM #{prefix}.endurant_cron_schedules")
     Repo.query!("DELETE FROM #{prefix}.endurant_scheduled_executions")
     Repo.query!("DELETE FROM #{prefix}.endurant_executions")
+    Repo.query!("DELETE FROM #{prefix}.endurant_settings")
     :ok
   end
 

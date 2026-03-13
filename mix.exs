@@ -20,7 +20,7 @@ defmodule Endurant.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger]
+      extra_applications: [:logger, :inets, :ssl]
     ]
   end
 
@@ -29,6 +29,7 @@ defmodule Endurant.MixProject do
     [
       {:ecto_sql, "~> 3.11"},
       {:postgrex, "~> 0.20"},
+      {:jason, "~> 1.4"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}

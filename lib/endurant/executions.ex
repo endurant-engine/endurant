@@ -870,10 +870,11 @@ defmodule Endurant.Executions do
                        raise "missing locked_until for waiting abandonment #{inspect(execution_id)}: #{inspect(other)}"
                    end
 
-                 Events.append(
+                 append_abandoned_execution_events(
+                   repo,
+                   prefix,
                    execution_id,
-                   :execution_abandoned,
-                   %{abandoned_at: abandoned_at},
+                   abandoned_at,
                    opts
                  )
 
@@ -1252,12 +1253,7 @@ defmodule Endurant.Executions do
                   raise "missing locked_until for waiting lock recovery #{inspect(id)}: #{inspect(other)}"
               end
 
-            Events.append(
-              to_app_id(id),
-              :execution_abandoned,
-              %{abandoned_at: abandoned_at},
-              opts
-            )
+            append_abandoned_execution_events(repo, prefix, to_app_id(id), abandoned_at, opts)
           end)
 
           expire_cancelling_sql = """
@@ -1323,12 +1319,7 @@ defmodule Endurant.Executions do
                     raise "missing locked_until for abandoned execution #{inspect(id)}: #{inspect(other)}"
                 end
 
-              Events.append(
-                to_app_id(id),
-                :execution_abandoned,
-                %{abandoned_at: abandoned_at},
-                opts
-              )
+              append_abandoned_execution_events(repo, prefix, to_app_id(id), abandoned_at, opts)
             end
           end)
 
@@ -2312,6 +2303,77 @@ defmodule Endurant.Executions do
   defp repo!(opts) do
     Keyword.get_lazy(opts, :repo, fn -> Application.fetch_env!(:endurant, :repo) end)
   end
+
+  @spec append_abandoned_execution_events(module(), String.t(), binary(), String.t(), keyword()) ::
+          :ok
+  defp append_abandoned_execution_events(repo, prefix, execution_id, abandoned_at, opts) do
+    execution_id_db = to_db_id(execution_id)
+
+    repo
+    |> open_task_runs(prefix, execution_id_db)
+    |> Enum.each(fn %{task: task, task_run_id: task_run_id} ->
+      Events.append(
+        execution_id,
+        :task_interrupted,
+        %{task: task, task_run_id: task_run_id},
+        opts
+      )
+    end)
+
+    Events.append(
+      execution_id,
+      :execution_abandoned,
+      %{abandoned_at: abandoned_at},
+      opts
+    )
+  end
+
+  @spec open_task_runs(module(), String.t(), binary()) :: [
+          %{task: String.t(), task_run_id: String.t()}
+        ]
+  defp open_task_runs(repo, prefix, execution_id) do
+    sql = """
+    SELECT type::text, payload
+    FROM #{prefix}.endurant_events
+    WHERE execution_id = $1
+    AND type::text IN ('task_started', 'task_completed', 'task_failed', 'task_interrupted')
+    ORDER BY sequence ASC
+    """
+
+    repo
+    |> query!(sql, [execution_id])
+    |> Map.fetch!(:rows)
+    |> Enum.reduce(%{}, fn [type, payload], acc ->
+      case {type, payload_task(payload), payload_task_run_id(payload)} do
+        {"task_started", task, task_run_id}
+        when is_binary(task) and is_binary(task_run_id) and task_run_id != "" ->
+          Map.put(acc, task_run_id, %{task: task, task_run_id: task_run_id})
+
+        {terminal_type, _task, task_run_id}
+        when terminal_type in ["task_completed", "task_failed", "task_interrupted"] and
+               is_binary(task_run_id) and task_run_id != "" ->
+          Map.delete(acc, task_run_id)
+
+        _ ->
+          acc
+      end
+    end)
+    |> Map.values()
+  end
+
+  @spec payload_task(map() | nil) :: String.t() | nil
+  defp payload_task(payload) when is_map(payload) do
+    Map.get(payload, "task") || Map.get(payload, :task)
+  end
+
+  defp payload_task(_payload), do: nil
+
+  @spec payload_task_run_id(map() | nil) :: String.t() | nil
+  defp payload_task_run_id(payload) when is_map(payload) do
+    Map.get(payload, "task_run_id") || Map.get(payload, :task_run_id)
+  end
+
+  defp payload_task_run_id(_payload), do: nil
 
   @spec parse_status(String.t()) :: atom()
   defp parse_status(status) do

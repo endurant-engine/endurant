@@ -268,8 +268,23 @@ defmodule Endurant.Integration.SignalSemanticsTest do
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.any?(events, &(&1.type == :execution_abandoned))
     assert Enum.any?(events, &(&1.type == :execution_resumed))
+    assert Enum.any?(events, &(&1.type == :task_interrupted))
     assert Enum.count(events, &(&1.type == :task_started)) == 2
     assert Enum.count(events, &(&1.type == :task_completed)) == 1
+
+    started_run_ids =
+      events
+      |> Enum.filter(&(&1.type == :task_started))
+      |> Enum.map(fn event -> event.payload["task_run_id"] || event.payload[:task_run_id] end)
+
+    interrupted_run_ids =
+      events
+      |> Enum.filter(&(&1.type == :task_interrupted))
+      |> Enum.map(fn event -> event.payload["task_run_id"] || event.payload[:task_run_id] end)
+
+    assert Enum.all?(started_run_ids, &is_binary/1)
+    assert Enum.all?(interrupted_run_ids, &is_binary/1)
+    assert interrupted_run_ids -- started_run_ids == []
   end
 
   @spec wait_for_status(binary(), atom(), pos_integer(), keyword()) :: atom()
