@@ -339,6 +339,7 @@ defmodule Endurant.Events do
       "task_started" -> :task_started
       "task_completed" -> :task_completed
       "task_failed" -> :task_failed
+      "task_interrupted" -> :task_interrupted
       "signal_received" -> :signal_received
       "cancel_requested" -> :cancel_requested
     end

@@ -3,8 +3,11 @@ defmodule Endurant.Supervisor do
 
   use Supervisor
 
+  alias Endurant.ArchiveWorker
+  alias Endurant.Archivers
   alias Endurant.Config
   alias Endurant.Crons
+  alias Endurant.Pruner
   alias Endurant.Registry
 
   @spec start_link(keyword()) :: Supervisor.on_start()
@@ -32,16 +35,30 @@ defmodule Endurant.Supervisor do
     end
 
     sync_config_crons!(config)
+    sync_config_archivers!(config)
     :ok = Registry.put_config(config)
 
-    children = [
-      %{
-        id: :scheduler,
-        start:
-          {Endurant.Scheduler, :start_link,
-           [[instance: config.name, repo: config.repo, prefix: config.prefix]]}
-      }
-      | Enum.map(config.queues, fn {queue, queue_opts} ->
+    children =
+      [
+        %{
+          id: :scheduler,
+          start:
+            {Endurant.Scheduler, :start_link,
+             [[instance: config.name, repo: config.repo, prefix: config.prefix]]}
+        }
+      ]
+      |> Kernel.++(
+        Enum.map(config.archivers, fn {archiver, archiver_opts} ->
+          %{
+            id: {:archiver, archiver},
+            start:
+              {ArchiveWorker, :start_link, [archive_worker_opts(config, archiver, archiver_opts)]}
+          }
+        end)
+      )
+      |> maybe_append_pruner(config)
+      |> Kernel.++(
+        Enum.map(config.queues, fn {queue, queue_opts} ->
           %{
             id: {:queue_manager, queue},
             start:
@@ -49,7 +66,7 @@ defmodule Endurant.Supervisor do
                [[instance: config.name, queue: queue, opts: queue_opts]]}
           }
         end)
-    ]
+      )
 
     Supervisor.init(children, strategy: :one_for_one)
   end
@@ -64,6 +81,71 @@ defmodule Endurant.Supervisor do
         raise "failed to sync config crons: #{inspect(reason)}"
     end
   end
+
+  @spec sync_config_archivers!(Config.t()) :: :ok
+  defp sync_config_archivers!(%Config{} = config) do
+    case Archivers.sync_from_config(config.archivers, Config.runtime_opts(config)) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise "failed to sync config archivers: #{inspect(reason)}"
+    end
+  end
+
+  @spec archive_worker_opts(Config.t(), String.t(), keyword()) :: keyword()
+  defp archive_worker_opts(%Config{} = config, archiver, archiver_opts) do
+    worker_keys = [:module, :batch_size, :scan_ms, :heartbeat_ms, :retry_ms, :lease_ms]
+    module = Keyword.fetch!(archiver_opts, :module)
+
+    [
+      instance: config.name,
+      archiver: archiver,
+      archiver_module: module,
+      archiver_opts: Keyword.drop(archiver_opts, worker_keys),
+      repo: config.repo,
+      prefix: config.prefix
+    ]
+    |> maybe_put_opt(:batch_size, Keyword.get(archiver_opts, :batch_size))
+    |> maybe_put_opt(:scan_ms, Keyword.get(archiver_opts, :scan_ms))
+    |> maybe_put_opt(:heartbeat_ms, Keyword.get(archiver_opts, :heartbeat_ms))
+    |> maybe_put_opt(:retry_ms, Keyword.get(archiver_opts, :retry_ms))
+    |> maybe_put_opt(:lease_ms, Keyword.get(archiver_opts, :lease_ms))
+  end
+
+  @spec maybe_append_pruner([map()], Config.t()) :: [map()]
+  defp maybe_append_pruner(children, %Config{pruner: pruner_opts} = config) do
+    if Keyword.get(pruner_opts, :enabled, false) do
+      children ++
+        [
+          %{
+            id: :pruner,
+            start: {Pruner, :start_link, [pruner_opts(config)]}
+          }
+        ]
+    else
+      children
+    end
+  end
+
+  @spec pruner_opts(Config.t()) :: keyword()
+  defp pruner_opts(%Config{} = config) do
+    [
+      instance: config.name,
+      repo: config.repo,
+      prefix: config.prefix
+    ]
+    |> maybe_put_opt(:batch_size, Keyword.get(config.pruner, :batch_size))
+    |> maybe_put_opt(:scan_ms, Keyword.get(config.pruner, :scan_ms))
+    |> maybe_put_opt(:heartbeat_ms, Keyword.get(config.pruner, :heartbeat_ms))
+    |> maybe_put_opt(:retry_ms, Keyword.get(config.pruner, :retry_ms))
+    |> maybe_put_opt(:lease_ms, Keyword.get(config.pruner, :lease_ms))
+    |> maybe_put_opt(:retention_ms, Keyword.get(config.pruner, :retention_ms))
+  end
+
+  @spec maybe_put_opt(keyword(), atom(), term()) :: keyword()
+  defp maybe_put_opt(opts, _key, nil), do: opts
+  defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   @spec supervisor_name(Config.instance_name()) :: pid() | nil
   def supervisor_name(instance) do
