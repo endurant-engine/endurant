@@ -2,6 +2,7 @@ defmodule Endurant.Crons do
   @moduledoc false
 
   alias Endurant.CronExpression
+  alias Endurant.Telemetry
 
   @default_prefix "public"
 
@@ -346,23 +347,25 @@ defmodule Endurant.Crons do
                DateTime.to_naive(next_run_at)
              ]).rows do
           [[id]] ->
-            {:ok,
-             %{
-               id: to_app_id(id),
-               name: name,
-               unique_id: unique_id,
-               queue: queue,
-               workflow: workflow_name,
-               version: version,
-               input: input,
-               cron_expr: cron_expr,
-               timezone: timezone,
-               start_at: start_at,
-               end_at: end_at,
-               next_run_at: next_run_at,
-               overlap_policy: :skip,
-               status: :active
-             }}
+            schedule = %{
+              id: to_app_id(id),
+              name: name,
+              unique_id: unique_id,
+              queue: queue,
+              workflow: workflow_name,
+              version: version,
+              input: input,
+              cron_expr: cron_expr,
+              timezone: timezone,
+              start_at: start_at,
+              end_at: end_at,
+              next_run_at: next_run_at,
+              overlap_policy: :skip,
+              status: :active
+            }
+
+            Telemetry.emit([:cron, :inserted], %{count: 1}, cron_metadata(opts, schedule))
+            {:ok, schedule}
 
           _ ->
             if name_conflict?(name, opts),
@@ -523,12 +526,23 @@ defmodule Endurant.Crons do
     repo = repo!(opts)
 
     case repo.transaction(fn -> dispatch_one_due_tx(opts) end, log: false) do
-      {:ok, result} -> result
+      {:ok, :none} ->
+        :none
+
+      {:ok, {:ok, schedule, outcome}} ->
+        Telemetry.emit(
+          [:cron, :dispatch],
+          %{count: 1, lag_ms: lag_ms(schedule.next_run_at)},
+          cron_metadata(opts, schedule, %{outcome: outcome})
+        )
+
+        :ok
+
       _ -> :none
     end
   end
 
-  @spec dispatch_one_due_tx(keyword()) :: :ok | :none
+  @spec dispatch_one_due_tx(keyword()) :: {:ok, cron_schedule(), :dispatched | :skipped} | :none
   defp dispatch_one_due_tx(opts) do
     case lock_next_due(opts) do
       nil ->
@@ -536,9 +550,9 @@ defmodule Endurant.Crons do
 
       schedule ->
         scheduled_for = schedule.next_run_at
-        :ok = insert_scheduled_fire(schedule, scheduled_for, opts)
+        outcome = insert_scheduled_fire(schedule, scheduled_for, opts)
         :ok = advance_schedule_after_fire(schedule, scheduled_for, opts)
-        :ok
+        {:ok, schedule, outcome}
     end
   end
 
@@ -578,7 +592,7 @@ defmodule Endurant.Crons do
     end
   end
 
-  @spec insert_scheduled_fire(cron_schedule(), DateTime.t(), keyword()) :: :ok
+  @spec insert_scheduled_fire(cron_schedule(), DateTime.t(), keyword()) :: :dispatched | :skipped
   defp insert_scheduled_fire(schedule, scheduled_for, opts) do
     repo = repo!(opts)
     prefix = Keyword.get(opts, :prefix, @default_prefix)
@@ -615,19 +629,19 @@ defmodule Endurant.Crons do
     ON CONFLICT (cron_schedule_id, scheduled_at) DO NOTHING
     """
 
-    _ =
-      query!(repo, sql, [
-        to_db_id(Ecto.UUID.generate()),
-        to_db_id(schedule.id),
-        schedule.unique_id,
-        schedule.queue,
-        schedule.workflow,
-        schedule.version,
-        schedule.input,
-        DateTime.to_naive(scheduled_for)
-      ])
-
-    :ok
+    case query!(repo, sql, [
+           to_db_id(Ecto.UUID.generate()),
+           to_db_id(schedule.id),
+           schedule.unique_id,
+           schedule.queue,
+           schedule.workflow,
+           schedule.version,
+           schedule.input,
+           DateTime.to_naive(scheduled_for)
+         ]).num_rows do
+      1 -> :dispatched
+      _ -> :skipped
+    end
   end
 
   @spec advance_schedule_after_fire(cron_schedule(), DateTime.t(), keyword()) :: :ok
@@ -878,6 +892,25 @@ defmodule Endurant.Crons do
   defp to_datetime(nil), do: nil
   defp to_datetime(%DateTime{} = dt), do: dt
   defp to_datetime(%NaiveDateTime{} = dt), do: DateTime.from_naive!(dt, "Etc/UTC")
+
+  @spec cron_metadata(keyword(), cron_schedule(), map()) :: map()
+  defp cron_metadata(opts, schedule, extra \\ %{}) do
+    Map.merge(
+      %{
+        instance: Keyword.get(opts, :instance),
+        node: node(),
+        queue: schedule.queue,
+        workflow: schedule.workflow,
+        version: schedule.version
+      },
+      extra
+    )
+  end
+
+  @spec lag_ms(DateTime.t()) :: non_neg_integer()
+  defp lag_ms(%DateTime{} = scheduled_at) do
+    Telemetry.datetime_diff_ms(scheduled_at, DateTime.utc_now())
+  end
 
   @spec positive_integer(term(), atom()) :: pos_integer()
   defp positive_integer(value, _name) when is_integer(value) and value > 0, do: value

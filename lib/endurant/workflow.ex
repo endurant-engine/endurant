@@ -38,6 +38,15 @@ defmodule Endurant.Workflow do
 
     @enforce_keys [:name, :task_key, :fun, :input, :opts]
     defstruct [:name, :task_key, :fun, :input, :opts, :task]
+
+    @type t :: %__MODULE__{
+            name: String.t(),
+            task_key: String.t(),
+            fun: (term() -> term()),
+            input: term(),
+            opts: keyword(),
+            task: Task.t() | nil
+          }
   end
 
   @typedoc "Workflow version passed to `run/2`."
@@ -49,14 +58,7 @@ defmodule Endurant.Workflow do
   @typedoc "Workflow return value."
   @type result :: term()
 
-  @opaque async_handle :: %AsyncHandle{
-            name: String.t(),
-            task_key: String.t(),
-            fun: (term() -> result()),
-            input: term(),
-            opts: keyword(),
-            task: Task.t() | nil
-          }
+  @type async_handle :: AsyncHandle.t()
 
   @callback run(version(), input()) :: result()
 

@@ -5,6 +5,7 @@ defmodule Endurant.Pruner do
 
   alias Endurant.Archivers
   alias Endurant.Settings
+  alias Endurant.Telemetry
 
   @default_prefix "public"
   @default_setting_id "pruner"
@@ -151,39 +152,83 @@ defmodule Endurant.Pruner do
 
   @spec process_scan(state()) :: :ok
   defp process_scan(%__MODULE__{} = state) do
-    case Archivers.enabled_names(state.runtime_opts) do
-      archivers when is_list(archivers) and archivers != [] ->
-        prune_batch(state, archivers)
+    started_at = Telemetry.monotonic_time()
 
-      _ ->
-        :ok
-    end
+    {outcome, enabled_archivers} =
+      case Archivers.enabled_names(state.runtime_opts) do
+        archivers when is_list(archivers) and archivers != [] ->
+          prune_batch(state, archivers)
+          {:ok, length(archivers)}
+
+        archivers when is_list(archivers) ->
+          {:ok, length(archivers)}
+
+        _ ->
+          {:error, 0}
+      end
+
+    Telemetry.emit(
+      [:pruner, :scan],
+      %{
+        duration_ms: Telemetry.duration_ms(started_at),
+        enabled_archivers: enabled_archivers
+      },
+      pruner_metadata(state, %{outcome: outcome})
+    )
   end
 
   @spec prune_batch(state(), [String.t()]) :: :ok
   defp prune_batch(%__MODULE__{} = state, enabled_archivers) do
     repo = Keyword.fetch!(state.runtime_opts, :repo)
     prefix = Keyword.fetch!(state.runtime_opts, :prefix)
+    started_at = Telemetry.monotonic_time()
 
     cutoff =
       DateTime.utc_now()
       |> DateTime.add(-state.retention_ms, :millisecond)
       |> DateTime.truncate(:microsecond)
 
-    repo.transaction(
+    {pruned, deleted_events, deleted_deliveries} =
+      repo.transaction(
       fn ->
         execution_ids =
           select_prunable_execution_ids(repo, prefix, enabled_archivers, cutoff, state.batch_size)
 
         if execution_ids != [] do
-          delete_events(repo, prefix, execution_ids)
-          delete_deliveries(repo, prefix, execution_ids)
-          delete_executions(repo, prefix, execution_ids)
+          deleted_events = delete_events(repo, prefix, execution_ids)
+          deleted_deliveries = delete_deliveries(repo, prefix, execution_ids)
+          pruned = delete_executions(repo, prefix, execution_ids)
+          {pruned, deleted_events, deleted_deliveries}
+        else
+          {0, 0, 0}
         end
       end,
       timeout: :infinity,
       log: false
     )
+      |> case do
+        {:ok, counts} -> counts
+        _ -> {0, 0, 0}
+      end
+
+    Telemetry.emit(
+      [:pruner, :batch],
+      %{
+        duration_ms: Telemetry.duration_ms(started_at),
+        pruned: pruned,
+        retention_ms: state.retention_ms,
+        batch_size: state.batch_size
+      },
+      pruner_metadata(state, %{outcome: :ok})
+    )
+
+    if pruned > 0 or deleted_events > 0 or deleted_deliveries > 0 do
+      Telemetry.emit(
+        [:pruner, :delete],
+        %{executions: pruned, events: deleted_events, deliveries: deleted_deliveries},
+        pruner_metadata(state)
+      )
+    end
 
     :ok
   rescue
@@ -226,25 +271,22 @@ defmodule Endurant.Pruner do
     |> Enum.map(fn [execution_id] -> execution_id end)
   end
 
-  @spec delete_events(module(), String.t(), [Ecto.UUID.t() | binary()]) :: :ok
+  @spec delete_events(module(), String.t(), [Ecto.UUID.t() | binary()]) :: non_neg_integer()
   defp delete_events(repo, prefix, execution_ids) do
     sql = "DELETE FROM #{prefix}.endurant_events WHERE execution_id = ANY($1)"
-    _ = repo.query!(sql, [execution_ids], log: false)
-    :ok
+    repo.query!(sql, [execution_ids], log: false).num_rows
   end
 
-  @spec delete_deliveries(module(), String.t(), [Ecto.UUID.t() | binary()]) :: :ok
+  @spec delete_deliveries(module(), String.t(), [Ecto.UUID.t() | binary()]) :: non_neg_integer()
   defp delete_deliveries(repo, prefix, execution_ids) do
     sql = "DELETE FROM #{prefix}.endurant_archive_deliveries WHERE execution_id = ANY($1)"
-    _ = repo.query!(sql, [execution_ids], log: false)
-    :ok
+    repo.query!(sql, [execution_ids], log: false).num_rows
   end
 
-  @spec delete_executions(module(), String.t(), [Ecto.UUID.t() | binary()]) :: :ok
+  @spec delete_executions(module(), String.t(), [Ecto.UUID.t() | binary()]) :: non_neg_integer()
   defp delete_executions(repo, prefix, execution_ids) do
     sql = "DELETE FROM #{prefix}.endurant_executions WHERE id = ANY($1)"
-    _ = repo.query!(sql, [execution_ids], log: false)
-    :ok
+    repo.query!(sql, [execution_ids], log: false).num_rows
   end
 
   @spec owner_id(atom() | String.t()) :: String.t()
@@ -255,6 +297,17 @@ defmodule Endurant.Pruner do
   @spec schedule(term(), non_neg_integer()) :: reference()
   defp schedule(message, delay_ms) do
     Process.send_after(self(), message, delay_ms)
+  end
+
+  @spec pruner_metadata(state(), map()) :: map()
+  defp pruner_metadata(state, extra \\ %{}) do
+    Map.merge(
+      %{
+        instance: state.instance,
+        node: node()
+      },
+      extra
+    )
   end
 
   @spec positive_integer(term(), atom()) :: pos_integer()

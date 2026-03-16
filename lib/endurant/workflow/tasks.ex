@@ -2,6 +2,7 @@ defmodule Endurant.Workflow.Tasks do
   @moduledoc false
 
   alias Endurant.Events
+  alias Endurant.Telemetry
   alias Endurant.Workflow
   alias Endurant.Workflow.AsyncHandle
 
@@ -52,8 +53,10 @@ defmodule Endurant.Workflow.Tasks do
         end
 
         task_run_id = new_task_run_id()
+        started_at = Telemetry.monotonic_time()
 
         :ok = append_task_event(runtime, :task_started, task_event_payload(task_key, task_run_id))
+        emit_task(runtime, :started, %{count: 1})
 
         try do
           result = fun.()
@@ -72,6 +75,7 @@ defmodule Endurant.Workflow.Tasks do
             | task_results: Map.put(current_runtime.task_results, task_key, result)
           })
 
+          emit_task(runtime, :completed, %{count: 1, duration_ms: Telemetry.duration_ms(started_at)})
           result
         rescue
           error ->
@@ -90,6 +94,12 @@ defmodule Endurant.Workflow.Tasks do
               current_runtime
               | task_failures: Map.put(current_failures, task_key, attempt)
             })
+
+            emit_task(runtime, :failed, %{
+              count: 1,
+              duration_ms: Telemetry.duration_ms(started_at),
+              attempt: attempt
+            }, %{error_kind: Telemetry.error_kind(format_error(error))})
 
             retry_or_reraise(name, task_key, attempt, opts, error, __STACKTRACE__, fun)
         catch
@@ -112,6 +122,12 @@ defmodule Endurant.Workflow.Tasks do
               current_runtime
               | task_failures: Map.put(current_failures, task_key, attempt)
             })
+
+            emit_task(runtime, :failed, %{
+              count: 1,
+              duration_ms: Telemetry.duration_ms(started_at),
+              attempt: attempt
+            }, %{error_kind: Telemetry.error_kind(%{kind: kind, reason: inspect(reason)})})
 
             retry_or_rethrow(name, task_key, attempt, opts, kind, reason, __STACKTRACE__, fun)
         end
@@ -149,6 +165,7 @@ defmodule Endurant.Workflow.Tasks do
     if retry?(attempt, opts, error) do
       retry_delay = retry_delay_ms(attempt, opts)
       retry_wait_key = "#{task_key}:#{attempt}"
+      emit_task(Workflow.runtime!(), :retry, %{count: 1, delay_ms: retry_delay, attempt: attempt})
       Workflow.sleep(retry_wait_key, retry_delay)
       do_task(name, fun, opts)
     else
@@ -171,6 +188,7 @@ defmodule Endurant.Workflow.Tasks do
     if retry?(attempt, opts, reason) do
       retry_delay = retry_delay_ms(attempt, opts)
       retry_wait_key = "#{task_key}:#{attempt}"
+      emit_task(Workflow.runtime!(), :retry, %{count: 1, delay_ms: retry_delay, attempt: attempt})
       Workflow.sleep(retry_wait_key, retry_delay)
       do_task(name, fun, opts)
     else
@@ -239,6 +257,7 @@ defmodule Endurant.Workflow.Tasks do
           nil ->
             parent = self()
             initial_attempts = Map.get(runtime.task_failures || %{}, task_key, 0)
+            telemetry_metadata = task_telemetry_metadata(runtime)
 
             task =
               Task.async(fn ->
@@ -251,7 +270,8 @@ defmodule Endurant.Workflow.Tasks do
                   fun,
                   opts,
                   initial_attempts,
-                  runtime.opts
+                  runtime.opts,
+                  telemetry_metadata
                 )
               end)
 
@@ -501,7 +521,8 @@ defmodule Endurant.Workflow.Tasks do
           (term() -> term()),
           keyword(),
           non_neg_integer(),
-          keyword()
+          keyword(),
+          map()
         ) :: :ok
   defp run_async_task(
          owner,
@@ -512,7 +533,8 @@ defmodule Endurant.Workflow.Tasks do
          fun,
          task_opts,
          attempts,
-         runtime_opts
+         runtime_opts,
+         telemetry_metadata
        ) do
     max = max_attempts(task_opts)
 
@@ -529,7 +551,8 @@ defmodule Endurant.Workflow.Tasks do
         fun,
         task_opts,
         attempts,
-        runtime_opts
+        runtime_opts,
+        telemetry_metadata
       )
     end
   end
@@ -543,7 +566,8 @@ defmodule Endurant.Workflow.Tasks do
           (term() -> term()),
           keyword(),
           non_neg_integer(),
-          keyword()
+          keyword(),
+          map()
         ) :: :ok
   defp run_async_task_attempt(
          owner,
@@ -554,9 +578,11 @@ defmodule Endurant.Workflow.Tasks do
          fun,
          task_opts,
          attempts,
-         runtime_opts
+         runtime_opts,
+         telemetry_metadata
        ) do
     task_run_id = new_task_run_id()
+    started_at = Telemetry.monotonic_time()
 
     case Events.append_if_running_owned(
            execution_id,
@@ -570,6 +596,8 @@ defmodule Endurant.Workflow.Tasks do
         :ok
 
       :ok ->
+        emit_task(telemetry_metadata, :started, %{count: 1})
+
         try do
           result = fun.(input)
 
@@ -581,6 +609,11 @@ defmodule Endurant.Workflow.Tasks do
                  runtime_opts
                ) do
             :ok ->
+              emit_task(telemetry_metadata, :completed, %{
+                count: 1,
+                duration_ms: Telemetry.duration_ms(started_at)
+              })
+
               send(owner, {:endurant_async_done, task_key, {:ok, result}})
               :ok
 
@@ -600,8 +633,10 @@ defmodule Endurant.Workflow.Tasks do
               task_opts,
               attempts,
               runtime_opts,
+              telemetry_metadata,
               {:exception, error},
-              task_run_id
+              task_run_id,
+              started_at
             )
         catch
           kind, reason ->
@@ -615,8 +650,10 @@ defmodule Endurant.Workflow.Tasks do
               task_opts,
               attempts,
               runtime_opts,
+              telemetry_metadata,
               {:throw, kind, reason},
-              task_run_id
+              task_run_id,
+              started_at
             )
         end
     end
@@ -632,8 +669,10 @@ defmodule Endurant.Workflow.Tasks do
           keyword(),
           non_neg_integer(),
           keyword(),
+          map(),
           {:exception, Exception.t()} | {:throw, atom(), term()},
-          String.t()
+          String.t(),
+          integer()
         ) :: :ok
   defp handle_async_failure(
          owner,
@@ -645,8 +684,10 @@ defmodule Endurant.Workflow.Tasks do
          task_opts,
          attempts,
          runtime_opts,
+         telemetry_metadata,
          failure,
-         task_run_id
+         task_run_id,
+         started_at
        ) do
     payload =
       case failure do
@@ -674,8 +715,21 @@ defmodule Endurant.Workflow.Tasks do
         send(owner, {:endurant_async_attempt_failed, task_key})
         next_attempt = attempts + 1
 
+        emit_task(
+          telemetry_metadata,
+          :failed,
+          %{
+            count: 1,
+            duration_ms: Telemetry.duration_ms(started_at),
+            attempt: next_attempt
+          },
+          %{error_kind: async_error_kind(failure)}
+        )
+
         if retry?(next_attempt, task_opts, failure) do
-          Process.sleep(retry_delay_ms(next_attempt, task_opts))
+          retry_delay = retry_delay_ms(next_attempt, task_opts)
+          emit_task(telemetry_metadata, :retry, %{count: 1, delay_ms: retry_delay, attempt: next_attempt})
+          Process.sleep(retry_delay)
 
           run_async_task(
             owner,
@@ -686,7 +740,8 @@ defmodule Endurant.Workflow.Tasks do
             fun,
             task_opts,
             next_attempt,
-            runtime_opts
+            runtime_opts,
+            telemetry_metadata
           )
         else
           send(owner, {:endurant_async_done, task_key, {:error, async_failure_reason(failure)}})
@@ -911,6 +966,30 @@ defmodule Endurant.Workflow.Tasks do
   defp format_error(error) do
     %{module: inspect(error.__struct__), message: Exception.message(error)}
   end
+
+  @spec emit_task(map(), atom(), map(), map()) :: :ok
+  defp emit_task(runtime, event, measurements, extra_metadata \\ %{}) do
+    Telemetry.emit(
+      [:task, event],
+      measurements,
+      Map.merge(task_telemetry_metadata(runtime), extra_metadata)
+    )
+  end
+
+  @spec task_telemetry_metadata(map()) :: map()
+  defp task_telemetry_metadata(runtime) do
+    %{
+      instance: Map.get(runtime, :instance),
+      node: node(),
+      queue: Map.get(runtime, :queue),
+      workflow: Map.get(runtime, :workflow),
+      version: Map.get(runtime, :version)
+    }
+  end
+
+  @spec async_error_kind({:exception, Exception.t()} | {:throw, atom(), term()}) :: String.t()
+  defp async_error_kind({:exception, error}), do: Telemetry.error_kind(format_error(error))
+  defp async_error_kind({:throw, kind, reason}), do: Telemetry.error_kind(%{kind: kind, reason: inspect(reason)})
 
   @spec normalize_task_name!(term()) :: String.t()
   defp normalize_task_name!(name) when is_binary(name), do: name

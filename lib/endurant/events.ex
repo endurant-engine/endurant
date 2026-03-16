@@ -1,6 +1,8 @@
 defmodule Endurant.Events do
   @moduledoc false
 
+  alias Endurant.Telemetry
+
   @default_prefix "public"
 
   @type event :: %{
@@ -34,7 +36,7 @@ defmodule Endurant.Events do
     type = normalize_type(type)
     payload = payload || %{}
 
-    do_append(repo, prefix, execution_id, type, payload)
+    do_append(repo, prefix, execution_id, type, payload, opts)
   end
 
   @doc """
@@ -62,7 +64,7 @@ defmodule Endurant.Events do
     type = normalize_type(type)
     payload = payload || %{}
 
-    do_append_if_running(repo, prefix, execution_id, worker_id, type, payload)
+    do_append_if_running(repo, prefix, execution_id, worker_id, type, payload, opts)
   end
 
   @doc """
@@ -197,23 +199,53 @@ defmodule Endurant.Events do
     repo.query!(sql, params, log: false)
   end
 
-  @spec do_append(module(), String.t(), binary(), String.t(), map()) :: :ok
-  defp do_append(repo, prefix, execution_id, type, payload) do
+  @spec do_append(module(), String.t(), binary(), String.t(), map(), keyword()) :: :ok
+  defp do_append(repo, prefix, execution_id, type, payload, opts) do
     lock_sql = lock_execution_for_append_sql(prefix)
     insert_sql = insert_event_with_sequence_and_size_sql(prefix)
     update_sql = update_execution_event_stats_sql(prefix)
+    started_at = Telemetry.monotonic_time()
 
     case repo.transaction(
            fn ->
              case query!(repo, lock_sql, [execution_id]).rows do
+               [[next_event_sequence, queue, workflow_name, version]]
+               when is_integer(next_event_sequence) and next_event_sequence >= 1 ->
+                 case query!(repo, insert_sql, [execution_id, next_event_sequence, type, payload]).rows do
+                   [[history_size_delta]]
+                   when is_integer(history_size_delta) and history_size_delta >= 0 ->
+                     case query!(repo, update_sql, [execution_id, history_size_delta]).num_rows do
+                       1 ->
+                         %{
+                           queue: queue,
+                           workflow: workflow_name,
+                           version: version,
+                           history_size_delta_bytes: history_size_delta
+                         }
+
+                       _ -> repo.rollback(:execution_not_found)
+                     end
+
+                   _ ->
+                     repo.rollback(:execution_not_found)
+                 end
+
                [[next_event_sequence]]
                when is_integer(next_event_sequence) and next_event_sequence >= 1 ->
                  case query!(repo, insert_sql, [execution_id, next_event_sequence, type, payload]).rows do
                    [[history_size_delta]]
                    when is_integer(history_size_delta) and history_size_delta >= 0 ->
                      case query!(repo, update_sql, [execution_id, history_size_delta]).num_rows do
-                       1 -> :ok
-                       _ -> repo.rollback(:execution_not_found)
+                       1 ->
+                         %{
+                           queue: nil,
+                           workflow: nil,
+                           version: nil,
+                           history_size_delta_bytes: history_size_delta
+                         }
+
+                       _ ->
+                         repo.rollback(:execution_not_found)
                      end
 
                    _ ->
@@ -226,7 +258,8 @@ defmodule Endurant.Events do
            end,
            log: false
          ) do
-      {:ok, :ok} ->
+      {:ok, telemetry_context} ->
+        emit_append_telemetry(opts, payload, started_at, telemetry_context)
         :ok
 
       {:error, :execution_not_found} ->
@@ -240,25 +273,56 @@ defmodule Endurant.Events do
           binary(),
           String.t(),
           String.t(),
-          map()
+          map(),
+          keyword()
         ) ::
           :ok | {:error, :not_running}
-  defp do_append_if_running(repo, prefix, execution_id, worker_id, type, payload) do
+  defp do_append_if_running(repo, prefix, execution_id, worker_id, type, payload, opts) do
     lock_sql = lock_execution_for_owned_append_sql(prefix)
     insert_sql = insert_event_with_sequence_and_size_sql(prefix)
     update_sql = update_execution_event_stats_sql(prefix)
+    started_at = Telemetry.monotonic_time()
 
     case repo.transaction(
            fn ->
              case query!(repo, lock_sql, [execution_id, worker_id]).rows do
+               [[next_event_sequence, queue, workflow_name, version]]
+               when is_integer(next_event_sequence) and next_event_sequence >= 1 ->
+                 case query!(repo, insert_sql, [execution_id, next_event_sequence, type, payload]).rows do
+                   [[history_size_delta]]
+                   when is_integer(history_size_delta) and history_size_delta >= 0 ->
+                     case query!(repo, update_sql, [execution_id, history_size_delta]).num_rows do
+                       1 ->
+                         %{
+                           queue: queue,
+                           workflow: workflow_name,
+                           version: version,
+                           history_size_delta_bytes: history_size_delta
+                         }
+
+                       _ -> repo.rollback(:not_running)
+                     end
+
+                   _ ->
+                     repo.rollback(:not_running)
+                 end
+
                [[next_event_sequence]]
                when is_integer(next_event_sequence) and next_event_sequence >= 1 ->
                  case query!(repo, insert_sql, [execution_id, next_event_sequence, type, payload]).rows do
                    [[history_size_delta]]
                    when is_integer(history_size_delta) and history_size_delta >= 0 ->
                      case query!(repo, update_sql, [execution_id, history_size_delta]).num_rows do
-                       1 -> :ok
-                       _ -> repo.rollback(:not_running)
+                       1 ->
+                         %{
+                           queue: nil,
+                           workflow: nil,
+                           version: nil,
+                           history_size_delta_bytes: history_size_delta
+                         }
+
+                       _ ->
+                         repo.rollback(:not_running)
                      end
 
                    _ ->
@@ -271,7 +335,10 @@ defmodule Endurant.Events do
            end,
            log: false
          ) do
-      {:ok, :ok} -> :ok
+      {:ok, telemetry_context} ->
+        emit_append_telemetry(opts, payload, started_at, telemetry_context)
+        :ok
+
       {:error, :not_running} -> {:error, :not_running}
     end
   end
@@ -279,7 +346,7 @@ defmodule Endurant.Events do
   @spec lock_execution_for_append_sql(String.t()) :: String.t()
   defp lock_execution_for_append_sql(prefix) do
     """
-    SELECT next_event_sequence
+    SELECT next_event_sequence, queue, workflow_name, version
     FROM #{prefix}.endurant_executions
     WHERE id = $1
     FOR UPDATE
@@ -289,7 +356,7 @@ defmodule Endurant.Events do
   @spec lock_execution_for_owned_append_sql(String.t()) :: String.t()
   defp lock_execution_for_owned_append_sql(prefix) do
     """
-    SELECT next_event_sequence
+    SELECT next_event_sequence, queue, workflow_name, version
     FROM #{prefix}.endurant_executions
     WHERE id = $1
     AND status = 'running'::#{prefix}.endurant_execution_status
@@ -323,6 +390,25 @@ defmodule Endurant.Events do
         history_size_bytes = history_size_bytes + $2::bigint
     WHERE id = $1
     """
+  end
+
+  @spec emit_append_telemetry(keyword(), map(), integer(), map()) :: :ok
+  defp emit_append_telemetry(opts, _payload, started_at, telemetry_context) do
+    Telemetry.emit(
+      [:event_log, :append],
+      %{
+        count: 1,
+        duration_ms: Telemetry.duration_ms(started_at),
+        history_size_delta_bytes: telemetry_context.history_size_delta_bytes
+      },
+      %{
+        instance: Keyword.get(opts, :instance),
+        node: node(),
+        queue: telemetry_context.queue,
+        workflow: telemetry_context.workflow,
+        version: telemetry_context.version
+      }
+    )
   end
 
   @spec parse_type(String.t()) :: atom()
