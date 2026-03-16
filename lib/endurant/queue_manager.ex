@@ -4,6 +4,7 @@ defmodule Endurant.QueueManager do
   use GenServer
 
   alias Endurant.Registry
+  alias Endurant.Telemetry
 
   defstruct [
     :instance,
@@ -59,15 +60,16 @@ defmodule Endurant.QueueManager do
 
   @impl true
   def handle_info(:tick, %__MODULE__{} = state) do
+    started_at = Telemetry.monotonic_time()
     recover_opts =
       state.opts
       |> Keyword.put(:queue, state.queue)
       |> Keyword.put(:recover_order, recover_order_for_tick(state.tick))
 
-    _ = Endurant.Executions.recover_expired_locks(recovery_limit(state.opts), recover_opts)
+    recovered = Endurant.Executions.recover_expired_locks(recovery_limit(state.opts), recover_opts)
     state = promote_db_ready_waiters(state)
     worker_id = worker_id(state.instance, state.queue)
-    {state, _resumed} = resume_ready_waiters(state, worker_id)
+    {state, resumed} = resume_ready_waiters(state, worker_id)
 
     capacity_after_resume = max(limit(state.opts) - map_size(state.running), 0)
 
@@ -111,6 +113,21 @@ defmodule Endurant.QueueManager do
       |> Map.put(:running, running)
       |> Map.update!(:tick, &(&1 + 1))
 
+    Telemetry.emit(
+      [:queue_manager, :tick],
+      %{
+        duration_ms: Telemetry.duration_ms(started_at),
+        running: map_size(state.running),
+        parked: map_size(state.parked),
+        ready: :queue.len(state.ready),
+        claimed_pending: length(executions),
+        claimed_ready: length(ready_waiting),
+        resumed: resumed,
+        recovered: recovered
+      },
+      queue_manager_metadata(state)
+    )
+
     Process.send_after(self(), :tick, poll_interval(state.opts))
     {:noreply, state}
   end
@@ -129,14 +146,38 @@ defmodule Endurant.QueueManager do
   @impl true
   def handle_call({:executor_parked, pid, execution_id}, _from, %__MODULE__{} = state) do
     if map_size(state.parked) < parked_limit(state.opts) do
-      {:reply, :park, move_running_to_parked(state, pid, execution_id)}
+      next_state = move_running_to_parked(state, pid, execution_id)
+
+      Telemetry.emit(
+        [:queue_manager, :parked],
+        %{count: 1, running: map_size(next_state.running), parked: map_size(next_state.parked)},
+        queue_manager_metadata(next_state, %{decision: :park})
+      )
+
+      {:reply, :park, next_state}
     else
-      {:reply, :release, remove_from_running(state, pid, execution_id)}
+      next_state = remove_from_running(state, pid, execution_id)
+
+      Telemetry.emit(
+        [:queue_manager, :parked],
+        %{count: 1, running: map_size(next_state.running), parked: map_size(next_state.parked)},
+        queue_manager_metadata(next_state, %{decision: :release})
+      )
+
+      {:reply, :release, next_state}
     end
   end
 
   def handle_call({:executor_ready, pid, execution_id}, _from, %__MODULE__{} = state) do
-    {:reply, :ok, mark_parked_ready(state, pid, execution_id)}
+    next_state = mark_parked_ready(state, pid, execution_id)
+
+    Telemetry.emit(
+      [:queue_manager, :ready],
+      %{count: 1, ready: :queue.len(next_state.ready)},
+      queue_manager_metadata(next_state)
+    )
+
+    {:reply, :ok, next_state}
   end
 
   @spec spawn_executions(list(term()), map(), String.t(), pid(), keyword()) :: map()
@@ -373,4 +414,16 @@ defmodule Endurant.QueueManager do
   @spec instance_tag(atom() | String.t()) :: String.t()
   defp instance_tag(instance) when is_binary(instance), do: instance
   defp instance_tag(instance) when is_atom(instance), do: inspect(instance)
+
+  @spec queue_manager_metadata(state(), map()) :: map()
+  defp queue_manager_metadata(state, extra \\ %{}) do
+    Map.merge(
+      %{
+        instance: state.instance,
+        node: node(),
+        queue: state.queue
+      },
+      extra
+    )
+  end
 end

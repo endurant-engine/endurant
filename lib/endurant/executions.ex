@@ -2,6 +2,7 @@ defmodule Endurant.Executions do
   @moduledoc false
 
   alias Endurant.Events
+  alias Endurant.Telemetry
 
   @default_prefix "public"
   @default_list_limit 50
@@ -24,6 +25,7 @@ defmodule Endurant.Executions do
 
   @type execution :: %{
           id: binary(),
+          queue: String.t(),
           workflow: module() | String.t(),
           input: map(),
           status: atom(),
@@ -138,7 +140,24 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, result} -> result
+      {:ok, {:ok, _execution} = result} ->
+        Telemetry.emit(
+          [:execution, :inserted],
+          %{count: 1},
+          execution_metadata(opts, queue, workflow_name, version)
+        )
+
+        result
+
+      {:ok, {:error, :unique_conflict} = result} ->
+        Telemetry.emit(
+          [:execution, :insert_conflict],
+          %{count: 1},
+          execution_metadata(opts, queue, workflow_name, version)
+        )
+
+        result
+
       {:error, _op, reason, _changes} -> {:error, reason}
     end
   end
@@ -170,16 +189,17 @@ defmodule Endurant.Executions do
     execution_id = to_db_id(execution_id)
 
     sql = """
-    SELECT id, workflow_name, input, status::text, version, next_event_sequence, history_size_bytes
+    SELECT id, queue, workflow_name, input, status::text, version, next_event_sequence, history_size_bytes
     FROM #{prefix}.endurant_executions
     WHERE id = $1
     LIMIT 1
     """
 
     case query!(repo, sql, [execution_id]).rows do
-      [[id, workflow_name, input, status, version, next_event_sequence, history_size_bytes]] ->
+      [[id, queue, workflow_name, input, status, version, next_event_sequence, history_size_bytes]] ->
         %{
           id: to_app_id(id),
+          queue: queue,
           workflow: workflow_name,
           input: input || %{},
           status: parse_status(status),
@@ -364,15 +384,19 @@ defmodule Endurant.Executions do
                |> Map.fetch!(:rows)
 
              Enum.map(rows, fn [id, workflow_name, input, version, previous_status] ->
+               previous_status = parse_status(previous_status)
+
                execution = %{
                  id: to_app_id(id),
+                 queue: queue,
                  workflow: workflow_name,
                  input: input,
                  status: :running,
-                 version: version
+                 version: version,
+                 previous_status: previous_status
                }
 
-               if previous_status == "abandoned" do
+               if previous_status == :abandoned do
                  Events.append(execution.id, :execution_resumed, %{worker_id: worker_id}, opts)
                end
 
@@ -381,7 +405,37 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, executions} -> executions
+      {:ok, executions} ->
+        Enum.each(executions, fn execution ->
+          Telemetry.emit(
+            [:execution, :claimed],
+            %{count: 1},
+            execution_metadata(
+              opts,
+              execution.queue,
+              execution.workflow,
+              execution.version,
+              %{previous_status: execution.previous_status}
+            )
+          )
+
+          if execution.previous_status == :abandoned do
+            Telemetry.emit(
+              [:execution, :resumed],
+              %{count: 1},
+              execution_metadata(
+                opts,
+                execution.queue,
+                execution.workflow,
+                execution.version,
+                %{previous_status: execution.previous_status}
+              )
+            )
+          end
+        end)
+
+        Enum.map(executions, &Map.delete(&1, :previous_status))
+
       {:error, reason} -> raise "claim_pending failed: #{inspect(reason)}"
     end
   end
@@ -433,11 +487,19 @@ defmodule Endurant.Executions do
     AND locked_by = $2
     AND locked_until IS NOT NULL
     AND locked_until > timezone('UTC', now())
+    RETURNING queue, workflow_name, version, inserted_at
     """
 
-    case query!(repo, sql, [execution_id, worker_id]).num_rows do
-      1 ->
+    case query!(repo, sql, [execution_id, worker_id]).rows do
+      [[queue, workflow_name, version, inserted_at]] ->
         Events.append(execution_id, :execution_started, %{worker_id: worker_id}, opts)
+
+        Telemetry.emit(
+          [:execution, :started],
+          %{count: 1, time_to_start_ms: Telemetry.datetime_diff_ms(inserted_at, NaiveDateTime.utc_now())},
+          execution_metadata(opts, queue, workflow_name, version)
+        )
+
         :ok
 
       _ ->
@@ -515,7 +577,7 @@ defmodule Endurant.Executions do
              case query!(repo, sql, [execution_id, worker_id]).num_rows do
                1 ->
                  Events.append(execution_id, :execution_completed, %{result: result}, opts)
-                 :ok
+                 terminal_execution_context(repo, prefix, execution_id)
 
                _ ->
                  repo.rollback(:not_running)
@@ -523,7 +585,20 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, :ok} -> :ok
+      {:ok, execution_context} ->
+        Telemetry.emit(
+          [:execution, :completed],
+          execution_terminal_measurements(execution_context),
+          execution_metadata(
+            opts,
+            execution_context.queue,
+            execution_context.workflow,
+            execution_context.version
+          )
+        )
+
+        :ok
+
       {:error, :not_running} -> {:error, :not_running}
     end
   end
@@ -588,7 +663,7 @@ defmodule Endurant.Executions do
              case query!(repo, sql, [execution_id, worker_id]).num_rows do
                1 ->
                  Events.append(execution_id, :execution_failed, %{error: error}, opts)
-                 :ok
+                 terminal_execution_context(repo, prefix, execution_id)
 
                _ ->
                  repo.rollback(:not_running)
@@ -596,7 +671,21 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, :ok} -> :ok
+      {:ok, execution_context} ->
+        Telemetry.emit(
+          [:execution, :failed],
+          execution_terminal_measurements(execution_context),
+          execution_metadata(
+            opts,
+            execution_context.queue,
+            execution_context.workflow,
+            execution_context.version,
+            %{error_kind: Telemetry.error_kind(error)}
+          )
+        )
+
+        :ok
+
       {:error, :not_running} -> {:error, :not_running}
     end
   end
@@ -717,7 +806,7 @@ defmodule Endurant.Executions do
                    opts
                  )
 
-                 :ok
+                 basic_execution_context(repo, prefix, execution_id_db)
 
                _ ->
                  repo.rollback(:not_running)
@@ -725,7 +814,21 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, :ok} -> :ok
+      {:ok, execution_context} ->
+        Telemetry.emit(
+          [:execution, :waiting],
+          %{count: 1},
+          execution_metadata(
+            opts,
+            execution_context.queue,
+            execution_context.workflow,
+            execution_context.version,
+            %{wait_kind: :signal}
+          )
+        )
+
+        :ok
+
       {:error, :not_running} -> {:error, :not_running}
     end
   end
@@ -788,7 +891,7 @@ defmodule Endurant.Executions do
                    opts
                  )
 
-                 :ok
+                 basic_execution_context(repo, prefix, execution_id_db)
 
                _ ->
                  repo.rollback(:not_running)
@@ -796,7 +899,21 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, :ok} -> :ok
+      {:ok, execution_context} ->
+        Telemetry.emit(
+          [:execution, :waiting],
+          %{count: 1},
+          execution_metadata(
+            opts,
+            execution_context.queue,
+            execution_context.workflow,
+            execution_context.version,
+            %{wait_kind: :time}
+          )
+        )
+
+        :ok
+
       {:error, :not_running} -> {:error, :not_running}
     end
   end
@@ -834,7 +951,7 @@ defmodule Endurant.Executions do
            fn ->
              sql = """
              WITH locked_execution AS (
-               SELECT id, locked_until
+               SELECT id, locked_until, status::text, queue, workflow_name, version
                FROM #{prefix}.endurant_executions
                WHERE id = $1
                AND status IN (
@@ -851,11 +968,16 @@ defmodule Endurant.Executions do
                updated_at = timezone('UTC', now())
              FROM locked_execution
              WHERE e.id = locked_execution.id
-             RETURNING locked_execution.locked_until
+             RETURNING
+               locked_execution.locked_until,
+               locked_execution.status,
+               locked_execution.queue,
+               locked_execution.workflow_name,
+               locked_execution.version
              """
 
              case query!(repo, sql, [execution_id_db, worker_id]).rows do
-               [[locked_until]] ->
+               [[locked_until, previous_status, queue, workflow_name, version]] ->
                  abandoned_at =
                    case locked_until do
                      %DateTime{} = dt ->
@@ -878,7 +1000,12 @@ defmodule Endurant.Executions do
                    opts
                  )
 
-                 :ok
+                 %{
+                   queue: queue,
+                   workflow: workflow_name,
+                   version: version,
+                   previous_status: parse_status(previous_status)
+                 }
 
                _ ->
                  repo.rollback(:not_running)
@@ -886,7 +1013,21 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, :ok} -> :ok
+      {:ok, execution_context} ->
+        Telemetry.emit(
+          [:execution, :released],
+          %{count: 1},
+          execution_metadata(
+            opts,
+            execution_context.queue,
+            execution_context.workflow,
+            execution_context.version,
+            %{previous_status: execution_context.previous_status}
+          )
+        )
+
+        :ok
+
       {:error, :not_running} -> {:error, :not_running}
     end
   end
@@ -952,18 +1093,24 @@ defmodule Endurant.Executions do
                    {acc, 0}
                  else
                    sql = claim_ready_waiting_sql(prefix, branch)
-                   branch_rows = query!(repo, sql, [queue, remaining, worker_id, lease_ms]).rows
+                   branch_rows =
+                     query!(repo, sql, [queue, remaining, worker_id, lease_ms]).rows
+                     |> Enum.map(&{branch, &1})
+
                    {acc ++ branch_rows, max(remaining - length(branch_rows), 0)}
                  end
                end)
 
-             Enum.map(rows, fn [id, workflow_name, input, version] ->
+             Enum.map(rows, fn {branch, [id, workflow_name, input, version]} ->
                execution = %{
                  id: to_app_id(id),
+                 queue: queue,
                  workflow: workflow_name,
                  input: input,
                  status: :running,
-                 version: version
+                 version: version,
+                 claim_branch: branch,
+                 previous_status: claim_branch_previous_status(branch)
                }
 
                Events.append(execution.id, :execution_resumed, %{worker_id: worker_id}, opts)
@@ -973,7 +1120,26 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, executions} -> executions
+      {:ok, executions} ->
+        Enum.each(executions, fn execution ->
+          Telemetry.emit(
+            [:execution, :resumed],
+            %{count: 1},
+            execution_metadata(
+              opts,
+              execution.queue,
+              execution.workflow,
+              execution.version,
+              %{
+                previous_status: execution.previous_status,
+                claim_branch: execution.claim_branch
+              }
+            )
+          )
+        end)
+
+        Enum.map(executions, &Map.drop(&1, [:claim_branch, :previous_status]))
+
       {:error, reason} -> raise "claim_ready_waiting failed: #{inspect(reason)}"
     end
   end
@@ -1082,10 +1248,22 @@ defmodule Endurant.Executions do
       updated_at = timezone('UTC', now())
     WHERE id = $1
     AND status = 'waiting'::#{prefix}.endurant_execution_status
+    RETURNING queue, workflow_name, version
     """
 
-    _ = query!(repo, sql, [execution_id])
-    :ok
+    case query!(repo, sql, [execution_id]).rows do
+      [[queue, workflow_name, version]] ->
+        Telemetry.emit(
+          [:execution, :continuable],
+          %{count: 1},
+          execution_metadata(opts, queue, workflow_name, version)
+        )
+
+        :ok
+
+      _ ->
+        :ok
+    end
   end
 
   @doc """
@@ -1207,7 +1385,7 @@ defmodule Endurant.Executions do
     prefix = Keyword.get(opts, :prefix, @default_prefix)
     queue = opts |> Keyword.get(:queue) |> normalize_queue_option()
 
-    abandoned_rows =
+    telemetry =
       repo.transaction(
         fn ->
           clear_waiting_locks_sql = """
@@ -1278,14 +1456,22 @@ defmodule Endurant.Executions do
             updated_at = timezone('UTC', now())
           FROM expired_cancelling
           WHERE e.id = expired_cancelling.id
-          RETURNING e.id
+          RETURNING e.id, e.queue, e.workflow_name, e.version, e.inserted_at
           """
 
           cancelled_rows = query!(repo, expire_cancelling_sql, [queue, limit]).rows
 
-          Enum.each(cancelled_rows, fn [id] ->
+          cancelled_telemetry =
+            Enum.map(cancelled_rows, fn [id, queue_name, workflow_name, version, inserted_at] ->
             Events.append(to_app_id(id), :execution_cancelled, %{}, opts)
-          end)
+
+              %{
+                queue: queue_name,
+                workflow: workflow_name,
+                version: version,
+                inserted_at: inserted_at
+              }
+            end)
 
           recover_order = recover_runnable_branch_order(opts)
 
@@ -1295,44 +1481,80 @@ defmodule Endurant.Executions do
                 {acc, 0}
               else
                 sql = recover_runnable_sql(prefix, branch)
-                branch_rows = query!(repo, sql, [queue, remaining]).rows
+                branch_rows =
+                  query!(repo, sql, [queue, remaining]).rows
+                  |> Enum.map(&{branch, &1})
+
                 {acc ++ branch_rows, max(remaining - length(branch_rows), 0)}
               end
             end)
 
-          Enum.each(rows, fn [id, locked_until, pre_orphaned_waiting, has_abandoned_event] ->
-            # Rows that were already orphaned may already have an abandoned event.
-            if pre_orphaned_waiting and has_abandoned_event do
-              :ok
-            else
-              abandoned_at =
-                case locked_until do
-                  %DateTime{} = dt ->
-                    DateTime.to_iso8601(dt)
+          recovered_telemetry =
+            Enum.reduce(rows, [], fn
+              {_branch, [_id, _queue_name, _locked_until, true, true]}, acc ->
+                acc
 
-                  %NaiveDateTime{} = dt ->
-                    dt
-                    |> DateTime.from_naive!("Etc/UTC")
-                    |> DateTime.to_iso8601()
+              {branch, [id, queue_name, locked_until, _pre_orphaned_waiting, _has_abandoned_event]},
+              acc ->
+                abandoned_at =
+                  case locked_until do
+                    %DateTime{} = dt ->
+                      DateTime.to_iso8601(dt)
 
-                  other ->
-                    raise "missing locked_until for abandoned execution #{inspect(id)}: #{inspect(other)}"
-                end
+                    %NaiveDateTime{} = dt ->
+                      dt
+                      |> DateTime.from_naive!("Etc/UTC")
+                      |> DateTime.to_iso8601()
 
-              append_abandoned_execution_events(repo, prefix, to_app_id(id), abandoned_at, opts)
-            end
-          end)
+                    other ->
+                      raise "missing locked_until for abandoned execution #{inspect(id)}: #{inspect(other)}"
+                  end
 
-          rows
+                append_abandoned_execution_events(repo, prefix, to_app_id(id), abandoned_at, opts)
+
+                [
+                  %{queue: queue_name, status: :abandoned, recover_branch: branch}
+                  | acc
+                ]
+            end)
+
+          %{cancelled: cancelled_telemetry, recovered: Enum.reverse(recovered_telemetry)}
         end,
         log: false
       )
       |> case do
-        {:ok, rows} -> rows
+        {:ok, telemetry} -> telemetry
         {:error, reason} -> raise "recover_expired_locks failed: #{inspect(reason)}"
       end
 
-    length(abandoned_rows)
+    Enum.each(telemetry.cancelled, fn execution_context ->
+      Telemetry.emit(
+        [:execution, :cancelled],
+        execution_cancelled_measurements(execution_context),
+        execution_metadata(
+          opts,
+          execution_context.queue,
+          execution_context.workflow,
+          execution_context.version
+        )
+      )
+    end)
+
+    Enum.each(telemetry.recovered, fn recovered ->
+      Telemetry.emit(
+        [:execution, :recovered],
+        %{count: 1},
+        %{
+          instance: Keyword.get(opts, :instance),
+          node: node(),
+          queue: recovered.queue,
+          status: recovered.status,
+          recover_branch: recovered.recover_branch
+        }
+      )
+    end)
+
+    length(telemetry.recovered)
   end
 
   @spec claim_ready_branch_order(keyword()) :: [claim_ready_branch()]
@@ -1430,6 +1652,7 @@ defmodule Endurant.Executions do
     WITH expired_running AS (
       SELECT
         e.id,
+        e.queue,
         e.locked_until,
         FALSE AS pre_orphaned_waiting,
         EXISTS (
@@ -1458,6 +1681,7 @@ defmodule Endurant.Executions do
     WHERE e.id = expired_running.id
     RETURNING
       e.id,
+      e.queue,
       expired_running.locked_until,
       expired_running.pre_orphaned_waiting,
       expired_running.has_abandoned_event
@@ -1469,6 +1693,7 @@ defmodule Endurant.Executions do
     WITH expired_continuable AS (
       SELECT
         e.id,
+        e.queue,
         e.locked_until,
         FALSE AS pre_orphaned_waiting,
         EXISTS (
@@ -1498,6 +1723,7 @@ defmodule Endurant.Executions do
     WHERE e.id = expired_continuable.id
     RETURNING
       e.id,
+      e.queue,
       expired_continuable.locked_until,
       expired_continuable.pre_orphaned_waiting,
       expired_continuable.has_abandoned_event
@@ -1509,6 +1735,7 @@ defmodule Endurant.Executions do
     WITH expired_waiting_ready AS (
       SELECT
         e.id,
+        e.queue,
         e.locked_until,
         (e.locked_by IS NULL) AS pre_orphaned_waiting,
         EXISTS (
@@ -1539,6 +1766,7 @@ defmodule Endurant.Executions do
     WHERE e.id = expired_waiting_ready.id
     RETURNING
       e.id,
+      e.queue,
       expired_waiting_ready.locked_until,
       expired_waiting_ready.pre_orphaned_waiting,
       expired_waiting_ready.has_abandoned_event
@@ -1595,11 +1823,11 @@ defmodule Endurant.Executions do
 
     case repo.transaction(
            fn ->
-             case lock_execution_status(repo, prefix, execution_id) do
+             case lock_execution(repo, prefix, execution_id) do
                nil ->
                  repo.rollback(:not_found)
 
-               status when status in [:pending, :running, :waiting, :continuable, :abandoned] ->
+               execution when execution.status in [:pending, :running, :waiting, :continuable, :abandoned] ->
                  Events.append(
                    execution_id,
                    :signal_received,
@@ -1607,12 +1835,15 @@ defmodule Endurant.Executions do
                    opts
                  )
 
-                 if status == :waiting and
-                      latest_wait_signal_matches?(execution_id, wait_signal_key, repo, prefix) do
+                 wakeup =
+                   execution.status == :waiting and
+                     latest_wait_signal_matches?(execution_id, wait_signal_key, repo, prefix)
+
+                 if wakeup do
                    mark_continuable(execution_id, opts)
                  end
 
-                 :ok
+                 %{execution: execution, wakeup: wakeup}
 
                _status ->
                  repo.rollback(:not_active)
@@ -1620,7 +1851,21 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, :ok} -> :ok
+      {:ok, %{execution: execution, wakeup: wakeup}} ->
+        Telemetry.emit(
+          [:execution, :signal_received],
+          %{count: 1},
+          execution_metadata(
+            opts,
+            execution.queue,
+            execution.workflow,
+            execution.version,
+            %{wakeup: wakeup}
+          )
+        )
+
+        :ok
+
       {:error, reason} -> {:error, reason}
     end
   end
@@ -1696,26 +1941,27 @@ defmodule Endurant.Executions do
 
     case repo.transaction(
            fn ->
-             case lock_execution_status(repo, prefix, execution_id) do
+             case lock_execution(repo, prefix, execution_id) do
                nil ->
                  repo.rollback(:not_found)
 
-               status when status in [:completed, :failed] ->
+               execution when execution.status in [:completed, :failed] ->
                  repo.rollback(:not_active)
 
-               :cancelled ->
-                 :already_cancelled
+               %{status: :cancelled} ->
+                 {:already_cancelled, nil}
 
-               :cancelling ->
-                 :already_cancelling
+               %{status: :cancelling} ->
+                 {:already_cancelling, nil}
 
-               :running ->
+               %{status: :running} = execution ->
                  mark_cancelling(execution_id, opts)
-                 :running
+                 {:running, execution}
 
-               status when status in [:pending, :waiting, :continuable, :abandoned] ->
+               %{status: status} = execution
+               when status in [:pending, :waiting, :continuable, :abandoned] ->
                  mark_cancelling(execution_id, opts)
-                 :finalize_now
+                 {:finalize_now, execution}
 
                _ ->
                  repo.rollback(:not_active)
@@ -1723,7 +1969,23 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, state} -> {:ok, state}
+      {:ok, {state, execution}} ->
+        if state in [:running, :finalize_now] and execution do
+          Telemetry.emit(
+            [:execution, :cancel_requested],
+            %{count: 1},
+            execution_metadata(
+              opts,
+              execution.queue,
+              execution.workflow,
+              execution.version,
+              %{status: execution.status}
+            )
+          )
+        end
+
+        {:ok, state}
+
       {:error, reason} -> {:error, reason}
     end
   end
@@ -1756,14 +2018,14 @@ defmodule Endurant.Executions do
 
     case repo.transaction(
            fn ->
-             case lock_execution_status(repo, prefix, execution_id) do
+             case lock_execution(repo, prefix, execution_id) do
                nil ->
-                 :ok
+                 nil
 
-               :cancelled ->
-                 :ok
+               %{status: :cancelled} ->
+                 nil
 
-               :cancelling ->
+               %{status: :cancelling} ->
                  finalize_cancel(execution_id, opts)
 
                _ ->
@@ -1772,7 +2034,23 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, :ok} -> :ok
+      {:ok, nil} ->
+        :ok
+
+      {:ok, execution_context} ->
+        Telemetry.emit(
+          [:execution, :cancelled],
+          execution_cancelled_measurements(execution_context),
+          execution_metadata(
+            opts,
+            execution_context.queue,
+            execution_context.workflow,
+            execution_context.version
+          )
+        )
+
+        :ok
+
       {:error, :invalid_transition} -> {:error, :invalid_transition}
       {:error, _reason} -> {:error, :invalid_transition}
     end
@@ -1806,7 +2084,7 @@ defmodule Endurant.Executions do
     :ok
   end
 
-  @spec finalize_cancel(binary(), keyword()) :: :ok
+  @spec finalize_cancel(binary(), keyword()) :: map() | :ok
   defp finalize_cancel(execution_id, opts) do
     repo = repo!(opts)
     prefix = Keyword.get(opts, :prefix, @default_prefix)
@@ -1822,14 +2100,16 @@ defmodule Endurant.Executions do
       updated_at = timezone('UTC', now())
     WHERE id = $1
     AND status = 'cancelling'::#{prefix}.endurant_execution_status
+    RETURNING id
     """
 
-    case query!(repo, sql, [execution_id]).num_rows do
-      1 -> Events.append(execution_id, :execution_cancelled, %{}, opts)
+    case query!(repo, sql, [execution_id]).rows do
+      [[_id]] ->
+        Events.append(execution_id, :execution_cancelled, %{}, opts)
+        terminal_execution_context(repo, prefix, execution_id)
+
       _ -> :ok
     end
-
-    :ok
   end
 
   @doc """
@@ -2375,6 +2655,87 @@ defmodule Endurant.Executions do
 
   defp payload_task_run_id(_payload), do: nil
 
+  @spec claim_branch_previous_status(claim_ready_branch()) :: :continuable | :waiting
+  defp claim_branch_previous_status(:continuable), do: :continuable
+  defp claim_branch_previous_status(:waiting_ready), do: :waiting
+
+  @spec execution_metadata(keyword(), String.t(), String.t(), String.t(), map()) :: map()
+  defp execution_metadata(opts, queue, workflow, version, extra \\ %{}) do
+    Map.merge(
+      %{
+        instance: Keyword.get(opts, :instance),
+        node: node(),
+        queue: queue,
+        workflow: workflow,
+        version: version
+      },
+      extra
+    )
+  end
+
+  @spec basic_execution_context(module(), String.t(), binary()) :: map()
+  defp basic_execution_context(repo, prefix, execution_id) do
+    sql = """
+    SELECT queue, workflow_name, version
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [execution_id]).rows do
+      [[queue, workflow_name, version]] ->
+        %{queue: queue, workflow: workflow_name, version: version}
+
+      _ ->
+        raise "missing execution telemetry context for #{inspect(to_app_id(execution_id))}"
+    end
+  end
+
+  @spec terminal_execution_context(module(), String.t(), binary()) :: map()
+  defp terminal_execution_context(repo, prefix, execution_id) do
+    sql = """
+    SELECT queue, workflow_name, version, inserted_at, next_event_sequence, history_size_bytes
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [execution_id]).rows do
+      [[queue, workflow_name, version, inserted_at, next_event_sequence, history_size_bytes]] ->
+        %{
+          queue: queue,
+          workflow: workflow_name,
+          version: version,
+          inserted_at: inserted_at,
+          next_event_sequence: next_event_sequence,
+          history_size_bytes: history_size_bytes
+        }
+
+      _ ->
+        raise "missing execution terminal context for #{inspect(to_app_id(execution_id))}"
+    end
+  end
+
+  @spec execution_terminal_measurements(map()) :: map()
+  defp execution_terminal_measurements(execution_context) do
+    %{
+      count: 1,
+      duration_ms: execution_duration_ms(execution_context),
+      history_length: max(execution_context.next_event_sequence - 1, 0),
+      history_size_bytes: execution_context.history_size_bytes
+    }
+  end
+
+  @spec execution_cancelled_measurements(map()) :: map()
+  defp execution_cancelled_measurements(execution_context) do
+    %{count: 1, duration_ms: execution_duration_ms(execution_context)}
+  end
+
+  @spec execution_duration_ms(map()) :: non_neg_integer()
+  defp execution_duration_ms(%{inserted_at: inserted_at}) do
+    Telemetry.datetime_diff_ms(inserted_at, NaiveDateTime.utc_now())
+  end
+
   @spec parse_status(String.t()) :: atom()
   defp parse_status(status) do
     case status do
@@ -2446,8 +2807,16 @@ defmodule Endurant.Executions do
 
   @spec lock_execution_status(module(), String.t(), binary()) :: atom() | nil
   defp lock_execution_status(repo, prefix, execution_id) do
+    case lock_execution(repo, prefix, execution_id) do
+      %{status: status} -> status
+      nil -> nil
+    end
+  end
+
+  @spec lock_execution(module(), String.t(), binary()) :: map() | nil
+  defp lock_execution(repo, prefix, execution_id) do
     sql = """
-    SELECT status::text
+    SELECT status::text, queue, workflow_name, version
     FROM #{prefix}.endurant_executions
     WHERE id = $1
     FOR UPDATE
@@ -2455,7 +2824,14 @@ defmodule Endurant.Executions do
     """
 
     case query!(repo, sql, [execution_id]).rows do
-      [[status]] -> parse_status(status)
+      [[status, queue, workflow_name, version]] ->
+        %{
+          status: parse_status(status),
+          queue: queue,
+          workflow: workflow_name,
+          version: version
+        }
+
       _ -> nil
     end
   end

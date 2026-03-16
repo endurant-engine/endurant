@@ -1,6 +1,8 @@
 defmodule Endurant.Schedules do
   @moduledoc false
 
+  alias Endurant.Telemetry
+
   @default_prefix "public"
 
   @type overlap_policy :: :skip
@@ -262,20 +264,22 @@ defmodule Endurant.Schedules do
            scheduled_at_naive
          ]).rows do
       [[id]] ->
-        {:ok,
-         %{
-           id: to_app_id(id),
-           cron_schedule_id: maybe_to_app_id(cron_schedule_id),
-           unique_id: unique_id,
-           queue: queue,
-           workflow: workflow_name,
-           version: version,
-           input: input,
-           scheduled_at: scheduled_at,
-           overlap_policy: :skip,
-           status: :pending,
-           dispatched_execution_id: nil
-         }}
+        schedule = %{
+          id: to_app_id(id),
+          cron_schedule_id: maybe_to_app_id(cron_schedule_id),
+          unique_id: unique_id,
+          queue: queue,
+          workflow: workflow_name,
+          version: version,
+          input: input,
+          scheduled_at: scheduled_at,
+          overlap_policy: :skip,
+          status: :pending,
+          dispatched_execution_id: nil
+        }
+
+        Telemetry.emit([:schedule, :inserted], %{count: 1}, schedule_metadata(opts, schedule))
+        {:ok, schedule}
 
       _ ->
         {:error, :id_conflict}
@@ -339,29 +343,49 @@ defmodule Endurant.Schedules do
 
   @spec dispatch_one(schedule(), keyword()) :: :ok
   defp dispatch_one(schedule, opts) do
-    case find_open_execution_id(schedule.unique_id, opts) do
+    outcome =
+      case find_open_execution_id(schedule.unique_id, opts) do
       nil ->
         dispatch_or_mark(schedule, opts)
 
       _execution_id ->
         mark_skipped(schedule.id, opts)
+        :skipped
     end
+
+    Telemetry.emit(
+      [:schedule, :dispatch],
+      %{count: 1, lag_ms: lag_ms(schedule.scheduled_at)},
+      schedule_metadata(opts, schedule, %{outcome: outcome})
+    )
+
+    :ok
   rescue
     _error ->
       mark_failed(schedule.id, opts)
+      Telemetry.emit(
+        [:schedule, :dispatch],
+        %{count: 1, lag_ms: lag_ms(schedule.scheduled_at)},
+        schedule_metadata(opts, schedule, %{outcome: :failed})
+      )
+
+      :ok
   end
 
-  @spec dispatch_or_mark(schedule(), keyword()) :: :ok
+  @spec dispatch_or_mark(schedule(), keyword()) :: :dispatched | :skipped | :failed
   defp dispatch_or_mark(schedule, opts) do
     case dispatch_execution(schedule, opts) do
       {:ok, execution_id} ->
         mark_dispatched(schedule.id, execution_id, opts)
+        :dispatched
 
       {:error, :unique_conflict} ->
         mark_skipped(schedule.id, opts)
+        :skipped
 
       {:error, _reason} ->
         mark_failed(schedule.id, opts)
+        :failed
     end
   end
 
@@ -623,6 +647,25 @@ defmodule Endurant.Schedules do
   defp to_datetime(nil), do: nil
   defp to_datetime(%DateTime{} = dt), do: dt
   defp to_datetime(%NaiveDateTime{} = dt), do: DateTime.from_naive!(dt, "Etc/UTC")
+
+  @spec schedule_metadata(keyword(), schedule(), map()) :: map()
+  defp schedule_metadata(opts, schedule, extra \\ %{}) do
+    Map.merge(
+      %{
+        instance: Keyword.get(opts, :instance),
+        node: node(),
+        queue: schedule.queue,
+        workflow: schedule.workflow,
+        version: schedule.version
+      },
+      extra
+    )
+  end
+
+  @spec lag_ms(DateTime.t()) :: non_neg_integer()
+  defp lag_ms(%DateTime{} = scheduled_at) do
+    Telemetry.datetime_diff_ms(scheduled_at, DateTime.utc_now())
+  end
 
   @spec positive_integer(term(), atom()) :: pos_integer()
   defp positive_integer(value, _name) when is_integer(value) and value > 0, do: value

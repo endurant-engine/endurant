@@ -17,6 +17,7 @@ defmodule Endurant.Workflow.Signals do
 
   alias Endurant.Events
   alias Endurant.Executions
+  alias Endurant.Telemetry
   alias Endurant.Workflow
 
   @doc """
@@ -57,8 +58,9 @@ defmodule Endurant.Workflow.Signals do
 
   @spec wait_for_signal_resume(map(), String.t()) :: term() | no_return()
   defp wait_for_signal_resume(runtime, signal_key) do
+    wait_started_at = Telemetry.monotonic_time()
     enter_signal_wait(runtime, signal_key)
-    do_wait_for_signal_resume(runtime, signal_key)
+    do_wait_for_signal_resume(runtime, signal_key, wait_started_at)
   end
 
   @spec enter_signal_wait(map(), String.t()) :: :ok | no_return()
@@ -76,11 +78,16 @@ defmodule Endurant.Workflow.Signals do
         throw({:endurant_halt, :not_running})
     end
 
+    emit_signal(runtime, :wait_started, %{count: 1})
+
     case notify_waiting(runtime) do
       :park ->
+        emit_signal(runtime, :park_decision, %{count: 1}, %{decision: :park})
         :ok
 
       :release ->
+        emit_signal(runtime, :park_decision, %{count: 1}, %{decision: :release})
+
         case Executions.release_waiting_as_abandoned_owned(
                runtime.execution_id,
                runtime.worker_id,
@@ -95,8 +102,8 @@ defmodule Endurant.Workflow.Signals do
     end
   end
 
-  @spec do_wait_for_signal_resume(map(), String.t()) :: term() | no_return()
-  defp do_wait_for_signal_resume(runtime, signal_key) do
+  @spec do_wait_for_signal_resume(map(), String.t(), integer()) :: term() | no_return()
+  defp do_wait_for_signal_resume(runtime, signal_key, wait_started_at) do
     case await_resume() do
       :ok ->
         refreshed_runtime = refresh_signal_runtime(runtime)
@@ -105,10 +112,15 @@ defmodule Endurant.Workflow.Signals do
           {:ok, payload, next_runtime} ->
             Workflow.put_runtime(next_runtime)
             notify_ready(next_runtime)
+            emit_signal(
+              next_runtime,
+              :resumed,
+              %{count: 1, wait_duration_ms: Telemetry.duration_ms(wait_started_at)}
+            )
             payload
 
           :empty ->
-            do_wait_for_signal_resume(refreshed_runtime, signal_key)
+            do_wait_for_signal_resume(refreshed_runtime, signal_key, wait_started_at)
         end
 
       {:error, :cancelled} ->
@@ -237,5 +249,23 @@ defmodule Endurant.Workflow.Signals do
 
   defp normalize_signal_name!(name) do
     raise ArgumentError, "signal name must be a string, got: #{inspect(name)}"
+  end
+
+  @spec emit_signal(map(), atom(), map(), map()) :: :ok
+  defp emit_signal(runtime, event, measurements, extra_metadata \\ %{}) do
+    Telemetry.emit(
+      [:signal, event],
+      measurements,
+      Map.merge(
+        %{
+          instance: Map.get(runtime, :instance),
+          node: node(),
+          queue: Map.get(runtime, :queue),
+          workflow: Map.get(runtime, :workflow),
+          version: Map.get(runtime, :version)
+        },
+        extra_metadata
+      )
+    )
   end
 end

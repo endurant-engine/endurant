@@ -7,6 +7,7 @@ defmodule Endurant.ArchiveWorker do
   alias Endurant.Archivers
   alias Endurant.Migrations.Postgres
   alias Endurant.Settings
+  alias Endurant.Telemetry
 
   @default_prefix "public"
   @default_lease_ms 30_000
@@ -222,43 +223,101 @@ defmodule Endurant.ArchiveWorker do
 
   @spec process_scan(state()) :: :ok
   defp process_scan(%__MODULE__{} = state) do
-    with {:ok, module} <- archiver_module(state),
-         {:ok, setting} <- archiver_setting(state),
-         {:ok, rows} <- fetch_execution_batch(state) do
-      last_row = List.last(rows)
+    started_at = Telemetry.monotonic_time()
 
-      pending_rows =
-        rows
-        |> Enum.reject(& &1.delivered?)
-        |> attach_events(state)
+    {outcome, fetched, pending, delivered} =
+      with {:ok, module} <- archiver_module(state),
+           {:ok, setting} <- archiver_setting(state),
+           {:ok, rows} <- fetch_execution_batch(state) do
+        last_row = List.last(rows)
 
-      result =
-        case pending_rows do
-          [] ->
-            :ok
+        pending_rows =
+          rows
+          |> Enum.reject(& &1.delivered?)
+          |> attach_events(state)
 
-          pending_rows ->
-            module.archive(
-              Enum.map(pending_rows, &%{execution: &1.execution, events: &1.events}),
-              Postgres.migrated_version(state.runtime_opts),
-              archiver_callback_opts(state, setting)
-            )
-        end
+        fetched = length(rows)
+        pending = length(pending_rows)
 
-      case result do
-        :ok ->
-          with :ok <- insert_deliveries(state, pending_rows),
-               :ok <- advance_cursor(state, last_row) do
-            :ok
+        result =
+          case pending_rows do
+            [] ->
+              :ok
+
+            pending_rows ->
+              archive_started_at = Telemetry.monotonic_time()
+
+              result =
+                module.archive(
+                  Enum.map(pending_rows, &%{execution: &1.execution, events: &1.events}),
+                  Postgres.migrated_version(state.runtime_opts),
+                  archiver_callback_opts(state, setting)
+                )
+
+              Telemetry.emit(
+                [:archiver, :archive],
+                %{
+                  duration_ms: Telemetry.duration_ms(archive_started_at),
+                  batch_size: pending,
+                  event_count: Enum.reduce(pending_rows, 0, fn row, acc -> length(row.events) + acc end),
+                  history_size_bytes:
+                    Enum.reduce(pending_rows, 0, fn row, acc ->
+                      row.execution.history_size_bytes + acc
+                    end)
+                },
+                archiver_metadata(state, %{outcome: archive_result_outcome(result)})
+              )
+
+              result
           end
 
-        {:error, _reason} ->
-          :ok
+        delivered =
+          case result do
+            :ok ->
+              with :ok <- insert_deliveries(state, pending_rows),
+                   :ok <- advance_cursor(state, last_row) do
+                if pending > 0 do
+                  Telemetry.emit(
+                    [:archiver, :delivery_insert],
+                    %{count: pending},
+                    archiver_metadata(state, %{outcome: :ok})
+                  )
+                end
+
+                if last_row do
+                  Telemetry.emit(
+                    [:archiver, :cursor_advanced],
+                    %{count: 1},
+                    archiver_metadata(state, %{outcome: :ok})
+                  )
+                end
+
+                pending
+              else
+                {:error, _reason} -> 0
+              end
+
+            {:error, _reason} ->
+              0
+          end
+
+        {archive_result_outcome(result), fetched, pending, delivered}
+      else
+        _ ->
+          {:error, 0, 0, 0}
       end
-    else
-      _ ->
-        :ok
-    end
+
+    Telemetry.emit(
+      [:archiver, :scan],
+      %{
+        duration_ms: Telemetry.duration_ms(started_at),
+        batch_size: state.batch_size,
+        fetched: fetched,
+        pending: pending,
+        delivered: delivered
+      },
+      archiver_metadata(state, %{outcome: outcome})
+    )
 
     :ok
   end
@@ -572,6 +631,22 @@ defmodule Endurant.ArchiveWorker do
   defp positive_integer(value, name) do
     raise ArgumentError, "#{inspect(name)} must be a positive integer, got: #{inspect(value)}"
   end
+
+  @spec archiver_metadata(state(), map()) :: map()
+  defp archiver_metadata(state, extra) do
+    Map.merge(
+      %{
+        instance: state.instance,
+        node: node(),
+        archiver: state.archiver
+      },
+      extra
+    )
+  end
+
+  @spec archive_result_outcome(:ok | {:error, term()}) :: :ok | :error
+  defp archive_result_outcome(:ok), do: :ok
+  defp archive_result_outcome({:error, _reason}), do: :error
 
   @spec normalize_archiver!(atom() | String.t()) :: String.t()
   defp normalize_archiver!(archiver) when is_atom(archiver) do

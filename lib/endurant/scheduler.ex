@@ -131,10 +131,17 @@ defmodule Endurant.Scheduler do
 
   @impl true
   def handle_info(:dispatch, %__MODULE__{active?: true} = state) do
-    _ = Crons.dispatch_due(state.dispatch_limit, state.runtime_opts)
-    _ = Schedules.dispatch_due(state.dispatch_limit, state.runtime_opts)
-    schedule(:dispatch, state.dispatch_ms)
-    {:noreply, state}
+    case Settings.get(state.setting_id, state.runtime_opts) do
+      %{} ->
+        _ = Crons.dispatch_due(state.dispatch_limit, state.runtime_opts)
+        _ = Schedules.dispatch_due(state.dispatch_limit, state.runtime_opts)
+        schedule(:dispatch, state.dispatch_ms)
+        {:noreply, state}
+
+      _ ->
+        schedule(:retry_acquire, 0)
+        {:noreply, %{state | active?: false, fence: nil}}
+    end
   end
 
   def handle_info(:dispatch, %__MODULE__{} = state) do
