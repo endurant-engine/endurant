@@ -259,7 +259,8 @@ defmodule Endurant.ArchiveWorker do
                 %{
                   duration_ms: Telemetry.duration_ms(archive_started_at),
                   batch_size: pending,
-                  event_count: Enum.reduce(pending_rows, 0, fn row, acc -> length(row.events) + acc end),
+                  event_count:
+                    Enum.reduce(pending_rows, 0, fn row, acc -> length(row.events) + acc end),
                   history_size_bytes:
                     Enum.reduce(pending_rows, 0, fn row, acc ->
                       row.execution.history_size_bytes + acc
@@ -360,7 +361,8 @@ defmodule Endurant.ArchiveWorker do
     WHERE e.status IN (
       'completed'::#{prefix}.endurant_execution_status,
       'failed'::#{prefix}.endurant_execution_status,
-      'cancelled'::#{prefix}.endurant_execution_status
+      'cancelled'::#{prefix}.endurant_execution_status,
+      'continued_as_new'::#{prefix}.endurant_execution_status
     )
     AND e.completed_at IS NOT NULL
     #{cursor_sql}
@@ -572,10 +574,12 @@ defmodule Endurant.ArchiveWorker do
   defp parse_status("completed"), do: :completed
   defp parse_status("failed"), do: :failed
   defp parse_status("cancelled"), do: :cancelled
+  defp parse_status("continued_as_new"), do: :continued_as_new
 
   @spec parse_event_type(String.t()) :: atom()
   defp parse_event_type("execution_created"), do: :execution_created
   defp parse_event_type("execution_started"), do: :execution_started
+  defp parse_event_type("execution_continued_as_new"), do: :execution_continued_as_new
   defp parse_event_type("execution_completed"), do: :execution_completed
   defp parse_event_type("execution_failed"), do: :execution_failed
   defp parse_event_type("execution_cancelled"), do: :execution_cancelled

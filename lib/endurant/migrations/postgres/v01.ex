@@ -22,7 +22,8 @@ defmodule Endurant.Migrations.Postgres.V01 do
         'cancelling',
         'completed',
         'failed',
-        'cancelled'
+        'cancelled',
+        'continued_as_new'
       );
       """)
     end
@@ -38,6 +39,7 @@ defmodule Endurant.Migrations.Postgres.V01 do
         'execution_abandoned',
         'execution_resumed',
         'execution_waiting',
+        'execution_continued_as_new',
         'task_started',
         'task_completed',
         'task_failed',
@@ -205,7 +207,8 @@ defmodule Endurant.Migrations.Postgres.V01 do
     create_if_not_exists(
       index(:endurant_executions, [:completed_at, :id],
         name: :endurant_executions_archive_scan_idx,
-        where: "status IN ('completed', 'failed', 'cancelled') AND completed_at IS NOT NULL",
+        where:
+          "status IN ('completed', 'failed', 'cancelled', 'continued_as_new') AND completed_at IS NOT NULL",
         prefix: prefix
       )
     )
