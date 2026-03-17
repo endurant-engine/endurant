@@ -68,9 +68,13 @@ defmodule Endurant.TestSupport.PostgresHelper do
           {false, pid}
       end
 
-    case Ecto.Migrator.down(Repo, @base_version + 1, StepMigration, log: false) do
-      :ok -> :ok
-      :already_down -> :ok
+    try do
+      case Ecto.Migrator.down(Repo, @base_version + 1, StepMigration, log: false) do
+        :ok -> :ok
+        :already_down -> :ok
+      end
+    rescue
+      _ -> :ok
     end
 
     Repo.query!("DROP SCHEMA IF EXISTS #{prefix} CASCADE")

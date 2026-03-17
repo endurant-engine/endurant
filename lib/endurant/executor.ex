@@ -7,56 +7,24 @@ defmodule Endurant.Executor do
   alias Endurant.Workflow
 
   @type execution_ref :: map() | binary()
+  @type execution_outcome ::
+          :completed
+          | :waiting
+          | :cancelled
+          | :failed
+          | :lock_lost
+          | :not_found
   @heartbeat_stop_timeout 1_000
 
   @spec run(execution_ref(), keyword()) ::
-          :completed | :waiting | :cancelled | :failed | :lock_lost | :not_found
+          execution_outcome()
   def run(execution_or_id, opts \\ []) do
     _ = queue_manager!(opts)
     worker_id = Keyword.get(opts, :worker_id, default_worker_id())
 
     with {:ok, execution} <- fetch_execution(execution_or_id, opts),
          {:ok, workflow_module} <- resolve_workflow_module(execution.workflow) do
-      lease_ms = Keyword.get(opts, :lease_ms, 30_000)
-      heartbeat_ms = heartbeat_interval_ms(opts, lease_ms)
-
-      case Executions.mark_started(execution.id, worker_id, opts) do
-        :ok ->
-          outcome =
-            case Executions.heartbeat(execution.id, worker_id, lease_ms, opts) do
-            :ok ->
-              heartbeat_pid =
-                start_heartbeat_loop(execution.id, worker_id, lease_ms, heartbeat_ms, opts)
-
-              try do
-                execute_loop(execution, workflow_module, worker_id, lease_ms, heartbeat_ms, opts)
-              after
-                stop_heartbeat_loop(heartbeat_pid)
-              end
-
-            {:error, :cancelled} ->
-              cancel_execution(execution.id, opts)
-              :cancelled
-
-            {:error, :lock_lost} ->
-              :lock_lost
-
-            {:error, :transient_db} ->
-              :lock_lost
-          end
-
-          outcome
-
-        {:error, :cancelled} ->
-          cancel_execution(execution.id, opts)
-          :cancelled
-
-        {:error, :lock_lost} ->
-          :lock_lost
-
-        {:error, :not_found} ->
-          :not_found
-      end
+      execute_execution(execution, workflow_module, worker_id, opts, false)
     else
       {:error, {:not_found, execution_id}} ->
         raise ArgumentError, "execution not found: #{inspect(execution_id)}"
@@ -133,7 +101,10 @@ defmodule Endurant.Executor do
           keyword()
         ) ::
           {:ok,
-           {:completed, term()} | {:waiting, term()} | {:halt, :not_running | :waiting_persisted}}
+           {:completed, term()}
+           | {:waiting, term()}
+           | {:halt, :not_running | :waiting_persisted}
+           | {:continue_as_new, map()}}
           | {:error, term(), binary()}
   defp run_workflow(workflow_module, execution, history, worker_id, opts) do
     task_results = task_results_from_history(history)
@@ -155,6 +126,7 @@ defmodule Endurant.Executor do
       waits: waits_from_history(history),
       signal_queues: signal_queues,
       loaded_signal_seq: loaded_signal_seq,
+      first_execution_id: first_execution_id_from_history(execution, history),
       history_length: history_length,
       history_size_bytes: history_size_bytes,
       next_event_sequence: next_event_sequence
@@ -178,10 +150,106 @@ defmodule Endurant.Executor do
       :throw, {:endurant_halt, :waiting_persisted} ->
         {:ok, {:halt, :waiting_persisted}}
 
+      :throw, {:endurant_continue_as_new, continue_as_new} ->
+        {:ok, {:continue_as_new, continue_as_new}}
+
       kind, reason ->
         {:error, {:throw, kind, reason, __STACKTRACE__}, execution.id}
     after
       Workflow.delete_runtime()
+    end
+  end
+
+  @spec execute_execution(Executions.execution(), module(), String.t(), keyword(), boolean()) ::
+          execution_outcome()
+  defp execute_execution(execution, workflow_module, worker_id, opts, already_started?) do
+    lease_ms = Keyword.get(opts, :lease_ms, 30_000)
+    heartbeat_ms = heartbeat_interval_ms(opts, lease_ms)
+
+    case maybe_start_execution(
+           execution,
+           worker_id,
+           lease_ms,
+           heartbeat_ms,
+           opts,
+           already_started?
+         ) do
+      {:ok, heartbeat_pid} ->
+        try do
+          case execute_loop(execution, workflow_module, worker_id, lease_ms, heartbeat_ms, opts) do
+            {:continue_as_new, next_execution} ->
+              notify_continued(execution.id, next_execution.id, opts)
+              execute_execution(next_execution, workflow_module, worker_id, opts, true)
+
+            outcome ->
+              outcome
+          end
+        after
+          stop_heartbeat_loop(heartbeat_pid)
+        end
+
+      {:error, :cancelled} ->
+        cancel_execution(execution.id, opts)
+        :cancelled
+
+      {:error, :lock_lost} ->
+        :lock_lost
+
+      {:error, :not_found} ->
+        :not_found
+    end
+  end
+
+  @spec maybe_start_execution(
+          Executions.execution(),
+          String.t(),
+          pos_integer(),
+          pos_integer(),
+          keyword(),
+          boolean()
+        ) ::
+          {:ok, pid()} | {:error, :cancelled | :lock_lost | :not_found}
+  defp maybe_start_execution(execution, worker_id, lease_ms, heartbeat_ms, opts, true) do
+    start_heartbeat_for_execution(execution.id, worker_id, lease_ms, heartbeat_ms, opts)
+  end
+
+  defp maybe_start_execution(execution, worker_id, lease_ms, heartbeat_ms, opts, false) do
+    case Executions.mark_started(execution.id, worker_id, opts) do
+      :ok ->
+        start_heartbeat_for_execution(execution.id, worker_id, lease_ms, heartbeat_ms, opts)
+
+      {:error, :cancelled} ->
+        {:error, :cancelled}
+
+      {:error, :lock_lost} ->
+        {:error, :lock_lost}
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+    end
+  end
+
+  @spec start_heartbeat_for_execution(
+          binary(),
+          String.t(),
+          pos_integer(),
+          pos_integer(),
+          keyword()
+        ) ::
+          {:ok, pid()} | {:error, :cancelled | :lock_lost}
+  defp start_heartbeat_for_execution(execution_id, worker_id, lease_ms, heartbeat_ms, opts) do
+    case Executions.heartbeat(execution_id, worker_id, lease_ms, opts) do
+      :ok ->
+        {:ok, start_heartbeat_loop(execution_id, worker_id, lease_ms, heartbeat_ms, opts)}
+
+      {:error, :cancelled} ->
+        {:error, :cancelled}
+
+      {:error, :lock_lost} ->
+        {:error, :lock_lost}
+
+      {:error, :transient_db} ->
+        {:error, :lock_lost}
     end
   end
 
@@ -192,7 +260,7 @@ defmodule Endurant.Executor do
           pos_integer(),
           pos_integer(),
           keyword()
-        ) :: :completed | :waiting | :cancelled | :failed | :lock_lost
+        ) :: execution_outcome() | {:continue_as_new, Executions.execution()}
   defp execute_loop(execution, workflow_module, worker_id, lease_ms, heartbeat_ms, opts) do
     case heartbeat_message() do
       :cancelled ->
@@ -225,7 +293,7 @@ defmodule Endurant.Executor do
           pos_integer(),
           pos_integer(),
           keyword()
-        ) :: :completed | :waiting | :cancelled | :failed | :lock_lost
+        ) :: execution_outcome() | {:continue_as_new, Executions.execution()}
   defp execute_loop_continue(execution, workflow_module, worker_id, lease_ms, heartbeat_ms, opts) do
     if Executions.cancellation_requested?(execution.id, opts) do
       cancel_execution(execution.id, opts)
@@ -280,6 +348,15 @@ defmodule Endurant.Executor do
 
           {:halt, :waiting_persisted} ->
             :waiting
+
+          {:continue_as_new, continue_as_new} ->
+            continue_as_new_execution(
+              execution,
+              worker_id,
+              lease_ms,
+              continue_as_new,
+              opts
+            )
         end
       else
         {:error, reason, execution_id} ->
@@ -604,6 +681,68 @@ defmodule Endurant.Executor do
     end)
   end
 
+  @spec first_execution_id_from_history(Executions.execution(), [Events.event()]) :: binary()
+  defp first_execution_id_from_history(execution, events) do
+    Enum.find_value(events, execution.id, fn event ->
+      case event do
+        %{type: :execution_started, payload: %{"first_execution_id" => first_execution_id}}
+        when is_binary(first_execution_id) ->
+          first_execution_id
+
+        %{type: :execution_started, payload: %{first_execution_id: first_execution_id}}
+        when is_binary(first_execution_id) ->
+          first_execution_id
+
+        _ ->
+          nil
+      end
+    end)
+  end
+
+  @spec continue_as_new_execution(
+          Executions.execution(),
+          String.t(),
+          pos_integer(),
+          map(),
+          keyword()
+        ) :: {:continue_as_new, Executions.execution()} | :failed | :cancelled | :lock_lost
+  defp continue_as_new_execution(
+         execution,
+         worker_id,
+         lease_ms,
+         continue_as_new,
+         opts
+       ) do
+    case Executions.continue_as_new_owned(
+           execution.id,
+           worker_id,
+           continue_as_new,
+           lease_ms,
+           opts
+         ) do
+      {:ok, next_execution} ->
+        {:continue_as_new, next_execution}
+
+      {:error, :cancelled} ->
+        cancel_execution(execution.id, opts)
+        :cancelled
+
+      {:error, :not_running} ->
+        :lock_lost
+
+      {:error, reason} ->
+        _ =
+          Executions.mark_failed_owned(
+            execution.id,
+            worker_id,
+            serialize_reason({:continue_as_new_failed, reason}),
+            opts
+          )
+
+        :failed
+    end
+  end
+
   @spec serialize_reason(term()) :: map()
   defp serialize_reason({:exception, error, stacktrace}) do
     %{
@@ -628,6 +767,20 @@ defmodule Endurant.Executor do
   defp cancel_execution(execution_id, opts) do
     _ = Executions.request_cancel(execution_id, opts)
     _ = Executions.mark_cancelled(execution_id, opts)
+    :ok
+  end
+
+  @spec notify_continued(binary(), binary(), keyword()) :: :ok
+  defp notify_continued(old_execution_id, new_execution_id, opts) do
+    manager = queue_manager!(opts)
+
+    _ =
+      GenServer.call(
+        manager,
+        {:executor_continued, self(), old_execution_id, new_execution_id},
+        5_000
+      )
+
     :ok
   end
 

@@ -61,12 +61,15 @@ defmodule Endurant.QueueManager do
   @impl true
   def handle_info(:tick, %__MODULE__{} = state) do
     started_at = Telemetry.monotonic_time()
+
     recover_opts =
       state.opts
       |> Keyword.put(:queue, state.queue)
       |> Keyword.put(:recover_order, recover_order_for_tick(state.tick))
 
-    recovered = Endurant.Executions.recover_expired_locks(recovery_limit(state.opts), recover_opts)
+    recovered =
+      Endurant.Executions.recover_expired_locks(recovery_limit(state.opts), recover_opts)
+
     state = promote_db_ready_waiters(state)
     worker_id = worker_id(state.instance, state.queue)
     {state, resumed} = resume_ready_waiters(state, worker_id)
@@ -180,6 +183,14 @@ defmodule Endurant.QueueManager do
     {:reply, :ok, next_state}
   end
 
+  def handle_call(
+        {:executor_continued, pid, old_execution_id, new_execution_id},
+        _from,
+        %__MODULE__{} = state
+      ) do
+    {:reply, :ok, update_execution_id(state, pid, old_execution_id, new_execution_id)}
+  end
+
   @spec spawn_executions(list(term()), map(), String.t(), pid(), keyword()) :: map()
   defp spawn_executions(executions, running, worker_id, manager, opts) do
     Enum.reduce(executions, running, fn execution, acc ->
@@ -270,6 +281,29 @@ defmodule Endurant.QueueManager do
       nil ->
         state
     end
+  end
+
+  @spec update_execution_id(state(), pid(), term(), term()) :: state()
+  defp update_execution_id(%__MODULE__{} = state, pid, old_execution_id, new_execution_id) do
+    running =
+      Enum.reduce(state.running, state.running, fn {ref, info}, acc ->
+        if info.pid == pid and info.execution_id == old_execution_id do
+          Map.put(acc, ref, %{info | execution_id: new_execution_id})
+        else
+          acc
+        end
+      end)
+
+    parked =
+      Enum.reduce(state.parked, state.parked, fn {ref, info}, acc ->
+        if info.pid == pid and info.execution_id == old_execution_id do
+          Map.put(acc, ref, %{info | execution_id: new_execution_id})
+        else
+          acc
+        end
+      end)
+
+    %{state | running: running, parked: parked}
   end
 
   @spec promote_db_ready_waiters(state()) :: state()

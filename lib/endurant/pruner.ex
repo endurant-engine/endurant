@@ -190,22 +190,28 @@ defmodule Endurant.Pruner do
 
     {pruned, deleted_events, deleted_deliveries} =
       repo.transaction(
-      fn ->
-        execution_ids =
-          select_prunable_execution_ids(repo, prefix, enabled_archivers, cutoff, state.batch_size)
+        fn ->
+          execution_ids =
+            select_prunable_execution_ids(
+              repo,
+              prefix,
+              enabled_archivers,
+              cutoff,
+              state.batch_size
+            )
 
-        if execution_ids != [] do
-          deleted_events = delete_events(repo, prefix, execution_ids)
-          deleted_deliveries = delete_deliveries(repo, prefix, execution_ids)
-          pruned = delete_executions(repo, prefix, execution_ids)
-          {pruned, deleted_events, deleted_deliveries}
-        else
-          {0, 0, 0}
-        end
-      end,
-      timeout: :infinity,
-      log: false
-    )
+          if execution_ids != [] do
+            deleted_events = delete_events(repo, prefix, execution_ids)
+            deleted_deliveries = delete_deliveries(repo, prefix, execution_ids)
+            pruned = delete_executions(repo, prefix, execution_ids)
+            {pruned, deleted_events, deleted_deliveries}
+          else
+            {0, 0, 0}
+          end
+        end,
+        timeout: :infinity,
+        log: false
+      )
       |> case do
         {:ok, counts} -> counts
         _ -> {0, 0, 0}
@@ -250,7 +256,8 @@ defmodule Endurant.Pruner do
     WHERE e.status IN (
       'completed'::#{prefix}.endurant_execution_status,
       'failed'::#{prefix}.endurant_execution_status,
-      'cancelled'::#{prefix}.endurant_execution_status
+      'cancelled'::#{prefix}.endurant_execution_status,
+      'continued_as_new'::#{prefix}.endurant_execution_status
     )
     AND e.completed_at IS NOT NULL
     AND e.completed_at < $2

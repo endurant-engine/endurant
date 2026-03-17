@@ -81,6 +81,8 @@ defmodule Endurant.Workflow do
           queue: 1,
           unique_id: 1,
           sleep: 2,
+          continue_as_new: 1,
+          continue_as_new: 2,
           execution_id: 0,
           history_length: 0,
           history_size: 0
@@ -219,6 +221,53 @@ defmodule Endurant.Workflow do
       put_runtime(runtime)
       wait_for_time_resume(runtime, delay_ms, wait_key)
     end
+  end
+
+  @doc """
+  Ends the current execution and immediately continues as a new execution.
+
+  The new execution inherits workflow metadata.
+  """
+  @spec continue_as_new(map()) :: no_return()
+  def continue_as_new(next_input) when is_map(next_input) do
+    continue_as_new(next_input, [])
+  end
+
+  @doc """
+  Ends the current execution and immediately continues as a new execution with
+  supported option overrides.
+
+  Supported options:
+  - `version: "..."` starts the continued execution with a different workflow version
+  - `rollover_signals: true` carries unused observed signals into the new execution
+  """
+  @spec continue_as_new(map(), keyword()) :: no_return()
+  def continue_as_new(next_input, opts) when is_map(next_input) and is_list(opts) do
+    runtime = runtime!()
+    version = Keyword.get(opts, :version)
+    rollover_signals = Keyword.get(opts, :rollover_signals, false)
+
+    if not (is_nil(version) or (is_binary(version) and byte_size(version) > 0)) do
+      raise ArgumentError,
+            "continue_as_new/2 expects :version to be a non-empty string, got: #{inspect(version)}"
+    end
+
+    if not is_boolean(rollover_signals) do
+      raise ArgumentError,
+            "continue_as_new/2 expects :rollover_signals to be a boolean, got: #{inspect(rollover_signals)}"
+    end
+
+    throw(
+      {:endurant_continue_as_new,
+       %{
+         next_input: next_input,
+         version: version,
+         rollover_signals: rollover_signals,
+         signal_queues: Map.get(runtime, :signal_queues, %{}),
+         loaded_signal_seq: Map.get(runtime, :loaded_signal_seq, 0),
+         first_execution_id: Map.get(runtime, :first_execution_id, runtime.execution_id)
+       }}
+    )
   end
 
   @spec wait_for_time_resume(map(), pos_integer(), String.t()) :: :ok | no_return()

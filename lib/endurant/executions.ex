@@ -9,7 +9,7 @@ defmodule Endurant.Executions do
   @max_list_limit 1000
 
   @open_status_strings ["pending", "running", "waiting", "continuable", "abandoned", "cancelling"]
-  @terminal_status_strings ["completed", "failed", "cancelled"]
+  @terminal_status_strings ["completed", "failed", "cancelled", "continued_as_new"]
   @all_status_strings @open_status_strings ++ @terminal_status_strings
 
   @type execution_status ::
@@ -22,6 +22,7 @@ defmodule Endurant.Executions do
           | :completed
           | :failed
           | :cancelled
+          | :continued_as_new
 
   @type execution :: %{
           id: binary(),
@@ -158,7 +159,8 @@ defmodule Endurant.Executions do
 
         result
 
-      {:error, _op, reason, _changes} -> {:error, reason}
+      {:error, _op, reason, _changes} ->
+        {:error, reason}
     end
   end
 
@@ -196,7 +198,18 @@ defmodule Endurant.Executions do
     """
 
     case query!(repo, sql, [execution_id]).rows do
-      [[id, queue, workflow_name, input, status, version, next_event_sequence, history_size_bytes]] ->
+      [
+        [
+          id,
+          queue,
+          workflow_name,
+          input,
+          status,
+          version,
+          next_event_sequence,
+          history_size_bytes
+        ]
+      ] ->
         %{
           id: to_app_id(id),
           queue: queue,
@@ -436,7 +449,8 @@ defmodule Endurant.Executions do
 
         Enum.map(executions, &Map.delete(&1, :previous_status))
 
-      {:error, reason} -> raise "claim_pending failed: #{inspect(reason)}"
+      {:error, reason} ->
+        raise "claim_pending failed: #{inspect(reason)}"
     end
   end
 
@@ -496,7 +510,10 @@ defmodule Endurant.Executions do
 
         Telemetry.emit(
           [:execution, :started],
-          %{count: 1, time_to_start_ms: Telemetry.datetime_diff_ms(inserted_at, NaiveDateTime.utc_now())},
+          %{
+            count: 1,
+            time_to_start_ms: Telemetry.datetime_diff_ms(inserted_at, NaiveDateTime.utc_now())
+          },
           execution_metadata(opts, queue, workflow_name, version)
         )
 
@@ -599,7 +616,8 @@ defmodule Endurant.Executions do
 
         :ok
 
-      {:error, :not_running} -> {:error, :not_running}
+      {:error, :not_running} ->
+        {:error, :not_running}
     end
   end
 
@@ -686,7 +704,161 @@ defmodule Endurant.Executions do
 
         :ok
 
-      {:error, :not_running} -> {:error, :not_running}
+      {:error, :not_running} ->
+        {:error, :not_running}
+    end
+  end
+
+  @spec continue_as_new_owned(binary(), String.t(), map(), pos_integer(), keyword()) ::
+          {:ok, execution()} | {:error, :not_running | :cancelled | term()}
+  def continue_as_new_owned(execution_id, worker_id, continue_as_new, lease_ms, opts \\ [])
+      when is_binary(worker_id) and is_integer(lease_ms) and lease_ms > 0 and
+             is_map(continue_as_new) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    execution_id = to_db_id(execution_id)
+    next_input = Map.fetch!(continue_as_new, :next_input)
+    next_version = Map.get(continue_as_new, :version)
+    rollover_signals = Map.get(continue_as_new, :rollover_signals, false)
+    loaded_signal_seq = Map.get(continue_as_new, :loaded_signal_seq, 0)
+    signal_queues = Map.get(continue_as_new, :signal_queues, %{})
+    first_execution_id = Map.get(continue_as_new, :first_execution_id)
+
+    case repo.transaction(
+           fn ->
+             with {:ok, current} <-
+                    fetch_running_execution_for_continue(repo, prefix, execution_id, worker_id) do
+               first_execution_id =
+                 if is_binary(first_execution_id) and first_execution_id != "" do
+                   first_execution_id
+                 else
+                   to_app_id(execution_id)
+                 end
+
+               next_version =
+                 if is_binary(next_version) and next_version != "" do
+                   next_version
+                 else
+                   current.version
+                 end
+
+               merged_signal_queues =
+                 if rollover_signals do
+                   merge_late_signals(
+                     signal_queues,
+                     execution_id,
+                     loaded_signal_seq,
+                     repo,
+                     prefix
+                   )
+                 else
+                   %{}
+                 end
+
+               case update_execution_for_continue(repo, prefix, execution_id, worker_id).num_rows do
+                 1 ->
+                   next_execution_id = Ecto.UUID.generate()
+
+                   case insert_continued_execution(
+                          repo,
+                          prefix,
+                          current,
+                          next_execution_id,
+                          next_input,
+                          next_version,
+                          worker_id,
+                          lease_ms
+                        ) do
+                     {:ok, next_execution} ->
+                       Events.append(
+                         to_app_id(execution_id),
+                         :execution_continued_as_new,
+                         %{
+                           new_execution_id: next_execution.id,
+                           first_execution_id: first_execution_id
+                         },
+                         opts
+                       )
+
+                       Events.append(
+                         next_execution.id,
+                         :execution_created,
+                         %{
+                           workflow: current.workflow,
+                           unique_id: current.unique_id,
+                           version: next_execution.version
+                         },
+                         opts
+                       )
+
+                       Events.append(
+                         next_execution.id,
+                         :execution_started,
+                         %{
+                           worker_id: worker_id,
+                           first_execution_id: first_execution_id,
+                           previous_execution_id: to_app_id(execution_id)
+                         },
+                         opts
+                       )
+
+                       Enum.each(Enum.sort(Map.keys(merged_signal_queues)), fn signal ->
+                         queue =
+                           case Map.fetch!(merged_signal_queues, signal) do
+                             value when is_list(value) -> :queue.from_list(value)
+                             value -> value
+                           end
+
+                         queue
+                         |> :queue.to_list()
+                         |> Enum.each(fn payload ->
+                           Events.append(
+                             next_execution.id,
+                             :signal_received,
+                             %{signal: signal, payload: payload},
+                             opts
+                           )
+                         end)
+                       end)
+
+                       next_execution
+
+                     {:error, reason} ->
+                       repo.rollback(reason)
+                   end
+
+                 _ ->
+                   repo.rollback(:not_running)
+               end
+             else
+               {:error, reason} ->
+                 repo.rollback(reason)
+             end
+           end,
+           log: false
+         ) do
+      {:ok, next_execution} ->
+        Telemetry.emit(
+          [:execution, :continued_as_new],
+          %{count: 1},
+          execution_metadata(
+            opts,
+            next_execution.queue,
+            to_string(next_execution.workflow),
+            next_execution.version
+          )
+        )
+
+        {:ok, next_execution}
+
+      {:error, :not_running} ->
+        {:error, :not_running}
+
+      {:error, :cancelled} ->
+        {:error, :cancelled}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -829,7 +1001,8 @@ defmodule Endurant.Executions do
 
         :ok
 
-      {:error, :not_running} -> {:error, :not_running}
+      {:error, :not_running} ->
+        {:error, :not_running}
     end
   end
 
@@ -914,7 +1087,8 @@ defmodule Endurant.Executions do
 
         :ok
 
-      {:error, :not_running} -> {:error, :not_running}
+      {:error, :not_running} ->
+        {:error, :not_running}
     end
   end
 
@@ -1028,7 +1202,8 @@ defmodule Endurant.Executions do
 
         :ok
 
-      {:error, :not_running} -> {:error, :not_running}
+      {:error, :not_running} ->
+        {:error, :not_running}
     end
   end
 
@@ -1093,6 +1268,7 @@ defmodule Endurant.Executions do
                    {acc, 0}
                  else
                    sql = claim_ready_waiting_sql(prefix, branch)
+
                    branch_rows =
                      query!(repo, sql, [queue, remaining, worker_id, lease_ms]).rows
                      |> Enum.map(&{branch, &1})
@@ -1140,7 +1316,8 @@ defmodule Endurant.Executions do
 
         Enum.map(executions, &Map.drop(&1, [:claim_branch, :previous_status]))
 
-      {:error, reason} -> raise "claim_ready_waiting failed: #{inspect(reason)}"
+      {:error, reason} ->
+        raise "claim_ready_waiting failed: #{inspect(reason)}"
     end
   end
 
@@ -1463,7 +1640,7 @@ defmodule Endurant.Executions do
 
           cancelled_telemetry =
             Enum.map(cancelled_rows, fn [id, queue_name, workflow_name, version, inserted_at] ->
-            Events.append(to_app_id(id), :execution_cancelled, %{}, opts)
+              Events.append(to_app_id(id), :execution_cancelled, %{}, opts)
 
               %{
                 queue: queue_name,
@@ -1481,6 +1658,7 @@ defmodule Endurant.Executions do
                 {acc, 0}
               else
                 sql = recover_runnable_sql(prefix, branch)
+
                 branch_rows =
                   query!(repo, sql, [queue, remaining]).rows
                   |> Enum.map(&{branch, &1})
@@ -1494,7 +1672,8 @@ defmodule Endurant.Executions do
               {_branch, [_id, _queue_name, _locked_until, true, true]}, acc ->
                 acc
 
-              {branch, [id, queue_name, locked_until, _pre_orphaned_waiting, _has_abandoned_event]},
+              {branch,
+               [id, queue_name, locked_until, _pre_orphaned_waiting, _has_abandoned_event]},
               acc ->
                 abandoned_at =
                   case locked_until do
@@ -1817,19 +1996,20 @@ defmodule Endurant.Executions do
   def record_signal(execution_id, signal, payload, opts \\ []) do
     repo = repo!(opts)
     prefix = Keyword.get(opts, :prefix, @default_prefix)
-    execution_id = to_db_id(execution_id)
+    signal_target = execution_id
     signal_name = normalize_signal(signal)
     wait_signal_key = signal_name
 
     case repo.transaction(
            fn ->
-             case lock_execution(repo, prefix, execution_id) do
+             case resolve_signal_target(repo, prefix, signal_target) do
                nil ->
-                 repo.rollback(:not_found)
+                 repo.rollback(signal_target_not_found_reason(repo, prefix, signal_target))
 
-               execution when execution.status in [:pending, :running, :waiting, :continuable, :abandoned] ->
+               execution
+               when execution.status in [:pending, :running, :waiting, :continuable, :abandoned] ->
                  Events.append(
-                   execution_id,
+                   execution.id,
                    :signal_received,
                    %{signal: signal_name, payload: payload || %{}},
                    opts
@@ -1837,10 +2017,15 @@ defmodule Endurant.Executions do
 
                  wakeup =
                    execution.status == :waiting and
-                     latest_wait_signal_matches?(execution_id, wait_signal_key, repo, prefix)
+                     latest_wait_signal_matches?(
+                       to_db_id(execution.id),
+                       wait_signal_key,
+                       repo,
+                       prefix
+                     )
 
                  if wakeup do
-                   mark_continuable(execution_id, opts)
+                   mark_continuable(execution.id, opts)
                  end
 
                  %{execution: execution, wakeup: wakeup}
@@ -1866,7 +2051,8 @@ defmodule Endurant.Executions do
 
         :ok
 
-      {:error, reason} -> {:error, reason}
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1986,7 +2172,8 @@ defmodule Endurant.Executions do
 
         {:ok, state}
 
-      {:error, reason} -> {:error, reason}
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -2051,8 +2238,11 @@ defmodule Endurant.Executions do
 
         :ok
 
-      {:error, :invalid_transition} -> {:error, :invalid_transition}
-      {:error, _reason} -> {:error, :invalid_transition}
+      {:error, :invalid_transition} ->
+        {:error, :invalid_transition}
+
+      {:error, _reason} ->
+        {:error, :invalid_transition}
     end
   end
 
@@ -2108,7 +2298,8 @@ defmodule Endurant.Executions do
         Events.append(execution_id, :execution_cancelled, %{}, opts)
         terminal_execution_context(repo, prefix, execution_id)
 
-      _ -> :ok
+      _ ->
+        :ok
     end
   end
 
@@ -2748,6 +2939,7 @@ defmodule Endurant.Executions do
       "completed" -> :completed
       "failed" -> :failed
       "cancelled" -> :cancelled
+      "continued_as_new" -> :continued_as_new
     end
   end
 
@@ -2756,6 +2948,15 @@ defmodule Endurant.Executions do
     case Ecto.UUID.dump(id) do
       {:ok, dumped} -> dumped
       :error -> id
+    end
+  end
+
+  @spec maybe_to_db_id(binary()) :: {:ok, binary()} | :error
+  defp maybe_to_db_id(id) when is_binary(id) do
+    case Ecto.UUID.dump(id) do
+      {:ok, dumped} -> {:ok, dumped}
+      :error when byte_size(id) == 16 -> {:ok, id}
+      :error -> :error
     end
   end
 
@@ -2816,7 +3017,7 @@ defmodule Endurant.Executions do
   @spec lock_execution(module(), String.t(), binary()) :: map() | nil
   defp lock_execution(repo, prefix, execution_id) do
     sql = """
-    SELECT status::text, queue, workflow_name, version
+    SELECT id, unique_id, status::text, queue, workflow_name, version
     FROM #{prefix}.endurant_executions
     WHERE id = $1
     FOR UPDATE
@@ -2824,15 +3025,18 @@ defmodule Endurant.Executions do
     """
 
     case query!(repo, sql, [execution_id]).rows do
-      [[status, queue, workflow_name, version]] ->
+      [[id, unique_id, status, queue, workflow_name, version]] ->
         %{
+          id: to_app_id(id),
+          unique_id: unique_id,
           status: parse_status(status),
           queue: queue,
           workflow: workflow_name,
           version: version
         }
 
-      _ -> nil
+      _ ->
+        nil
     end
   end
 
@@ -2842,6 +3046,233 @@ defmodule Endurant.Executions do
 
   @spec normalize_signal(String.t()) :: String.t()
   defp normalize_signal(signal) when is_binary(signal), do: signal
+
+  @spec fetch_running_execution_for_continue(module(), String.t(), binary(), String.t()) ::
+          {:ok, map()} | {:error, :not_running | :cancelled}
+  defp fetch_running_execution_for_continue(repo, prefix, execution_id, worker_id) do
+    sql = """
+    SELECT id, unique_id, queue, workflow_name, version
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    AND status = 'running'::#{prefix}.endurant_execution_status
+    AND locked_by = $2
+    AND locked_until IS NOT NULL
+    AND locked_until > timezone('UTC', now())
+    FOR UPDATE
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [execution_id, worker_id]).rows do
+      [[id, unique_id, queue, workflow_name, version]] ->
+        {:ok,
+         %{
+           id: to_app_id(id),
+           unique_id: unique_id,
+           queue: queue,
+           workflow: workflow_name,
+           version: version
+         }}
+
+      _ ->
+        case lock_execution_status(repo, prefix, execution_id) do
+          status when status in [:cancelling, :cancelled] -> {:error, :cancelled}
+          _ -> {:error, :not_running}
+        end
+    end
+  end
+
+  @spec insert_continued_execution(
+          module(),
+          String.t(),
+          map(),
+          binary(),
+          map(),
+          String.t(),
+          String.t(),
+          pos_integer()
+        ) ::
+          {:ok, execution()} | {:error, term()}
+  defp insert_continued_execution(
+         repo,
+         prefix,
+         current,
+         next_execution_id,
+         input,
+         version,
+         worker_id,
+         lease_ms
+       ) do
+    execution_db_id = to_db_id(next_execution_id)
+
+    sql = """
+    INSERT INTO #{prefix}.endurant_executions
+      (id, unique_id, queue, workflow_name, version, input, status, locked_by, locked_until, inserted_at, updated_at)
+    VALUES
+      (
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        'running'::#{prefix}.endurant_execution_status,
+        $7,
+        timezone('UTC', now()) + ($8::int * interval '1 millisecond'),
+        timezone('UTC', now()),
+        timezone('UTC', now())
+      )
+    RETURNING id
+    """
+
+    case query!(repo, sql, [
+           execution_db_id,
+           current.unique_id,
+           current.queue,
+           current.workflow,
+           version,
+           input,
+           worker_id,
+           lease_ms
+         ]).rows do
+      [[_id]] ->
+        {:ok,
+         %{
+           id: next_execution_id,
+           queue: current.queue,
+           workflow: current.workflow,
+           input: input,
+           status: :running,
+           version: version
+         }}
+
+      _ ->
+        {:error, :insert_failed}
+    end
+  end
+
+  @spec update_execution_for_continue(module(), String.t(), binary(), String.t()) :: map()
+  defp update_execution_for_continue(repo, prefix, execution_id, worker_id) do
+    sql = """
+    UPDATE #{prefix}.endurant_executions
+    SET
+      status = 'continued_as_new'::#{prefix}.endurant_execution_status,
+      completed_at = timezone('UTC', now()),
+      locked_by = NULL,
+      locked_until = NULL,
+      updated_at = timezone('UTC', now())
+    WHERE id = $1
+    AND status = 'running'::#{prefix}.endurant_execution_status
+    AND locked_by = $2
+    AND locked_until IS NOT NULL
+    AND locked_until > timezone('UTC', now())
+    """
+
+    query!(repo, sql, [execution_id, worker_id])
+  end
+
+  @spec merge_late_signals(map(), binary(), non_neg_integer(), module(), String.t()) :: map()
+  defp merge_late_signals(signal_queues, execution_id, loaded_signal_seq, repo, prefix) do
+    sql = """
+    SELECT payload
+    FROM #{prefix}.endurant_events
+    WHERE execution_id = $1
+    AND sequence > $2
+    AND type = 'signal_received'::#{prefix}.endurant_event_type
+    ORDER BY sequence ASC
+    """
+
+    Enum.reduce(query!(repo, sql, [execution_id, loaded_signal_seq]).rows, signal_queues, fn
+      [%{"signal" => signal, "payload" => payload}], acc ->
+        enqueue_signal_payload(acc, signal, payload)
+
+      [%{signal: signal, payload: payload}], acc ->
+        enqueue_signal_payload(acc, signal, payload)
+
+      [_], acc ->
+        acc
+    end)
+  end
+
+  @spec enqueue_signal_payload(map(), String.t(), term()) :: map()
+  defp enqueue_signal_payload(signal_queues, signal, payload) do
+    Map.update(signal_queues, signal, :queue.in(payload, :queue.new()), fn queue ->
+      queue =
+        case queue do
+          value when is_list(value) -> :queue.from_list(value)
+          value -> value
+        end
+
+      :queue.in(payload, queue)
+    end)
+  end
+
+  @spec resolve_signal_target(module(), String.t(), binary()) :: map() | nil
+  defp resolve_signal_target(repo, prefix, execution_or_unique_id) do
+    case maybe_to_db_id(execution_or_unique_id) do
+      {:ok, execution_id} ->
+        case lock_execution(repo, prefix, execution_id) do
+          nil -> lock_open_execution_by_unique_id(repo, prefix, execution_or_unique_id)
+          execution -> execution
+        end
+
+      :error ->
+        lock_open_execution_by_unique_id(repo, prefix, execution_or_unique_id)
+    end
+  end
+
+  @spec signal_target_not_found_reason(module(), String.t(), binary()) :: :not_found | :not_active
+  defp signal_target_not_found_reason(repo, prefix, unique_id) do
+    sql = """
+    SELECT status::text
+    FROM #{prefix}.endurant_executions
+    WHERE unique_id = $1
+    ORDER BY inserted_at DESC, id DESC
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [unique_id]).rows do
+      [[status]] when status in ["completed", "failed", "cancelled", "continued_as_new"] ->
+        :not_active
+
+      _ ->
+        :not_found
+    end
+  end
+
+  @spec lock_open_execution_by_unique_id(module(), String.t(), binary()) :: map() | nil
+  defp lock_open_execution_by_unique_id(repo, prefix, unique_id) do
+    sql = """
+    SELECT id, unique_id, status::text, queue, workflow_name, version
+    FROM #{prefix}.endurant_executions
+    WHERE unique_id = $1
+    AND status IN (
+      'pending'::#{prefix}.endurant_execution_status,
+      'running'::#{prefix}.endurant_execution_status,
+      'waiting'::#{prefix}.endurant_execution_status,
+      'continuable'::#{prefix}.endurant_execution_status,
+      'abandoned'::#{prefix}.endurant_execution_status,
+      'cancelling'::#{prefix}.endurant_execution_status
+    )
+    ORDER BY inserted_at DESC, id DESC
+    FOR UPDATE
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [unique_id]).rows do
+      [[id, open_unique_id, status, queue, workflow_name, version]] ->
+        %{
+          id: to_app_id(id),
+          unique_id: open_unique_id,
+          status: parse_status(status),
+          queue: queue,
+          workflow: workflow_name,
+          version: version
+        }
+
+      _ ->
+        nil
+    end
+  end
 
   @spec latest_wait_signal_matches?(binary(), String.t(), module(), String.t()) :: boolean()
   defp latest_wait_signal_matches?(execution_id, signal_key, repo, prefix) do

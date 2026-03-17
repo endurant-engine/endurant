@@ -223,7 +223,8 @@ defmodule Endurant.Events do
                            history_size_delta_bytes: history_size_delta
                          }
 
-                       _ -> repo.rollback(:execution_not_found)
+                       _ ->
+                         repo.rollback(:execution_not_found)
                      end
 
                    _ ->
@@ -300,7 +301,8 @@ defmodule Endurant.Events do
                            history_size_delta_bytes: history_size_delta
                          }
 
-                       _ -> repo.rollback(:not_running)
+                       _ ->
+                         repo.rollback(:not_running)
                      end
 
                    _ ->
@@ -339,7 +341,8 @@ defmodule Endurant.Events do
         emit_append_telemetry(opts, payload, started_at, telemetry_context)
         :ok
 
-      {:error, :not_running} -> {:error, :not_running}
+      {:error, :not_running} ->
+        {:error, :not_running}
     end
   end
 
@@ -416,6 +419,7 @@ defmodule Endurant.Events do
     case type do
       "execution_created" -> :execution_created
       "execution_started" -> :execution_started
+      "execution_continued_as_new" -> :execution_continued_as_new
       "execution_completed" -> :execution_completed
       "execution_failed" -> :execution_failed
       "execution_cancelled" -> :execution_cancelled

@@ -55,6 +55,7 @@ defmodule Endurant.MixProject do
     concepts = [
       "docs/concepts/tasks.md",
       "docs/concepts/signals.md",
+      "docs/concepts/continue_as_new.md",
       "docs/concepts/sleep.md",
       "docs/concepts/schedules.md",
       "docs/concepts/cron.md",
