@@ -474,6 +474,10 @@ defmodule Endurant.Events do
       "execution_abandoned" -> :execution_abandoned
       "execution_resumed" -> :execution_resumed
       "execution_waiting" -> :execution_waiting
+      "child_execution_started" -> :child_execution_started
+      "child_execution_completed" -> :child_execution_completed
+      "child_execution_failed" -> :child_execution_failed
+      "child_execution_cancelled" -> :child_execution_cancelled
       "task_started" -> :task_started
       "task_completed" -> :task_completed
       "task_failed" -> :task_failed

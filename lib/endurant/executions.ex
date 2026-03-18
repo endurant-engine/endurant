@@ -31,6 +31,7 @@ defmodule Endurant.Executions do
           input: map(),
           status: atom(),
           version: String.t(),
+          metadata: map(),
           next_event_sequence: pos_integer(),
           history_size_bytes: non_neg_integer()
         }
@@ -119,18 +120,25 @@ defmodule Endurant.Executions do
     repo = repo!(opts)
     prefix = Keyword.get(opts, :prefix, @default_prefix)
     workflow = workflow_module.__workflow__()
-    execution_id = Ecto.UUID.generate()
+
+    execution_id =
+      normalize_execution_id!(Keyword.get(opts, :execution_id, Ecto.UUID.generate()), :execution)
+
     execution_db_id = to_db_id(execution_id)
-    unique_id = resolve_unique_id(workflow, input)
+
+    unique_id =
+      normalize_unique_id!(Keyword.get(opts, :unique_id, resolve_unique_id(workflow, input)))
+
     queue = resolve_queue(workflow)
     workflow_name = inspect(workflow_module)
-    version = Map.get(workflow, :version, "1")
+    version = normalize_version!(Keyword.get(opts, :version, Map.get(workflow, :version, "1")))
+    metadata = normalize_execution_row_metadata(Keyword.get(opts, :metadata, %{}))
 
     sql = """
     INSERT INTO #{prefix}.endurant_executions
-      (id, unique_id, queue, workflow_name, version, input, status, inserted_at, updated_at)
+      (id, unique_id, queue, workflow_name, version, input, metadata, status, inserted_at, updated_at)
     VALUES
-      ($1, $2, $3, $4, $5, $6, 'pending'::#{prefix}.endurant_execution_status, timezone('UTC', now()), timezone('UTC', now()))
+      ($1, $2, $3, $4, $5, $6, $7, 'pending'::#{prefix}.endurant_execution_status, timezone('UTC', now()), timezone('UTC', now()))
     ON CONFLICT (unique_id)
       WHERE status IN (
         'pending'::#{prefix}.endurant_execution_status,
@@ -150,7 +158,8 @@ defmodule Endurant.Executions do
            queue,
            workflow_name,
            version,
-           input
+           input,
+           metadata
          ]).rows do
       [[_]] ->
         :ok =
@@ -167,6 +176,7 @@ defmodule Endurant.Executions do
            workflow_module: workflow_name,
            unique_id: unique_id,
            version: version,
+           metadata: metadata,
            status: :pending
          }}
 
@@ -202,7 +212,7 @@ defmodule Endurant.Executions do
     execution_id = to_db_id(execution_id)
 
     sql = """
-    SELECT id, queue, workflow_name, input, status::text, version, next_event_sequence, history_size_bytes
+    SELECT id, queue, workflow_name, input, status::text, version, metadata, next_event_sequence, history_size_bytes
     FROM #{prefix}.endurant_executions
     WHERE id = $1
     LIMIT 1
@@ -217,6 +227,7 @@ defmodule Endurant.Executions do
           input,
           status,
           version,
+          metadata,
           next_event_sequence,
           history_size_bytes
         ]
@@ -228,6 +239,7 @@ defmodule Endurant.Executions do
           input: input || %{},
           status: parse_status(status),
           version: version,
+          metadata: metadata || %{},
           next_event_sequence: next_event_sequence,
           history_size_bytes: history_size_bytes
         }
@@ -605,6 +617,14 @@ defmodule Endurant.Executions do
              case query!(repo, sql, [execution_id, worker_id]).num_rows do
                1 ->
                  Events.append(execution_id, :execution_completed, %{result: result}, opts)
+
+                 maybe_record_child_terminal_event(
+                   to_app_id(execution_id),
+                   :child_execution_completed,
+                   %{result: result},
+                   opts
+                 )
+
                  terminal_execution_context(repo, prefix, execution_id)
 
                _ ->
@@ -614,6 +634,8 @@ defmodule Endurant.Executions do
            log: false
          ) do
       {:ok, execution_context} ->
+        handle_open_children_on_parent_close(to_app_id(execution_id), opts)
+
         Telemetry.emit(
           [:execution, :completed],
           execution_terminal_measurements(execution_context),
@@ -692,6 +714,14 @@ defmodule Endurant.Executions do
              case query!(repo, sql, [execution_id, worker_id]).num_rows do
                1 ->
                  Events.append(execution_id, :execution_failed, %{error: error}, opts)
+
+                 maybe_record_child_terminal_event(
+                   to_app_id(execution_id),
+                   :child_execution_failed,
+                   %{error: error},
+                   opts
+                 )
+
                  terminal_execution_context(repo, prefix, execution_id)
 
                _ ->
@@ -701,6 +731,8 @@ defmodule Endurant.Executions do
            log: false
          ) do
       {:ok, execution_context} ->
+        handle_open_children_on_parent_close(to_app_id(execution_id), opts)
+
         Telemetry.emit(
           [:execution, :failed],
           execution_terminal_measurements(execution_context),
@@ -849,6 +881,8 @@ defmodule Endurant.Executions do
            log: false
          ) do
       {:ok, next_execution} ->
+        handle_open_children_on_parent_close(to_app_id(execution_id), opts)
+
         Telemetry.emit(
           [:execution, :continued_as_new],
           %{count: 1},
@@ -1007,6 +1041,105 @@ defmodule Endurant.Executions do
             execution_context.workflow,
             execution_context.version,
             %{wait_kind: :signal}
+          )
+        )
+
+        :ok
+
+      {:error, :not_running} ->
+        {:error, :not_running}
+    end
+  end
+
+  @doc false
+  @spec mark_waiting_with_child_event_owned(
+          binary(),
+          String.t(),
+          String.t(),
+          String.t() | nil,
+          binary() | nil,
+          keyword()
+        ) :: :ok | :already_resolved | {:error, :not_running}
+  def mark_waiting_with_child_event_owned(
+        execution_id,
+        worker_id,
+        child_key,
+        child_unique_id,
+        child_execution_id,
+        opts \\ []
+      )
+      when is_binary(worker_id) and is_binary(child_key) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    execution_id_db = to_db_id(execution_id)
+
+    lock_sql = """
+    SELECT queue, workflow_name, version
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    AND status = 'running'::#{prefix}.endurant_execution_status
+    AND locked_by = $2
+    AND locked_until IS NOT NULL
+    AND locked_until > timezone('UTC', now())
+    FOR UPDATE
+    """
+
+    update_sql = """
+    UPDATE #{prefix}.endurant_executions
+    SET
+      status = 'waiting'::#{prefix}.endurant_execution_status,
+      waiting_until = NULL,
+      updated_at = timezone('UTC', now())
+    WHERE id = $1
+    """
+
+    case repo.transaction(
+           fn ->
+             case query!(repo, lock_sql, [execution_id_db, worker_id]).rows do
+               [[queue, workflow_name, version]] ->
+                 if child_terminal_event_recorded?(execution_id_db, child_key, repo, prefix) do
+                   :already_resolved
+                 else
+                   case query!(repo, update_sql, [execution_id_db]).num_rows do
+                     1 ->
+                       Events.append(
+                         execution_id,
+                         :execution_waiting,
+                         %{
+                           mode: :child,
+                           child_key: child_key,
+                           child_unique_id: child_unique_id,
+                           child_execution_id: child_execution_id
+                         },
+                         opts
+                       )
+
+                       %{queue: queue, workflow: workflow_name, version: version}
+
+                     _ ->
+                       repo.rollback(:not_running)
+                   end
+                 end
+
+               _ ->
+                 repo.rollback(:not_running)
+             end
+           end,
+           log: false
+         ) do
+      {:ok, :already_resolved} ->
+        :already_resolved
+
+      {:ok, execution_context} ->
+        Telemetry.emit(
+          [:execution, :waiting],
+          %{count: 1},
+          execution_metadata(
+            opts,
+            execution_context.queue,
+            execution_context.workflow,
+            execution_context.version,
+            %{wait_kind: :child}
           )
         )
 
@@ -2236,6 +2369,8 @@ defmodule Endurant.Executions do
         :ok
 
       {:ok, execution_context} ->
+        handle_open_children_on_parent_close(to_app_id(execution_id), opts)
+
         Telemetry.emit(
           [:execution, :cancelled],
           execution_cancelled_measurements(execution_context),
@@ -2307,6 +2442,14 @@ defmodule Endurant.Executions do
     case query!(repo, sql, [execution_id]).rows do
       [[_id]] ->
         Events.append(execution_id, :execution_cancelled, %{}, opts)
+
+        maybe_record_child_terminal_event(
+          to_app_id(execution_id),
+          :child_execution_cancelled,
+          %{},
+          opts
+        )
+
         terminal_execution_context(repo, prefix, execution_id)
 
       _ ->
@@ -2751,6 +2894,29 @@ defmodule Endurant.Executions do
           "#{inspect(filter_key)} execution id must be a binary, got: #{inspect(other)}"
   end
 
+  @spec normalize_unique_id!(term()) :: String.t()
+  defp normalize_unique_id!(unique_id) when is_binary(unique_id) and byte_size(unique_id) > 0,
+    do: unique_id
+
+  defp normalize_unique_id!(other) do
+    raise ArgumentError, "unique_id must be a non-empty binary, got: #{inspect(other)}"
+  end
+
+  @spec normalize_version!(term()) :: String.t()
+  defp normalize_version!(version) when is_binary(version) and byte_size(version) > 0, do: version
+
+  defp normalize_version!(other) do
+    raise ArgumentError, "version must be a non-empty binary, got: #{inspect(other)}"
+  end
+
+  @spec normalize_execution_row_metadata(term()) :: map()
+  defp normalize_execution_row_metadata(metadata) when is_map(metadata), do: metadata
+  defp normalize_execution_row_metadata(nil), do: %{}
+
+  defp normalize_execution_row_metadata(other) do
+    raise ArgumentError, "metadata must be a map, got: #{inspect(other)}"
+  end
+
   @spec normalize_filter_timestamp!(term(), atom()) :: NaiveDateTime.t()
   defp normalize_filter_timestamp!(%NaiveDateTime{} = timestamp, _filter_key), do: timestamp
 
@@ -3028,7 +3194,7 @@ defmodule Endurant.Executions do
   @spec lock_execution(module(), String.t(), binary()) :: map() | nil
   defp lock_execution(repo, prefix, execution_id) do
     sql = """
-    SELECT id, unique_id, status::text, queue, workflow_name, version
+    SELECT id, unique_id, status::text, queue, workflow_name, version, metadata
     FROM #{prefix}.endurant_executions
     WHERE id = $1
     FOR UPDATE
@@ -3036,14 +3202,15 @@ defmodule Endurant.Executions do
     """
 
     case query!(repo, sql, [execution_id]).rows do
-      [[id, unique_id, status, queue, workflow_name, version]] ->
+      [[id, unique_id, status, queue, workflow_name, version, metadata]] ->
         %{
           id: to_app_id(id),
           unique_id: unique_id,
           status: parse_status(status),
           queue: queue,
           workflow: workflow_name,
-          version: version
+          version: version,
+          metadata: metadata || %{}
         }
 
       _ ->
@@ -3062,7 +3229,7 @@ defmodule Endurant.Executions do
           {:ok, map()} | {:error, :not_running | :cancelled}
   defp fetch_running_execution_for_continue(repo, prefix, execution_id, worker_id) do
     sql = """
-    SELECT id, unique_id, queue, workflow_name, version
+    SELECT id, unique_id, queue, workflow_name, version, metadata
     FROM #{prefix}.endurant_executions
     WHERE id = $1
     AND status = 'running'::#{prefix}.endurant_execution_status
@@ -3074,14 +3241,15 @@ defmodule Endurant.Executions do
     """
 
     case query!(repo, sql, [execution_id, worker_id]).rows do
-      [[id, unique_id, queue, workflow_name, version]] ->
+      [[id, unique_id, queue, workflow_name, version, metadata]] ->
         {:ok,
          %{
            id: to_app_id(id),
            unique_id: unique_id,
            queue: queue,
            workflow: workflow_name,
-           version: version
+           version: version,
+           metadata: metadata || %{}
          }}
 
       _ ->
@@ -3117,7 +3285,7 @@ defmodule Endurant.Executions do
 
     sql = """
     INSERT INTO #{prefix}.endurant_executions
-      (id, unique_id, queue, workflow_name, version, input, status, locked_by, locked_until, inserted_at, updated_at)
+      (id, unique_id, queue, workflow_name, version, input, metadata, status, locked_by, locked_until, inserted_at, updated_at)
     VALUES
       (
         $1,
@@ -3126,9 +3294,10 @@ defmodule Endurant.Executions do
         $4,
         $5,
         $6,
-        'running'::#{prefix}.endurant_execution_status,
         $7,
-        timezone('UTC', now()) + ($8::int * interval '1 millisecond'),
+        'running'::#{prefix}.endurant_execution_status,
+        $8,
+        timezone('UTC', now()) + ($9::int * interval '1 millisecond'),
         timezone('UTC', now()),
         timezone('UTC', now())
       )
@@ -3142,6 +3311,7 @@ defmodule Endurant.Executions do
            current.workflow,
            version,
            input,
+           Map.get(current, :metadata, %{}),
            worker_id,
            lease_ms
          ]).rows do
@@ -3153,7 +3323,8 @@ defmodule Endurant.Executions do
            workflow: current.workflow,
            input: input,
            status: :running,
-           version: version
+           version: version,
+           metadata: Map.get(current, :metadata, %{})
          }}
 
       _ ->
@@ -3301,5 +3472,171 @@ defmodule Endurant.Executions do
       [[%{mode: :signal, signal: ^signal_key}]] -> true
       _ -> false
     end
+  end
+
+  @spec latest_wait_child_matches?(binary(), String.t(), module(), String.t()) :: boolean()
+  defp latest_wait_child_matches?(execution_id, child_key, repo, prefix) do
+    sql = """
+    SELECT payload
+    FROM #{prefix}.endurant_events
+    WHERE execution_id = $1
+    AND type = 'execution_waiting'::#{prefix}.endurant_event_type
+    ORDER BY sequence DESC
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [execution_id]).rows do
+      [[%{"mode" => "child", "child_key" => ^child_key}]] -> true
+      [[%{mode: :child, child_key: ^child_key}]] -> true
+      _ -> false
+    end
+  end
+
+  @spec child_terminal_event_recorded?(binary(), String.t(), module(), String.t()) :: boolean()
+  defp child_terminal_event_recorded?(execution_id, child_key, repo, prefix) do
+    sql = """
+    SELECT 1
+    FROM #{prefix}.endurant_events
+    WHERE execution_id = $1
+    AND type IN (
+      'child_execution_completed'::#{prefix}.endurant_event_type,
+      'child_execution_failed'::#{prefix}.endurant_event_type,
+      'child_execution_cancelled'::#{prefix}.endurant_event_type
+    )
+    AND payload->>'child_key' = $2
+    LIMIT 1
+    """
+
+    match?(%{rows: [[1]]}, query!(repo, sql, [execution_id, child_key]))
+  end
+
+  @spec maybe_record_child_terminal_event(binary(), atom(), map(), keyword()) :: :ok
+  defp maybe_record_child_terminal_event(child_execution_id, event_type, payload, opts) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+
+    case child_parent_context(child_execution_id, repo, prefix) do
+      nil ->
+        :ok
+
+      child_context ->
+        if parent_execution_open?(child_context.parent_execution_id, repo, prefix) do
+          Events.append(
+            child_context.parent_execution_id,
+            event_type,
+            Map.merge(payload, %{
+              child_key: child_context.parent_child_key,
+              child_execution_id: child_execution_id,
+              child_first_execution_id: child_context.child_first_execution_id,
+              child_unique_id: child_context.child_unique_id
+            }),
+            opts
+          )
+
+          if latest_wait_child_matches?(
+               to_db_id(child_context.parent_execution_id),
+               child_context.parent_child_key,
+               repo,
+               prefix
+             ) do
+            mark_continuable(child_context.parent_execution_id, opts)
+          end
+        end
+    end
+
+    :ok
+  end
+
+  @spec handle_open_children_on_parent_close(binary(), keyword()) :: :ok
+  defp handle_open_children_on_parent_close(parent_execution_id, opts) do
+    children = list_open_child_executions(parent_execution_id, opts)
+
+    Enum.each(children, fn child ->
+      if child.parent_close_policy == "request_cancel" do
+        _ = cancel(child.execution_id, opts)
+      end
+    end)
+
+    :ok
+  end
+
+  @spec parent_execution_open?(binary(), module(), String.t()) :: boolean()
+  defp parent_execution_open?(parent_execution_id, repo, prefix) do
+    sql = """
+    SELECT status::text
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [to_db_id(parent_execution_id)]).rows do
+      [[status]] when status in @open_status_strings -> true
+      _ -> false
+    end
+  end
+
+  @spec child_parent_context(binary(), module(), String.t()) :: map() | nil
+  defp child_parent_context(child_execution_id, repo, prefix) do
+    sql = """
+    SELECT unique_id, metadata
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [to_db_id(child_execution_id)]).rows do
+      [[child_unique_id, metadata]] ->
+        metadata = metadata || %{}
+
+        with %{} = child_workflow <- metadata["child_workflow"] || metadata[:child_workflow],
+             parent_execution_id when is_binary(parent_execution_id) <-
+               child_workflow["parent_execution_id"] || child_workflow[:parent_execution_id],
+             parent_child_key when is_binary(parent_child_key) <-
+               child_workflow["parent_child_key"] || child_workflow[:parent_child_key] do
+          %{
+            child_unique_id: child_unique_id,
+            child_first_execution_id:
+              child_workflow["child_first_execution_id"] ||
+                child_workflow[:child_first_execution_id] ||
+                child_execution_id,
+            parent_execution_id: parent_execution_id,
+            parent_child_key: parent_child_key,
+            parent_close_policy:
+              child_workflow["parent_close_policy"] || child_workflow[:parent_close_policy]
+          }
+        else
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  @spec list_open_child_executions(binary(), keyword()) :: [map()]
+  defp list_open_child_executions(parent_execution_id, opts) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+
+    sql = """
+    SELECT
+      id,
+      metadata->'child_workflow'->>'parent_close_policy'
+    FROM #{prefix}.endurant_executions
+    WHERE metadata->'child_workflow'->>'parent_execution_id' = $1
+    AND status IN (
+      'pending'::#{prefix}.endurant_execution_status,
+      'running'::#{prefix}.endurant_execution_status,
+      'waiting'::#{prefix}.endurant_execution_status,
+      'continuable'::#{prefix}.endurant_execution_status,
+      'abandoned'::#{prefix}.endurant_execution_status,
+      'cancelling'::#{prefix}.endurant_execution_status
+    )
+    """
+
+    query!(repo, sql, [parent_execution_id]).rows
+    |> Enum.map(fn [id, parent_close_policy] ->
+      %{execution_id: to_app_id(id), parent_close_policy: parent_close_policy}
+    end)
   end
 end

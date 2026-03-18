@@ -40,6 +40,10 @@ defmodule Endurant.Migrations.Postgres.V01 do
         'execution_resumed',
         'execution_waiting',
         'execution_continued_as_new',
+        'child_execution_started',
+        'child_execution_completed',
+        'child_execution_failed',
+        'child_execution_cancelled',
         'task_started',
         'task_completed',
         'task_failed',
@@ -86,6 +90,7 @@ defmodule Endurant.Migrations.Postgres.V01 do
       add(:workflow_name, :text, null: false)
       add(:version, :text, null: false, default: "1")
       add(:input, :map, null: false)
+      add(:metadata, :map, null: false, default: %{})
       add(:status, :"#{quoted}.endurant_execution_status", null: false)
       add(:next_event_sequence, :bigint, null: false, default: 1)
       add(:history_size_bytes, :bigint, null: false, default: 0)
@@ -212,6 +217,43 @@ defmodule Endurant.Migrations.Postgres.V01 do
         prefix: prefix
       )
     )
+
+    execute("""
+    CREATE INDEX IF NOT EXISTS endurant_executions_child_parent_execution_idx
+    ON #{quoted}.endurant_executions ((metadata->'child_workflow'->>'parent_execution_id'))
+    WHERE metadata ? 'child_workflow'
+      AND status IN (
+        'pending'::#{quoted}.endurant_execution_status,
+        'running'::#{quoted}.endurant_execution_status,
+        'waiting'::#{quoted}.endurant_execution_status,
+        'continuable'::#{quoted}.endurant_execution_status,
+        'abandoned'::#{quoted}.endurant_execution_status,
+        'cancelling'::#{quoted}.endurant_execution_status
+      )
+    """)
+
+    execute("""
+    CREATE INDEX IF NOT EXISTS endurant_executions_child_parent_lookup_idx
+    ON #{quoted}.endurant_executions ((metadata->'child_workflow'->>'parent_execution_id'))
+    WHERE metadata ? 'child_workflow'
+    """)
+
+    execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS endurant_executions_open_child_key_unique_idx
+    ON #{quoted}.endurant_executions (
+      (metadata->'child_workflow'->>'parent_execution_id'),
+      (metadata->'child_workflow'->>'parent_child_key')
+    )
+    WHERE metadata ? 'child_workflow'
+      AND status IN (
+        'pending'::#{quoted}.endurant_execution_status,
+        'running'::#{quoted}.endurant_execution_status,
+        'waiting'::#{quoted}.endurant_execution_status,
+        'continuable'::#{quoted}.endurant_execution_status,
+        'abandoned'::#{quoted}.endurant_execution_status,
+        'cancelling'::#{quoted}.endurant_execution_status
+      )
+    """)
 
     create_if_not_exists table(:endurant_scheduled_executions, primary_key: false, prefix: prefix) do
       add(:id, :binary_id, primary_key: true)
@@ -424,6 +466,10 @@ defmodule Endurant.Migrations.Postgres.V01 do
   def down(%{prefix: prefix, quoted_prefix: quoted}) do
     drop_if_exists(index(:endurant_events, [:execution_id, :sequence], prefix: prefix))
     drop_if_exists(table(:endurant_events, prefix: prefix))
+
+    execute("DROP INDEX IF EXISTS #{quoted}.endurant_executions_open_child_key_unique_idx")
+    execute("DROP INDEX IF EXISTS #{quoted}.endurant_executions_child_parent_lookup_idx")
+    execute("DROP INDEX IF EXISTS #{quoted}.endurant_executions_child_parent_execution_idx")
 
     drop_if_exists(
       index(:endurant_archive_deliveries, [:execution_id],

@@ -102,6 +102,15 @@ defmodule Endurant.Workflow do
 
       import Endurant.Workflow.Signals, only: [wait_signal: 1]
 
+      import Endurant.Workflow.Children,
+        only: [
+          child_workflow: 3,
+          child_workflow: 4,
+          child_workflow_async: 3,
+          child_workflow_async: 4,
+          child_workflow_await: 1
+        ]
+
       Module.register_attribute(__MODULE__, :endurant_workflow_version, persist: true)
 
       @endurant_workflow_version unquote(version)
