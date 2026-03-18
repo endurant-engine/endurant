@@ -3,18 +3,29 @@ defmodule Endurant.Workflow.Children do
 
   alias Endurant.Events
   alias Endurant.Executions
+  alias Endurant.Telemetry
   alias Endurant.Workflow
 
   defmodule Handle do
     @moduledoc false
 
     @enforce_keys [:child_key]
-    defstruct [:child_key, :child_execution_id, :child_unique_id]
+    defstruct [
+      :child_key,
+      :child_execution_id,
+      :child_unique_id,
+      :child_workflow_name,
+      :child_version,
+      :parent_close_policy
+    ]
 
     @type t :: %__MODULE__{
             child_key: String.t(),
             child_execution_id: binary() | nil,
-            child_unique_id: String.t() | nil
+            child_unique_id: String.t() | nil,
+            child_workflow_name: String.t() | nil,
+            child_version: String.t() | nil,
+            parent_close_policy: String.t() | nil
           }
   end
 
@@ -112,9 +123,11 @@ defmodule Endurant.Workflow.Children do
 
   @spec wait_for_child_resume(map(), Handle.t()) :: term() | no_return()
   defp wait_for_child_resume(runtime, %Handle{} = handle) do
+    wait_started_at = Telemetry.monotonic_time()
+
     case enter_child_wait(runtime, handle) do
       :ok ->
-        do_wait_for_child_resume(runtime, handle)
+        do_wait_for_child_resume(runtime, handle, wait_started_at)
 
       :already_resolved ->
         refreshed_runtime = refresh_child_runtime(runtime)
@@ -142,11 +155,16 @@ defmodule Endurant.Workflow.Children do
            runtime.opts
          ) do
       :ok ->
+        emit_child(runtime, handle, :wait_started, %{count: 1})
+
         case notify_waiting(runtime) do
           :park ->
+            emit_child(runtime, handle, :park_decision, %{count: 1}, %{decision: :park})
             :ok
 
           :release ->
+            emit_child(runtime, handle, :park_decision, %{count: 1}, %{decision: :release})
+
             case Executions.release_waiting_as_abandoned_owned(
                    runtime.execution_id,
                    runtime.worker_id,
@@ -168,8 +186,8 @@ defmodule Endurant.Workflow.Children do
     end
   end
 
-  @spec do_wait_for_child_resume(map(), Handle.t()) :: term() | no_return()
-  defp do_wait_for_child_resume(runtime, %Handle{} = handle) do
+  @spec do_wait_for_child_resume(map(), Handle.t(), integer()) :: term() | no_return()
+  defp do_wait_for_child_resume(runtime, %Handle{} = handle, wait_started_at) do
     case await_resume() do
       :ok ->
         refreshed_runtime = refresh_child_runtime(runtime)
@@ -178,10 +196,16 @@ defmodule Endurant.Workflow.Children do
           {:ok, state, next_runtime} ->
             Workflow.put_runtime(next_runtime)
             notify_ready(next_runtime)
+
+            emit_child(next_runtime, merge_handle(handle, state), :resumed, %{
+              count: 1,
+              wait_duration_ms: Telemetry.duration_ms(wait_started_at)
+            })
+
             resolve_or_wait!(next_runtime, handle, state)
 
           :missing ->
-            do_wait_for_child_resume(refreshed_runtime, handle)
+            do_wait_for_child_resume(refreshed_runtime, handle, wait_started_at)
         end
 
       {:error, :cancelled} ->
@@ -252,7 +276,10 @@ defmodule Endurant.Workflow.Children do
        %{
          status: :started,
          child_execution_id: payload_value(payload, "child_execution_id"),
-         child_unique_id: payload_value(payload, "child_unique_id")
+         child_unique_id: payload_value(payload, "child_unique_id"),
+         child_workflow_name: payload_value(payload, "child_workflow_name"),
+         child_version: payload_value(payload, "child_version"),
+         parent_close_policy: payload_value(payload, "parent_close_policy")
        }}
     else
       _ -> nil
@@ -368,7 +395,10 @@ defmodule Endurant.Workflow.Children do
                      %Handle{
                        child_key: child_key,
                        child_execution_id: child_execution.id,
-                       child_unique_id: child_unique_id
+                       child_unique_id: child_unique_id,
+                       child_workflow_name: child_workflow_name,
+                       child_version: child_version,
+                       parent_close_policy: close_policy
                      }
 
                    {:error, :unique_conflict} ->
@@ -382,6 +412,7 @@ defmodule Endurant.Workflow.Children do
            log: false
          ) do
       {:ok, handle} ->
+        emit_child(runtime, handle, :started, %{count: 1})
         handle
 
       {:error, :not_running} ->
@@ -398,7 +429,10 @@ defmodule Endurant.Workflow.Children do
     %Handle{
       child_key: child_key,
       child_execution_id: Map.get(state, :child_execution_id),
-      child_unique_id: Map.get(state, :child_unique_id)
+      child_unique_id: Map.get(state, :child_unique_id),
+      child_workflow_name: Map.get(state, :child_workflow_name),
+      child_version: Map.get(state, :child_version),
+      parent_close_policy: Map.get(state, :parent_close_policy)
     }
   end
 
@@ -407,7 +441,10 @@ defmodule Endurant.Workflow.Children do
     %Handle{
       handle
       | child_execution_id: Map.get(state, :child_execution_id, handle.child_execution_id),
-        child_unique_id: Map.get(state, :child_unique_id, handle.child_unique_id)
+        child_unique_id: Map.get(state, :child_unique_id, handle.child_unique_id),
+        child_workflow_name: Map.get(state, :child_workflow_name, handle.child_workflow_name),
+        child_version: Map.get(state, :child_version, handle.child_version),
+        parent_close_policy: Map.get(state, :parent_close_policy, handle.parent_close_policy)
     }
   end
 
@@ -507,6 +544,32 @@ defmodule Endurant.Workflow.Children do
       :heartbeat_lock_lost -> {:error, :cancelled}
       {:heartbeat_failed, reason} -> raise "heartbeat failed while waiting: #{inspect(reason)}"
     end
+  end
+
+  @spec emit_child(map(), Handle.t(), atom(), map(), map()) :: :ok
+  defp emit_child(runtime, %Handle{} = handle, event, measurements, extra_metadata \\ %{}) do
+    Telemetry.emit(
+      [:child, event],
+      measurements,
+      child_telemetry_metadata(runtime, handle, extra_metadata)
+    )
+  end
+
+  @spec child_telemetry_metadata(map(), Handle.t(), map()) :: map()
+  defp child_telemetry_metadata(runtime, %Handle{} = handle, extra_metadata) do
+    Map.merge(
+      %{
+        instance: Map.get(runtime, :instance),
+        node: node(),
+        queue: Map.get(runtime, :queue),
+        workflow: Map.get(runtime, :workflow),
+        version: Map.get(runtime, :version),
+        child_workflow: handle.child_workflow_name,
+        child_version: handle.child_version,
+        close_policy: handle.parent_close_policy
+      },
+      extra_metadata
+    )
   end
 
   @spec repo!(keyword()) :: module()

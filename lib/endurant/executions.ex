@@ -618,14 +618,17 @@ defmodule Endurant.Executions do
                1 ->
                  Events.append(execution_id, :execution_completed, %{result: result}, opts)
 
-                 maybe_record_child_terminal_event(
-                   to_app_id(execution_id),
-                   :child_execution_completed,
-                   %{result: result},
-                   opts
-                 )
+                 apply_parent_close_policies_in_tx(repo, prefix, to_app_id(execution_id), opts)
 
-                 terminal_execution_context(repo, prefix, execution_id)
+                 {
+                   terminal_execution_context(repo, prefix, execution_id),
+                   maybe_record_child_terminal_event(
+                     to_app_id(execution_id),
+                     :child_execution_completed,
+                     %{result: result},
+                     opts
+                   )
+                 }
 
                _ ->
                  repo.rollback(:not_running)
@@ -633,9 +636,7 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, execution_context} ->
-        handle_open_children_on_parent_close(to_app_id(execution_id), opts)
-
+      {:ok, {execution_context, child_metric}} ->
         Telemetry.emit(
           [:execution, :completed],
           execution_terminal_measurements(execution_context),
@@ -646,6 +647,8 @@ defmodule Endurant.Executions do
             execution_context.version
           )
         )
+
+        emit_child_metric(child_metric)
 
         :ok
 
@@ -715,14 +718,17 @@ defmodule Endurant.Executions do
                1 ->
                  Events.append(execution_id, :execution_failed, %{error: error}, opts)
 
-                 maybe_record_child_terminal_event(
-                   to_app_id(execution_id),
-                   :child_execution_failed,
-                   %{error: error},
-                   opts
-                 )
+                 apply_parent_close_policies_in_tx(repo, prefix, to_app_id(execution_id), opts)
 
-                 terminal_execution_context(repo, prefix, execution_id)
+                 {
+                   terminal_execution_context(repo, prefix, execution_id),
+                   maybe_record_child_terminal_event(
+                     to_app_id(execution_id),
+                     :child_execution_failed,
+                     %{error: error},
+                     opts
+                   )
+                 }
 
                _ ->
                  repo.rollback(:not_running)
@@ -730,9 +736,7 @@ defmodule Endurant.Executions do
            end,
            log: false
          ) do
-      {:ok, execution_context} ->
-        handle_open_children_on_parent_close(to_app_id(execution_id), opts)
-
+      {:ok, {execution_context, child_metric}} ->
         Telemetry.emit(
           [:execution, :failed],
           execution_terminal_measurements(execution_context),
@@ -744,6 +748,8 @@ defmodule Endurant.Executions do
             %{error_kind: Telemetry.error_kind(error)}
           )
         )
+
+        emit_child_metric(child_metric)
 
         :ok
 
@@ -864,6 +870,13 @@ defmodule Endurant.Executions do
                          end)
                        end)
 
+                       apply_parent_close_policies_in_tx(
+                         repo,
+                         prefix,
+                         to_app_id(execution_id),
+                         opts
+                       )
+
                        next_execution
 
                      {:error, reason} ->
@@ -881,8 +894,6 @@ defmodule Endurant.Executions do
            log: false
          ) do
       {:ok, next_execution} ->
-        handle_open_children_on_parent_close(to_app_id(execution_id), opts)
-
         Telemetry.emit(
           [:execution, :continued_as_new],
           %{count: 1},
@@ -2285,12 +2296,12 @@ defmodule Endurant.Executions do
                  {:already_cancelling, nil}
 
                %{status: :running} = execution ->
-                 mark_cancelling(execution_id, opts)
+                 mark_cancelling_in_tx(repo, prefix, execution_id, opts)
                  {:running, execution}
 
                %{status: status} = execution
                when status in [:pending, :waiting, :continuable, :abandoned] ->
-                 mark_cancelling(execution_id, opts)
+                 mark_cancelling_in_tx(repo, prefix, execution_id, opts)
                  {:finalize_now, execution}
 
                _ ->
@@ -2357,7 +2368,7 @@ defmodule Endurant.Executions do
                  nil
 
                %{status: :cancelling} ->
-                 finalize_cancel(execution_id, opts)
+                 finalize_cancel_in_tx(repo, prefix, execution_id, opts)
 
                _ ->
                  repo.rollback(:invalid_transition)
@@ -2368,9 +2379,7 @@ defmodule Endurant.Executions do
       {:ok, nil} ->
         :ok
 
-      {:ok, execution_context} ->
-        handle_open_children_on_parent_close(to_app_id(execution_id), opts)
-
+      {:ok, {execution_context, child_metric}} ->
         Telemetry.emit(
           [:execution, :cancelled],
           execution_cancelled_measurements(execution_context),
@@ -2382,6 +2391,8 @@ defmodule Endurant.Executions do
           )
         )
 
+        emit_child_metric(child_metric)
+
         :ok
 
       {:error, :invalid_transition} ->
@@ -2392,11 +2403,8 @@ defmodule Endurant.Executions do
     end
   end
 
-  @spec mark_cancelling(binary(), keyword()) :: :ok
-  defp mark_cancelling(execution_id, opts) do
-    repo = repo!(opts)
-    prefix = Keyword.get(opts, :prefix, @default_prefix)
-
+  @spec mark_cancelling_in_tx(module(), String.t(), binary(), keyword()) :: :ok
+  defp mark_cancelling_in_tx(repo, prefix, execution_id, opts) do
     sql = """
     UPDATE #{prefix}.endurant_executions
     SET
@@ -2420,11 +2428,8 @@ defmodule Endurant.Executions do
     :ok
   end
 
-  @spec finalize_cancel(binary(), keyword()) :: map() | :ok
-  defp finalize_cancel(execution_id, opts) do
-    repo = repo!(opts)
-    prefix = Keyword.get(opts, :prefix, @default_prefix)
-
+  @spec finalize_cancel_in_tx(module(), String.t(), binary(), keyword()) :: map() | :ok
+  defp finalize_cancel_in_tx(repo, prefix, execution_id, opts) do
     sql = """
     UPDATE #{prefix}.endurant_executions
     SET
@@ -2443,14 +2448,17 @@ defmodule Endurant.Executions do
       [[_id]] ->
         Events.append(execution_id, :execution_cancelled, %{}, opts)
 
-        maybe_record_child_terminal_event(
-          to_app_id(execution_id),
-          :child_execution_cancelled,
-          %{},
-          opts
-        )
+        apply_parent_close_policies_in_tx(repo, prefix, to_app_id(execution_id), opts)
 
-        terminal_execution_context(repo, prefix, execution_id)
+        {
+          terminal_execution_context(repo, prefix, execution_id),
+          maybe_record_child_terminal_event(
+            to_app_id(execution_id),
+            :child_execution_cancelled,
+            %{},
+            opts
+          )
+        }
 
       _ ->
         :ok
@@ -3104,6 +3112,68 @@ defmodule Endurant.Executions do
     Telemetry.datetime_diff_ms(inserted_at, NaiveDateTime.utc_now())
   end
 
+  @spec emit_child_metric(map() | nil) :: :ok
+  defp emit_child_metric(nil), do: :ok
+
+  defp emit_child_metric(%{event: event, measurements: measurements, metadata: metadata}) do
+    Telemetry.emit([:child, event], measurements, metadata)
+  end
+
+  @spec child_metric_context(module(), String.t(), map(), binary(), atom(), map(), keyword()) ::
+          map()
+  defp child_metric_context(
+         repo,
+         prefix,
+         child_context,
+         child_execution_id,
+         event_type,
+         payload,
+         opts
+       ) do
+    parent_context =
+      basic_execution_context(repo, prefix, to_db_id(child_context.parent_execution_id))
+
+    child_execution_context = basic_execution_context(repo, prefix, to_db_id(child_execution_id))
+
+    metadata =
+      execution_metadata(
+        opts,
+        parent_context.queue,
+        parent_context.workflow,
+        parent_context.version,
+        %{
+          child_workflow: child_execution_context.workflow,
+          child_version: child_execution_context.version,
+          close_policy: child_context.parent_close_policy
+        }
+      )
+
+    metadata =
+      case event_type do
+        :child_execution_failed ->
+          Map.put(metadata, :error_kind, Telemetry.error_kind(payload_value(payload, "error")))
+
+        _ ->
+          metadata
+      end
+
+    %{
+      event: child_metric_event_name(event_type),
+      measurements: %{count: 1},
+      metadata: metadata
+    }
+  end
+
+  @spec child_metric_event_name(atom()) :: :completed | :failed | :cancelled
+  defp child_metric_event_name(:child_execution_completed), do: :completed
+  defp child_metric_event_name(:child_execution_failed), do: :failed
+  defp child_metric_event_name(:child_execution_cancelled), do: :cancelled
+
+  @spec payload_value(map(), String.t()) :: term()
+  defp payload_value(payload, key) do
+    Map.get(payload, key) || Map.get(payload, String.to_atom(key))
+  end
+
   @spec parse_status(String.t()) :: atom()
   defp parse_status(status) do
     case status do
@@ -3510,17 +3580,28 @@ defmodule Endurant.Executions do
     match?(%{rows: [[1]]}, query!(repo, sql, [execution_id, child_key]))
   end
 
-  @spec maybe_record_child_terminal_event(binary(), atom(), map(), keyword()) :: :ok
+  @spec maybe_record_child_terminal_event(binary(), atom(), map(), keyword()) :: map() | nil
   defp maybe_record_child_terminal_event(child_execution_id, event_type, payload, opts) do
     repo = repo!(opts)
     prefix = Keyword.get(opts, :prefix, @default_prefix)
 
     case child_parent_context(child_execution_id, repo, prefix) do
       nil ->
-        :ok
+        nil
 
       child_context ->
-        if parent_execution_open?(child_context.parent_execution_id, repo, prefix) do
+        if lock_open_parent_execution(child_context.parent_execution_id, repo, prefix) do
+          child_metric =
+            child_metric_context(
+              repo,
+              prefix,
+              child_context,
+              child_execution_id,
+              event_type,
+              payload,
+              opts
+            )
+
           Events.append(
             child_context.parent_execution_id,
             event_type,
@@ -3541,36 +3622,45 @@ defmodule Endurant.Executions do
              ) do
             mark_continuable(child_context.parent_execution_id, opts)
           end
+
+          child_metric
         end
     end
-
-    :ok
   end
 
-  @spec handle_open_children_on_parent_close(binary(), keyword()) :: :ok
-  defp handle_open_children_on_parent_close(parent_execution_id, opts) do
-    children = list_open_child_executions(parent_execution_id, opts)
-
-    Enum.each(children, fn child ->
+  @spec apply_parent_close_policies_in_tx(module(), String.t(), binary(), keyword()) :: :ok
+  defp apply_parent_close_policies_in_tx(repo, prefix, parent_execution_id, opts) do
+    parent_execution_id
+    |> list_open_child_executions_in_tx(repo, prefix)
+    |> Enum.each(fn child ->
       if child.parent_close_policy == "request_cancel" do
-        _ = cancel(child.execution_id, opts)
+        _ = request_cancel_in_tx(repo, prefix, child.execution_id, opts)
       end
     end)
 
     :ok
   end
 
-  @spec parent_execution_open?(binary(), module(), String.t()) :: boolean()
-  defp parent_execution_open?(parent_execution_id, repo, prefix) do
+  @spec lock_open_parent_execution(binary(), module(), String.t()) :: boolean()
+  defp lock_open_parent_execution(parent_execution_id, repo, prefix) do
     sql = """
-    SELECT status::text
+    SELECT 1
     FROM #{prefix}.endurant_executions
     WHERE id = $1
+    AND status IN (
+      'pending'::#{prefix}.endurant_execution_status,
+      'running'::#{prefix}.endurant_execution_status,
+      'waiting'::#{prefix}.endurant_execution_status,
+      'continuable'::#{prefix}.endurant_execution_status,
+      'abandoned'::#{prefix}.endurant_execution_status,
+      'cancelling'::#{prefix}.endurant_execution_status
+    )
+    FOR UPDATE
     LIMIT 1
     """
 
     case query!(repo, sql, [to_db_id(parent_execution_id)]).rows do
-      [[status]] when status in @open_status_strings -> true
+      [[1]] -> true
       _ -> false
     end
   end
@@ -3613,14 +3703,12 @@ defmodule Endurant.Executions do
     end
   end
 
-  @spec list_open_child_executions(binary(), keyword()) :: [map()]
-  defp list_open_child_executions(parent_execution_id, opts) do
-    repo = repo!(opts)
-    prefix = Keyword.get(opts, :prefix, @default_prefix)
-
+  @spec list_open_child_executions_in_tx(binary(), module(), String.t()) :: [map()]
+  defp list_open_child_executions_in_tx(parent_execution_id, repo, prefix) do
     sql = """
     SELECT
       id,
+      status::text,
       metadata->'child_workflow'->>'parent_close_policy'
     FROM #{prefix}.endurant_executions
     WHERE metadata->'child_workflow'->>'parent_execution_id' = $1
@@ -3632,11 +3720,41 @@ defmodule Endurant.Executions do
       'abandoned'::#{prefix}.endurant_execution_status,
       'cancelling'::#{prefix}.endurant_execution_status
     )
+    FOR UPDATE
     """
 
     query!(repo, sql, [parent_execution_id]).rows
-    |> Enum.map(fn [id, parent_close_policy] ->
-      %{execution_id: to_app_id(id), parent_close_policy: parent_close_policy}
+    |> Enum.map(fn [id, status, parent_close_policy] ->
+      %{
+        execution_id: to_app_id(id),
+        status: parse_status(status),
+        parent_close_policy: parent_close_policy
+      }
     end)
+  end
+
+  @spec request_cancel_in_tx(module(), String.t(), binary(), keyword()) :: :ok
+  defp request_cancel_in_tx(repo, prefix, execution_id, opts) do
+    execution_id_db = to_db_id(execution_id)
+
+    case lock_execution(repo, prefix, execution_id_db) do
+      nil ->
+        :ok
+
+      execution when execution.status in [:completed, :failed, :cancelled] ->
+        _ = execution
+        :ok
+
+      %{status: :cancelling} ->
+        :ok
+
+      %{status: :running} ->
+        mark_cancelling_in_tx(repo, prefix, execution_id_db, opts)
+
+      %{status: status} when status in [:pending, :waiting, :continuable, :abandoned] ->
+        :ok = mark_cancelling_in_tx(repo, prefix, execution_id_db, opts)
+        _ = finalize_cancel_in_tx(repo, prefix, execution_id_db, opts)
+        :ok
+    end
   end
 end
