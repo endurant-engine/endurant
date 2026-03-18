@@ -586,6 +586,10 @@ defmodule Endurant.ArchiveWorker do
   defp parse_event_type("execution_abandoned"), do: :execution_abandoned
   defp parse_event_type("execution_resumed"), do: :execution_resumed
   defp parse_event_type("execution_waiting"), do: :execution_waiting
+  defp parse_event_type("child_execution_started"), do: :child_execution_started
+  defp parse_event_type("child_execution_completed"), do: :child_execution_completed
+  defp parse_event_type("child_execution_failed"), do: :child_execution_failed
+  defp parse_event_type("child_execution_cancelled"), do: :child_execution_cancelled
   defp parse_event_type("task_started"), do: :task_started
   defp parse_event_type("task_completed"), do: :task_completed
   defp parse_event_type("task_failed"), do: :task_failed

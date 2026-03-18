@@ -109,6 +109,7 @@ defmodule Endurant.Executor do
   defp run_workflow(workflow_module, execution, history, worker_id, opts) do
     task_results = task_results_from_history(history)
     {signal_queues, loaded_signal_seq} = signal_state_from_history(history)
+    {child_states, loaded_child_seq} = child_state_from_history(history)
 
     {history_length, history_size_bytes, next_event_sequence} =
       initial_history_counters(execution, history)
@@ -126,6 +127,8 @@ defmodule Endurant.Executor do
       waits: waits_from_history(history),
       signal_queues: signal_queues,
       loaded_signal_seq: loaded_signal_seq,
+      child_states: child_states,
+      loaded_child_seq: loaded_child_seq,
       first_execution_id: first_execution_id_from_history(execution, history),
       history_length: history_length,
       history_size_bytes: history_size_bytes,
@@ -643,6 +646,91 @@ defmodule Endurant.Executor do
     end)
   end
 
+  @spec child_state_from_history([Events.event()]) ::
+          {%{optional(String.t()) => map()}, non_neg_integer()}
+  defp child_state_from_history(events) do
+    Enum.reduce(events, {%{}, 0}, fn event, {states, max_seq} ->
+      seq =
+        case event do
+          %{sequence: value} when is_integer(value) and value > 0 -> value
+          _ -> max_seq
+        end
+
+      updated_max_seq = max(max_seq, seq)
+
+      case event do
+        %{type: :child_execution_started, payload: payload} ->
+          case payload_value(payload, "child_key") do
+            child_key when is_binary(child_key) ->
+              state = %{
+                status: :started,
+                child_execution_id: payload_value(payload, "child_execution_id"),
+                child_unique_id: payload_value(payload, "child_unique_id")
+              }
+
+              {Map.put(states, child_key, Map.merge(Map.get(states, child_key, %{}), state)),
+               updated_max_seq}
+
+            _ ->
+              {states, updated_max_seq}
+          end
+
+        %{type: :child_execution_completed, payload: payload} ->
+          case payload_value(payload, "child_key") do
+            child_key when is_binary(child_key) ->
+              state = %{
+                status: :completed,
+                result: payload_value(payload, "result"),
+                child_execution_id: payload_value(payload, "child_execution_id"),
+                child_unique_id: payload_value(payload, "child_unique_id")
+              }
+
+              {Map.put(states, child_key, Map.merge(Map.get(states, child_key, %{}), state)),
+               updated_max_seq}
+
+            _ ->
+              {states, updated_max_seq}
+          end
+
+        %{type: :child_execution_failed, payload: payload} ->
+          case payload_value(payload, "child_key") do
+            child_key when is_binary(child_key) ->
+              state = %{
+                status: :failed,
+                error: payload_value(payload, "error"),
+                child_execution_id: payload_value(payload, "child_execution_id"),
+                child_unique_id: payload_value(payload, "child_unique_id")
+              }
+
+              {Map.put(states, child_key, Map.merge(Map.get(states, child_key, %{}), state)),
+               updated_max_seq}
+
+            _ ->
+              {states, updated_max_seq}
+          end
+
+        %{type: :child_execution_cancelled, payload: payload} ->
+          case payload_value(payload, "child_key") do
+            child_key when is_binary(child_key) ->
+              state = %{
+                status: :cancelled,
+                child_execution_id: payload_value(payload, "child_execution_id"),
+                child_unique_id: payload_value(payload, "child_unique_id")
+              }
+
+              {Map.put(states, child_key, Map.merge(Map.get(states, child_key, %{}), state)),
+               updated_max_seq}
+
+            _ ->
+              {states, updated_max_seq}
+          end
+
+        _ ->
+          {states, updated_max_seq}
+      end
+    end)
+  end
+
   @spec task_failures_from_history([Events.event()]) :: %{
           optional(String.t()) => non_neg_integer()
         }
@@ -659,6 +747,11 @@ defmodule Endurant.Executor do
           acc
       end
     end)
+  end
+
+  @spec payload_value(map(), String.t()) :: term()
+  defp payload_value(payload, key) do
+    Map.get(payload, key) || Map.get(payload, String.to_atom(key))
   end
 
   @spec enqueue_signal_payload(map(), term(), term()) :: map()

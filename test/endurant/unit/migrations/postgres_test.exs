@@ -59,9 +59,10 @@ defmodule Endurant.Migrations.PostgresTest do
 
   test "down raises for version above current_version" do
     Process.put(:repo_result, {:ok, %{rows: [["1"]]}})
+    invalid_version = Postgres.current_version() + 1
 
-    assert_raise ArgumentError, ~r/invalid migration version 2/, fn ->
-      Postgres.down(version: 2, repo: FakeRepo)
+    assert_raise ArgumentError, ~r/invalid migration version #{invalid_version}/, fn ->
+      Postgres.down(version: invalid_version, repo: FakeRepo)
     end
   end
 end
