@@ -75,12 +75,9 @@ defmodule Endurant.Integration.RetryPolicyTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.RetryPolicyTest.ExhaustedWorkflow,
-               %{id: "re-1"}
+               %{id: "re-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :failed}} =
@@ -118,12 +115,9 @@ defmodule Endurant.Integration.RetryPolicyTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.RetryPolicyTest.RetryableFalseWorkflow,
-               %{id: "rf-1"}
+               %{id: "rf-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :failed}} =
@@ -162,12 +156,9 @@ defmodule Endurant.Integration.RetryPolicyTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.RetryPolicyTest.ExponentialWorkflow,
-               %{id: "rx-1"}
+               %{id: "rx-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :completed}} =

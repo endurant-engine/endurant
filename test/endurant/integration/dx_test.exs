@@ -53,12 +53,9 @@ defmodule Endurant.Integration.DXTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.DXTest.OrderWorkflow,
-               %{order_id: "o-123", user_id: "u-7", items: ["book", "pen"]}
+               %{order_id: "o-123", user_id: "u-7", items: ["book", "pen"]},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert execution.workflow_module == "Endurant.Integration.DXTest.OrderWorkflow"

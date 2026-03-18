@@ -120,7 +120,7 @@ defmodule Endurant.TestSupport.PostgresHelper do
   @spec do_wait(binary(), integer(), non_neg_integer(), non_neg_integer(), keyword()) ::
           {:ok, %{status: :completed | :failed, result: term()}} | no_return()
   defp do_wait(execution_id, deadline, poll_ms, timeout_ms, opts) do
-    case Endurant.execution(instance_from_opts!(opts), execution_id) do
+    case Endurant.execution(execution_id, instance: instance_from_opts!(opts)) do
       %{status: :completed} ->
         case replay(execution_id, opts) do
           {:ok, result} ->
@@ -152,14 +152,14 @@ defmodule Endurant.TestSupport.PostgresHelper do
 
   @spec history(binary(), keyword()) :: {:ok, [Endurant.Events.event()]}
   def history(execution_id, opts \\ []) do
-    {:ok, Endurant.events(instance_from_opts!(opts), execution_id)}
+    {:ok, Endurant.events(execution_id, instance: instance_from_opts!(opts))}
   end
 
   @spec replay(binary(), keyword()) :: {:ok, term()} | {:error, :not_completed}
   def replay(execution_id, opts \\ []) do
     completion_event =
       execution_id
-      |> then(&Endurant.events(instance_from_opts!(opts), &1))
+      |> then(&Endurant.events(&1, instance: instance_from_opts!(opts)))
       |> Enum.reverse()
       |> Enum.find(&(&1.type == :execution_completed))
 
@@ -176,7 +176,7 @@ defmodule Endurant.TestSupport.PostgresHelper do
   defp failure_result(execution_id, opts) do
     failure =
       execution_id
-      |> then(&Endurant.events(instance_from_opts!(opts), &1))
+      |> then(&Endurant.events(&1, instance: instance_from_opts!(opts)))
       |> Enum.reverse()
       |> Enum.find(&(&1.type == :execution_failed))
 

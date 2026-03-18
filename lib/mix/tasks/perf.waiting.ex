@@ -352,7 +352,7 @@ WHERE status = 'waiting'::#{prefix}.endurant_execution_status
     ids = waiting_ids(sample_size, runtime_opts)
 
     Enum.map(ids, fn id ->
-      :ok = Endurant.signal(Keyword.fetch!(runtime_opts, :instance), id, "go", %{bench: true})
+      :ok = Endurant.signal(id, "go", %{bench: true}, instance: Keyword.fetch!(runtime_opts, :instance))
       {signal_seq, signal_at} = last_signal_event!(id, runtime_opts)
       latency = wait_resume_started_latency!(id, signal_seq, signal_at, runtime_opts, 30000)
       latency

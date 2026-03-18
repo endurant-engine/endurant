@@ -41,16 +41,16 @@ defmodule Endurant.Integration.CronTest do
 
     assert {:ok, cron} =
              Endurant.cron(
-               engine_name,
                FastCronWorkflow,
                %{"id" => "loop"},
                "*/1 * * * * *",
+               instance: engine_name,
                start_at: start_at,
                end_at: end_at
              )
 
     assert wait_until(fn ->
-             Endurant.cron_fires(engine_name, cron.id, limit: 10)
+             Endurant.cron_fires(cron.id, limit: 10, instance: engine_name)
              |> Enum.any?(&(&1.status == :dispatched))
            end)
 
@@ -66,7 +66,7 @@ defmodule Endurant.Integration.CronTest do
 
     # Past end_at, schedule remains active but no fires should exist beyond end_at.
     Process.sleep(1_500)
-    fires = Endurant.cron_fires(engine_name, cron.id, limit: 20)
+    fires = Endurant.cron_fires(cron.id, limit: 20, instance: engine_name)
     assert fires != []
     assert Enum.all?(fires, &(DateTime.compare(&1.scheduled_for, end_at) != :gt))
   end
@@ -75,7 +75,7 @@ defmodule Endurant.Integration.CronTest do
     engine_name: engine_name
   } do
     assert {:ok, running} =
-             Endurant.insert(engine_name, BlockingCronWorkflow, %{"id" => "skip"})
+             Endurant.insert(BlockingCronWorkflow, %{"id" => "skip"}, instance: engine_name)
 
     assert wait_for_execution_status(engine_name, running.id, [:running, :waiting])
 
@@ -84,16 +84,16 @@ defmodule Endurant.Integration.CronTest do
 
     assert {:ok, cron} =
              Endurant.cron(
-               engine_name,
                FastCronWorkflow,
                %{"id" => "skip"},
                "*/1 * * * * *",
+               instance: engine_name,
                start_at: start_at,
                end_at: end_at
              )
 
     assert wait_until(fn ->
-             Endurant.cron_fires(engine_name, cron.id, limit: 10)
+             Endurant.cron_fires(cron.id, limit: 10, instance: engine_name)
              |> Enum.any?(&(&1.status == :skipped))
            end)
   end
@@ -106,18 +106,18 @@ defmodule Endurant.Integration.CronTest do
 
     assert {:ok, cron} =
              Endurant.cron(
-               engine_name,
                FastCronWorkflow,
                %{"id" => "control"},
                "*/1 * * * * *",
+               instance: engine_name,
                start_at: start_at,
                end_at: DateTime.add(start_at, 60, :second)
              )
 
-    listed = Endurant.crons(engine_name, status: :active)
+    listed = Endurant.crons(status: :active, instance: engine_name)
     assert Enum.any?(listed, &(&1.id == cron.id))
 
-    assert :ok = Endurant.pause_cron(engine_name, cron.id)
+    assert :ok = Endurant.pause_cron(cron.id, instance: engine_name)
 
     assert wait_until(fn ->
              case Crons.get(cron.id, runtime_opts) do
@@ -126,7 +126,7 @@ defmodule Endurant.Integration.CronTest do
              end
            end)
 
-    assert :ok = Endurant.resume_cron(engine_name, cron.id)
+    assert :ok = Endurant.resume_cron(cron.id, instance: engine_name)
 
     assert wait_until(fn ->
              case Crons.get(cron.id, runtime_opts) do
@@ -135,7 +135,7 @@ defmodule Endurant.Integration.CronTest do
              end
            end)
 
-    assert :ok = Endurant.delete_cron(engine_name, cron.id)
+    assert :ok = Endurant.delete_cron(cron.id, instance: engine_name)
 
     assert wait_until(fn ->
              case Crons.get(cron.id, runtime_opts) do
@@ -189,7 +189,7 @@ defmodule Endurant.Integration.CronTest do
     Process.unlink(pid1)
 
     config_cron =
-      Endurant.crons(sync_engine)
+      Endurant.crons(instance: sync_engine)
       |> Enum.find(&(&1.name == "cfg-sync"))
 
     assert config_cron != nil
@@ -198,15 +198,15 @@ defmodule Endurant.Integration.CronTest do
 
     assert {:ok, manual} =
              Endurant.cron(
-               sync_engine,
                FastCronWorkflow,
                %{"id" => "manual-sync"},
                "*/15 * * * * *",
+               instance: sync_engine,
                start_at: start_at,
                end_at: end_at
              )
 
-    assert :ok = Endurant.pause_cron(sync_engine, config_cron.id)
+    assert :ok = Endurant.pause_cron(config_cron.id, instance: sync_engine)
 
     assert wait_until(fn ->
              case Crons.get(config_cron.id, runtime_opts) do
@@ -269,7 +269,7 @@ defmodule Endurant.Integration.CronTest do
   defp wait_for_execution_status(instance, execution_id, statuses, timeout_ms \\ 2_000) do
     wait_until(
       fn ->
-        case Endurant.execution(instance, execution_id) do
+        case Endurant.execution(execution_id, instance: instance) do
           %{status: status} -> status in statuses
           _ -> false
         end

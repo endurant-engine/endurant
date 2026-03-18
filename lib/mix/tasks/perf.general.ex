@@ -121,7 +121,7 @@ defmodule Mix.Tasks.Perf.General do
   @spec insert_all!(module(), pos_integer(), keyword()) :: :ok
   defp insert_all!(workflow_module, count, runtime_opts) do
     Enum.each(1..count, fn id ->
-      case Endurant.insert(Keyword.fetch!(runtime_opts, :instance), workflow_module, %{id: id}) do
+      case Endurant.insert(workflow_module, %{id: id}, instance: Keyword.fetch!(runtime_opts, :instance)) do
         {:ok, _execution} -> :ok
         {:error, reason} -> Mix.raise("insert failed for id=#{id}: #{inspect(reason)}")
       end

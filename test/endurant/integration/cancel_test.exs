@@ -25,16 +25,13 @@ defmodule Endurant.Integration.CancelTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.CancelTest.PendingBlockedWorkflow,
-               %{id: "p1"}
+               %{id: "p1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :pending = wait_for_status(execution.id, :pending, 2000, runtime_opts)
-    assert :ok = Endurant.cancel(Keyword.fetch!(runtime_opts, :instance), execution.id)
+    assert :ok = Endurant.cancel(execution.id, instance: Keyword.fetch!(runtime_opts, :instance))
     assert :cancelled = wait_for_status(execution.id, :cancelled, 3000, runtime_opts)
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.any?(events, &(&1.type == :cancel_requested))
@@ -67,26 +64,23 @@ defmodule Endurant.Integration.CancelTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.CancelTest.WaitingWorkflow,
-               %{id: "w1"}
+               %{id: "w1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :execution_waiting =
              wait_for_event(execution.id, :execution_waiting, 8000, runtime_opts)
 
     assert :waiting = wait_for_status(execution.id, :waiting, 3000, runtime_opts)
-    assert :ok = Endurant.cancel(Keyword.fetch!(runtime_opts, :instance), execution.id)
+    assert :ok = Endurant.cancel(execution.id, instance: Keyword.fetch!(runtime_opts, :instance))
     assert :cancelled = wait_for_status(execution.id, :cancelled, 3000, runtime_opts)
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.any?(events, &(&1.type == :cancel_requested))
     assert Enum.any?(events, &(&1.type == :execution_cancelled))
 
     assert {:error, :not_active} =
-             Endurant.signal(Keyword.fetch!(runtime_opts, :instance), execution.id, "go_w1", %{})
+             Endurant.signal(execution.id, "go_w1", %{}, instance: Keyword.fetch!(runtime_opts, :instance))
   end
 
   test("cancel running execution transitions through cancelling and ends cancelled", %{
@@ -116,12 +110,9 @@ defmodule Endurant.Integration.CancelTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.CancelTest.RunningWorkflow,
-               %{id: "r1"}
+               %{id: "r1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     worker_id = "test-worker:cancel-running"
@@ -140,7 +131,7 @@ defmodule Endurant.Integration.CancelTest do
              wait_for_event(execution.id, :execution_started, 5000, runtime_opts)
 
     assert :running = wait_for_status(execution.id, :running, 2000, runtime_opts)
-    assert :ok = Endurant.cancel(Keyword.fetch!(runtime_opts, :instance), execution.id)
+    assert :ok = Endurant.cancel(execution.id, instance: Keyword.fetch!(runtime_opts, :instance))
     assert :cancel_requested = wait_for_event(execution.id, :cancel_requested, 2000, runtime_opts)
     assert :cancelled = wait_for_status(execution.id, :cancelled, 5000, runtime_opts)
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
@@ -157,7 +148,7 @@ defmodule Endurant.Integration.CancelTest do
 
   @spec do_wait_for_status(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_status(execution_id, expected_status, deadline, runtime_opts) do
-    case Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution_id) do
+    case Endurant.execution(execution_id, instance: Keyword.fetch!(runtime_opts, :instance)) do
       %{status: ^expected_status} ->
         expected_status
 
@@ -179,7 +170,7 @@ defmodule Endurant.Integration.CancelTest do
 
   @spec do_wait_for_event(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_event(execution_id, expected_type, deadline, runtime_opts) do
-    events = Endurant.events(Keyword.fetch!(runtime_opts, :instance), execution_id)
+    events = Endurant.events(execution_id, instance: Keyword.fetch!(runtime_opts, :instance))
 
     if Enum.any?(events, &(&1.type == expected_type)) do
       expected_type

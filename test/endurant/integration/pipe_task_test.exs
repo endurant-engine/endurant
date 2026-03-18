@@ -28,12 +28,9 @@ defmodule Endurant.Integration.PipeTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.PipeTaskTest.PipeWorkflow,
-               %{user_id: "u-9"}
+               %{user_id: "u-9"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :completed, result: result}} =

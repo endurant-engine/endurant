@@ -49,22 +49,23 @@ defmodule Endurant.Integration.ExecutionsListTest do
       })
 
     rows =
-      Endurant.executions(engine_name,
+      Endurant.executions(
         status: [:pending, :waiting],
         queue: "manual_orders",
         workflow: "List.WorkflowA",
         order: :asc,
-        limit: 10
+        limit: 10,
+        instance: engine_name
       )
 
     assert Enum.map(rows, & &1.id) == [id_a, id_b]
     assert Enum.map(rows, & &1.status) == [:pending, :waiting]
 
     assert [%{id: ^id_c, unique_id: "list-c"}] =
-             Endurant.executions(engine_name, unique_id: "list-c", limit: 5)
+             Endurant.executions(unique_id: "list-c", limit: 5, instance: engine_name)
 
     id_rows =
-      Endurant.executions(engine_name, execution_ids: [id_d, id_a], order: :asc, limit: 10)
+      Endurant.executions(execution_ids: [id_d, id_a], order: :asc, limit: 10, instance: engine_name)
 
     assert Enum.map(id_rows, & &1.id) == [id_a, id_d]
   end
@@ -116,18 +117,19 @@ defmodule Endurant.Integration.ExecutionsListTest do
         completed_at: NaiveDateTime.add(base, 4, :second)
       })
 
-    open_rows = Endurant.executions(engine_name, open: true, order: :asc, limit: 10)
+    open_rows = Endurant.executions(open: true, order: :asc, limit: 10, instance: engine_name)
     assert Enum.map(open_rows, & &1.id) == [id_open_a, id_open_b]
 
-    terminal_rows = Endurant.executions(engine_name, terminal: true, order: :asc, limit: 10)
+    terminal_rows = Endurant.executions(terminal: true, order: :asc, limit: 10, instance: engine_name)
     assert Enum.map(terminal_rows, & &1.id) == [id_terminal_a, id_terminal_b]
 
     ranged_rows =
-      Endurant.executions(engine_name,
+      Endurant.executions(
         inserted_after: NaiveDateTime.add(base, 2, :second),
         inserted_before: NaiveDateTime.add(base, 4, :second),
         order: :asc,
-        limit: 10
+        limit: 10,
+        instance: engine_name
       )
 
     assert Enum.map(ranged_rows, & &1.id) == [id_open_b, id_terminal_a]
@@ -153,21 +155,22 @@ defmodule Endurant.Integration.ExecutionsListTest do
         })
       end)
 
-    all_rows = Endurant.executions(engine_name, queue: "manual_cursor", order: :desc, limit: 10)
+    all_rows = Endurant.executions(queue: "manual_cursor", order: :desc, limit: 10, instance: engine_name)
     all_ids = Enum.map(all_rows, & &1.id)
 
-    page_one = Endurant.executions(engine_name, queue: "manual_cursor", order: :desc, limit: 2)
+    page_one = Endurant.executions(queue: "manual_cursor", order: :desc, limit: 2, instance: engine_name)
     page_one_ids = Enum.map(page_one, & &1.id)
     assert page_one_ids == Enum.take(all_ids, 2)
 
     cursor_row = List.last(page_one)
 
     page_two =
-      Endurant.executions(engine_name,
+      Endurant.executions(
         queue: "manual_cursor",
         order: :desc,
         limit: 2,
-        cursor: %{inserted_at: cursor_row.inserted_at, id: cursor_row.id}
+        cursor: %{inserted_at: cursor_row.inserted_at, id: cursor_row.id},
+        instance: engine_name
       )
 
     page_two_ids = Enum.map(page_two, & &1.id)

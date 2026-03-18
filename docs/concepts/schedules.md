@@ -4,7 +4,7 @@ One-time schedules are for "run this workflow at X".
 
 ## Create a Schedule
 
-Use `Endurant.schedule/3`, `Endurant.schedule/4`, or `Endurant.schedule/5`.
+Use `Endurant.schedule/3` or `Endurant.schedule/4`.
 
 ```elixir
 scheduled_at = DateTime.add(DateTime.utc_now(), 300, :second)
@@ -22,10 +22,10 @@ To target a named instance:
 ```elixir
 {:ok, scheduled} =
   Endurant.schedule(
-    :my_endurant,
     MyApp.Workflows.OrderReminderWorkflow,
     %{"order_id" => "o-123"},
-    scheduled_at
+    scheduled_at,
+    instance: :my_endurant
   )
 ```
 
@@ -35,13 +35,13 @@ Options:
 
 ## List Scheduled Rows
 
-Use `Endurant.scheduled/0`, `Endurant.scheduled/1`, `Endurant.scheduled/2`.
+Use `Endurant.scheduled/0` or `Endurant.scheduled/1`.
 
 ```elixir
 all = Endurant.scheduled()
 pending = Endurant.scheduled(status: :pending, limit: 50)
 cron_rows = Endurant.scheduled(cron_schedule_id: "c3e0-...")
-instance_rows = Endurant.scheduled(:my_endurant, status: :dispatched)
+instance_rows = Endurant.scheduled(status: :dispatched, instance: :my_endurant)
 ```
 
 Filters:

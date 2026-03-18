@@ -36,9 +36,7 @@ end
 {:ok, execution} =
   Endurant.insert(
     MyApp.Workflows.OrderApprovalWorkflow,
-    %{"order_id" => "o-123"},
-    repo: MyApp.Repo,
-    prefix: "public"
+    %{"order_id" => "o-123"}
   )
 ```
 
@@ -49,7 +47,7 @@ end
   Endurant.signal(
     execution.id,
     "approval_requested",
-    %{"approved" => true},
+    %{"approved" => true}
   )
 ```
 

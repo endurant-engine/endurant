@@ -27,34 +27,28 @@ defmodule Endurant.Integration.QueueManagerTest do
 
     assert {:ok, a} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.QueueManagerTest.WaitingLimitWorkflow,
-               %{id: "a"}
+               %{id: "a"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :waiting = wait_for_status(a.id, :waiting, 2000, runtime_opts)
 
     assert {:ok, b} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.QueueManagerTest.WaitingLimitWorkflow,
-               %{id: "b"}
+               %{id: "b"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :waiting = wait_for_status(b.id, :waiting, 2000, runtime_opts)
-    assert :ok = Endurant.signal(Keyword.fetch!(runtime_opts, :instance), a.id, "go_a", %{})
+    assert :ok = Endurant.signal(a.id, "go_a", %{}, instance: Keyword.fetch!(runtime_opts, :instance))
 
     assert {:ok, %{status: :completed}} =
              PostgresHelper.wait_for_execution!(a.id, 5000, runtime_opts)
 
     assert :waiting = wait_for_status(b.id, :waiting, 2000, runtime_opts)
-    assert :ok = Endurant.signal(Keyword.fetch!(runtime_opts, :instance), b.id, "go_b", %{})
+    assert :ok = Endurant.signal(b.id, "go_b", %{}, instance: Keyword.fetch!(runtime_opts, :instance))
 
     assert {:ok, %{status: :completed}} =
              PostgresHelper.wait_for_execution!(b.id, 5000, runtime_opts)
@@ -103,35 +97,29 @@ defmodule Endurant.Integration.QueueManagerTest do
 
     assert {:ok, waiting_execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.QueueManagerTest.ResumePriorityWaitingWorkflow,
-               %{id: "w1"}
+               %{id: "w1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :waiting = wait_for_status(waiting_execution.id, :waiting, 2000, runtime_opts)
 
     assert {:ok, pending_execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.QueueManagerTest.ResumePriorityPendingWorkflow,
-               %{id: "p1"}
+               %{id: "p1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert %{status: :pending} =
-             Endurant.execution(Keyword.fetch!(runtime_opts, :instance), pending_execution.id)
+             Endurant.execution(pending_execution.id, instance: Keyword.fetch!(runtime_opts, :instance))
 
     assert :ok =
              Endurant.signal(
-               Keyword.fetch!(runtime_opts, :instance),
                waiting_execution.id,
                "go_w1",
-               %{}
+               %{},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :completed}} =
@@ -172,12 +160,9 @@ defmodule Endurant.Integration.QueueManagerTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.QueueManagerTest.RecoveryWorkflow,
-               %{id: "r1"}
+               %{id: "r1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :running = wait_for_status(execution.id, :running, 2000, runtime_opts)
@@ -220,12 +205,9 @@ defmodule Endurant.Integration.QueueManagerTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.QueueManagerTest.WaitingRecoveryWorkflow,
-               %{id: "wr1"}
+               %{id: "wr1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
@@ -236,10 +218,10 @@ defmodule Endurant.Integration.QueueManagerTest do
     Process.sleep(150)
 
     assert %{status: :waiting} =
-             Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution.id)
+             Endurant.execution(execution.id, instance: Keyword.fetch!(runtime_opts, :instance))
 
     assert :ok =
-             Endurant.signal(Keyword.fetch!(runtime_opts, :instance), execution.id, "go_wr1", %{})
+             Endurant.signal(execution.id, "go_wr1", %{}, instance: Keyword.fetch!(runtime_opts, :instance))
 
     assert {:ok, %{status: :completed, result: %{id: "wr1", ok: true}}} =
              PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
@@ -257,7 +239,7 @@ defmodule Endurant.Integration.QueueManagerTest do
 
   @spec do_wait_for_status(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_status(execution_id, expected_status, deadline, runtime_opts) do
-    case Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution_id) do
+    case Endurant.execution(execution_id, instance: Keyword.fetch!(runtime_opts, :instance)) do
       %{status: ^expected_status} ->
         expected_status
 

@@ -457,7 +457,7 @@ AND waiting_until IS NULL
     sample_size
     |> waiting_ids_for_cancel(runtime_opts)
     |> Enum.reduce(0, fn id, acc ->
-      case Endurant.cancel(Keyword.fetch!(runtime_opts, :instance), id) do
+      case Endurant.cancel(id, instance: Keyword.fetch!(runtime_opts, :instance)) do
         :ok -> acc + 1
         _ -> acc
       end
@@ -506,7 +506,7 @@ LIMIT $1
     ids = waiting_ids(sample_size, runtime_opts)
 
     Enum.each(ids, fn id ->
-      :ok = Endurant.signal(Keyword.fetch!(runtime_opts, :instance), id, "go", %{bench: true})
+      :ok = Endurant.signal(id, "go", %{bench: true}, instance: Keyword.fetch!(runtime_opts, :instance))
     end)
 
     signal_events = last_signal_events!(ids, runtime_opts)
