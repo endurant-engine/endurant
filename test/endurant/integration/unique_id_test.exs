@@ -28,24 +28,18 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:ok, first} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.UniqueIdTest.OpenConflictWorkflow,
-               %{id: "u-1"}
+               %{id: "u-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :running = wait_for_status(first.id, :running, 5000, runtime_opts)
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.UniqueIdTest.OpenConflictWorkflow,
-               %{id: "u-1"}
+               %{id: "u-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
   end
 
@@ -73,12 +67,9 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:ok, first} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.UniqueIdTest.ReinsertAfterTerminalWorkflow,
-               %{id: "u-2"}
+               %{id: "u-2"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :completed, result: %{id: "u-2", ok: true}}} =
@@ -86,12 +77,9 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:ok, second} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.UniqueIdTest.ReinsertAfterTerminalWorkflow,
-               %{id: "u-2"}
+               %{id: "u-2"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert is_binary(second.id)
@@ -123,24 +111,18 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:ok, first} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.UniqueIdTest.WaitingConflictWorkflow,
-               %{id: "u-3"}
+               %{id: "u-3"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :waiting = wait_for_status(first.id, :waiting, 5000, runtime_opts)
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.UniqueIdTest.WaitingConflictWorkflow,
-               %{id: "u-3"}
+               %{id: "u-3"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
   end
 
@@ -169,12 +151,9 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:ok, first} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.UniqueIdTest.ContinuableConflictWorkflow,
-               %{id: "u-4"}
+               %{id: "u-4"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :waiting = wait_for_status(first.id, :waiting, 5000, runtime_opts)
@@ -183,12 +162,9 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.UniqueIdTest.ContinuableConflictWorkflow,
-               %{id: "u-4"}
+               %{id: "u-4"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
   end
 
@@ -219,12 +195,9 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:ok, first} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.UniqueIdTest.CancellingConflictWorkflow,
-               %{id: "u-5"}
+               %{id: "u-5"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :running = wait_for_status(first.id, :running, 5000, runtime_opts)
@@ -233,12 +206,9 @@ defmodule Endurant.Integration.UniqueIdTest do
 
     assert {:error, :unique_conflict} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.UniqueIdTest.CancellingConflictWorkflow,
-               %{id: "u-5"}
+               %{id: "u-5"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
   end
 
@@ -250,7 +220,7 @@ defmodule Endurant.Integration.UniqueIdTest do
 
   @spec do_wait_for_status(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_status(execution_id, expected_status, deadline, runtime_opts) do
-    case Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution_id) do
+    case Endurant.execution(execution_id, instance: Keyword.fetch!(runtime_opts, :instance)) do
       %{status: ^expected_status} ->
         expected_status
 

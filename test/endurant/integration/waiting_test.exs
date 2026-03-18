@@ -24,12 +24,9 @@ defmodule Endurant.Integration.WaitingTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.WaitingTest.DelayWorkflow,
-               %{id: "d-1"}
+               %{id: "d-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :completed, result: %{id: "d-1", done: true}}} =
@@ -62,25 +59,19 @@ defmodule Endurant.Integration.WaitingTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.WaitingTest.SignalWorkflow,
-               %{id: "s-1"}
+               %{id: "s-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
 
     assert :ok =
              Endurant.signal(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                execution.id,
                "approval_requested",
-               %{approved: true}
+               %{approved: true},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :completed, result: result}} =
@@ -116,34 +107,25 @@ defmodule Endurant.Integration.WaitingTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.WaitingTest.SignalQueueWorkflow,
-               %{id: "sq-1"}
+               %{id: "sq-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :ok =
              Endurant.signal(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                execution.id,
                "approval_requested",
-               %{n: 1}
+               %{n: 1},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :ok =
              Endurant.signal(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                execution.id,
                "approval_requested",
-               %{n: 2}
+               %{n: 2},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :completed, result: result}} =
@@ -160,7 +142,7 @@ defmodule Endurant.Integration.WaitingTest do
 
   @spec do_wait_for_status(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_status(execution_id, expected_status, deadline, runtime_opts) do
-    case Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution_id) do
+    case Endurant.execution(execution_id, instance: Keyword.fetch!(runtime_opts, :instance)) do
       %{status: ^expected_status} ->
         expected_status
 

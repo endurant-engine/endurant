@@ -50,15 +50,15 @@ defmodule Endurant.Integration.ContinueAsNewTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               instance,
                Endurant.Integration.ContinueAsNewTest.Workflow,
-               %{id: "c1"}
+               %{id: "c1"},
+               instance: instance
              )
 
     assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
 
-    assert :ok = Endurant.signal(instance, execution.id, "carry", %{value: "kept"})
-    assert :ok = Endurant.signal(instance, execution.id, "first", %{value: "go"})
+    assert :ok = Endurant.signal(execution.id, "carry", %{value: "kept"}, instance: instance)
+    assert :ok = Endurant.signal(execution.id, "first", %{value: "go"}, instance: instance)
 
     assert :continued_as_new =
              wait_for_status(execution.id, :continued_as_new, 5_000, runtime_opts)
@@ -77,12 +77,12 @@ defmodule Endurant.Integration.ContinueAsNewTest do
 
     assert :waiting = wait_for_status(new_execution_id, :waiting, 5_000, runtime_opts)
 
-    assert :ok = Endurant.signal(instance, "continue-as-new:c1", "final", %{value: "done"})
+    assert :ok = Endurant.signal("continue-as-new:c1", "final", %{value: "done"}, instance: instance)
 
     assert {:ok, %{status: :completed, result: result}} =
              PostgresHelper.wait_for_execution!(new_execution_id, 8_000, runtime_opts)
 
-    assert %{version: "2"} = Endurant.execution(instance, new_execution_id)
+    assert %{version: "2"} = Endurant.execution(new_execution_id, instance: instance)
 
     assert result == %{
              id: "c1",
@@ -149,15 +149,15 @@ defmodule Endurant.Integration.ContinueAsNewTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               instance,
                Endurant.Integration.ContinueAsNewTest.NoSignalRolloverWorkflow,
-               %{id: "c2"}
+               %{id: "c2"},
+               instance: instance
              )
 
     assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
 
-    assert :ok = Endurant.signal(instance, execution.id, "carry", %{value: "old"})
-    assert :ok = Endurant.signal(instance, execution.id, "first", %{value: "go"})
+    assert :ok = Endurant.signal(execution.id, "carry", %{value: "old"}, instance: instance)
+    assert :ok = Endurant.signal(execution.id, "first", %{value: "go"}, instance: instance)
 
     assert :continued_as_new =
              wait_for_status(execution.id, :continued_as_new, 5_000, runtime_opts)
@@ -180,7 +180,13 @@ defmodule Endurant.Integration.ContinueAsNewTest do
              event.type == :signal_received and payload_value(event.payload, "signal") == "carry"
            end)
 
-    assert :ok = Endurant.signal(instance, "continue-as-new:no-rollover:c2", "final", %{value: "done"})
+    assert :ok =
+             Endurant.signal(
+               "continue-as-new:no-rollover:c2",
+               "final",
+               %{value: "done"},
+               instance: instance
+             )
 
     assert {:ok, %{status: :completed, result: result}} =
              PostgresHelper.wait_for_execution!(new_execution_id, 8_000, runtime_opts)
@@ -200,7 +206,7 @@ defmodule Endurant.Integration.ContinueAsNewTest do
 
   @spec do_wait_for_status(term(), binary(), atom(), integer()) :: atom()
   defp do_wait_for_status(instance, execution_id, status, deadline) do
-    case Endurant.execution(instance, execution_id) do
+    case Endurant.execution(execution_id, instance: instance) do
       %{status: ^status} ->
         status
 

@@ -80,6 +80,43 @@ defmodule Endurant.Executions do
   def insert(workflow_module, input, opts \\ [])
       when is_atom(workflow_module) and is_map(input) do
     repo = repo!(opts)
+    workflow = workflow_module.__workflow__()
+    queue = resolve_queue(workflow)
+    workflow_name = inspect(workflow_module)
+    version = Map.get(workflow, :version, "1")
+
+    case repo.transaction(
+           fn -> insert_in_tx(workflow_module, input, opts) end,
+           log: false
+         ) do
+      {:ok, {:ok, _execution} = result} ->
+        Telemetry.emit(
+          [:execution, :inserted],
+          %{count: 1},
+          execution_metadata(opts, queue, workflow_name, version)
+        )
+
+        result
+
+      {:ok, {:error, :unique_conflict} = result} ->
+        Telemetry.emit(
+          [:execution, :insert_conflict],
+          %{count: 1},
+          execution_metadata(opts, queue, workflow_name, version)
+        )
+
+        result
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc false
+  @spec insert_in_tx(module(), map(), keyword()) :: {:ok, map()} | {:error, :unique_conflict}
+  def insert_in_tx(workflow_module, input, opts \\ [])
+      when is_atom(workflow_module) and is_map(input) do
+    repo = repo!(opts)
     prefix = Keyword.get(opts, :prefix, @default_prefix)
     workflow = workflow_module.__workflow__()
     execution_id = Ecto.UUID.generate()
@@ -107,60 +144,34 @@ defmodule Endurant.Executions do
     RETURNING id
     """
 
-    case repo.transaction(
-           fn ->
-             case query!(repo, sql, [
-                    execution_db_id,
-                    unique_id,
-                    queue,
-                    workflow_name,
-                    version,
-                    input
-                  ]).rows do
-               [[_]] ->
-                 :ok =
-                   Events.append(
-                     execution_id,
-                     :execution_created,
-                     %{workflow: workflow_name, unique_id: unique_id, version: version},
-                     opts
-                   )
+    case query!(repo, sql, [
+           execution_db_id,
+           unique_id,
+           queue,
+           workflow_name,
+           version,
+           input
+         ]).rows do
+      [[_]] ->
+        :ok =
+          Events.append_in_tx(
+            execution_id,
+            :execution_created,
+            %{workflow: workflow_name, unique_id: unique_id, version: version},
+            opts
+          )
 
-                 {:ok,
-                  %{
-                    id: execution_id,
-                    workflow_module: workflow_name,
-                    unique_id: unique_id,
-                    version: version,
-                    status: :pending
-                  }}
+        {:ok,
+         %{
+           id: execution_id,
+           workflow_module: workflow_name,
+           unique_id: unique_id,
+           version: version,
+           status: :pending
+         }}
 
-               _ ->
-                 {:error, :unique_conflict}
-             end
-           end,
-           log: false
-         ) do
-      {:ok, {:ok, _execution} = result} ->
-        Telemetry.emit(
-          [:execution, :inserted],
-          %{count: 1},
-          execution_metadata(opts, queue, workflow_name, version)
-        )
-
-        result
-
-      {:ok, {:error, :unique_conflict} = result} ->
-        Telemetry.emit(
-          [:execution, :insert_conflict],
-          %{count: 1},
-          execution_metadata(opts, queue, workflow_name, version)
-        )
-
-        result
-
-      {:error, _op, reason, _changes} ->
-        {:error, reason}
+      _ ->
+        {:error, :unique_conflict}
     end
   end
 

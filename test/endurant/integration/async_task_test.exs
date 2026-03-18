@@ -45,12 +45,9 @@ defmodule Endurant.Integration.AsyncTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.AsyncTaskTest.ManyWorkflow,
-               %{id: "m1"}
+               %{id: "m1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :completed, result: result}} =
@@ -99,12 +96,9 @@ defmodule Endurant.Integration.AsyncTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.AsyncTaskTest.RetryWorkflow,
-               %{id: "r1"}
+               %{id: "r1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :completed, result: result}} =
@@ -138,12 +132,9 @@ defmodule Endurant.Integration.AsyncTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.AsyncTaskTest.StreamDuplicateWorkflow,
-               %{id: "s1"}
+               %{id: "s1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :failed, result: error}} =
@@ -182,12 +173,9 @@ defmodule Endurant.Integration.AsyncTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.AsyncTaskTest.FailWorkflow,
-               %{id: "f1"}
+               %{id: "f1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :failed, result: error}} =

@@ -40,10 +40,10 @@ defmodule Endurant.Integration.ScheduledTest do
 
     assert {:ok, scheduled} =
              Endurant.schedule(
-               engine_name,
                FastScheduleWorkflow,
                %{"id" => "dispatch"},
-               scheduled_at
+               scheduled_at,
+               instance: engine_name
              )
 
     assert wait_until(fn ->
@@ -71,16 +71,16 @@ defmodule Endurant.Integration.ScheduledTest do
     runtime_opts: runtime_opts
   } do
     assert {:ok, running} =
-             Endurant.insert(engine_name, BlockingScheduleWorkflow, %{"id" => "skip"})
+             Endurant.insert(BlockingScheduleWorkflow, %{"id" => "skip"}, instance: engine_name)
 
     assert wait_for_execution_status(engine_name, running.id, [:running, :waiting])
 
     assert {:ok, scheduled} =
              Endurant.schedule(
-               engine_name,
                FastScheduleWorkflow,
                %{"id" => "skip"},
-               DateTime.utc_now()
+               DateTime.utc_now(),
+               instance: engine_name
              )
 
     assert wait_until(fn ->
@@ -99,16 +99,16 @@ defmodule Endurant.Integration.ScheduledTest do
 
     assert {:ok, scheduled} =
              Endurant.schedule(
-               engine_name,
                FastScheduleWorkflow,
                %{"id" => "cancel-scheduled"},
-               scheduled_at
+               scheduled_at,
+               instance: engine_name
              )
 
-    listed = Endurant.scheduled(engine_name, status: :pending)
+    listed = Endurant.scheduled(status: :pending, instance: engine_name)
     assert Enum.any?(listed, &(&1.id == scheduled.id))
 
-    assert :ok = Endurant.cancel_scheduled(engine_name, scheduled.id)
+    assert :ok = Endurant.cancel_scheduled(scheduled.id, instance: engine_name)
 
     assert wait_until(fn ->
              case Schedules.get(scheduled.id, runtime_opts) do
@@ -128,7 +128,7 @@ defmodule Endurant.Integration.ScheduledTest do
   defp wait_for_execution_status(instance, execution_id, statuses, timeout_ms \\ 2_000) do
     wait_until(
       fn ->
-        case Endurant.execution(instance, execution_id) do
+        case Endurant.execution(execution_id, instance: instance) do
           %{status: status} -> status in statuses
           _ -> false
         end

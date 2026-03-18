@@ -42,9 +42,9 @@ defmodule Endurant.Integration.HistoryStatsTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               engine_name,
                Endurant.Integration.HistoryStatsTest.HistoryWorkflow,
-               %{id: "hs-1"}
+               %{id: "hs-1"},
+               instance: engine_name
              )
 
     assert {:ok,

@@ -8,7 +8,7 @@ Inside a workflow, use `wait_signal/1`:
 approval = wait_signal("approval_requested")
 ```
 
-From outside the workflow, send a signal with `Endurant.signal/4`:
+From outside the workflow, send a signal with `Endurant.signal/3` or `Endurant.signal/4`:
 
 ```elixir
 :ok =
@@ -16,6 +16,18 @@ From outside the workflow, send a signal with `Endurant.signal/4`:
     execution_id,
     "approval_requested",
     %{"approved" => true}
+  )
+```
+
+To target a named instance:
+
+```elixir
+:ok =
+  Endurant.signal(
+    execution_id,
+    "approval_requested",
+    %{"approved" => true},
+    instance: :my_endurant
   )
 ```
 

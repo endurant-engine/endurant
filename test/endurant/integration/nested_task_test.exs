@@ -36,12 +36,9 @@ defmodule Endurant.Integration.NestedTaskTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.NestedTaskTest.NestedWorkflow,
-               %{id: "n-1", user_id: "u-42"}
+               %{id: "n-1", user_id: "u-42"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :completed, result: result}} =

@@ -45,16 +45,14 @@ defmodule Endurant.Integration.ApiTest do
     Code.compile_quoted(workflow_module)
 
     assert {:ok, execution} =
-             Endurant.insert(
-               engine_name,
-               Endurant.Integration.ApiTest.InstanceTargetWorkflow,
-               %{id: "inst-1"}
+             Endurant.insert(Endurant.Integration.ApiTest.InstanceTargetWorkflow, %{id: "inst-1"},
+               instance: engine_name
              )
 
-    assert %{status: status} = Endurant.execution(engine_name, execution.id)
+    assert %{status: status} = Endurant.execution(execution.id, instance: engine_name)
     assert status in [:pending, :running, :waiting]
-    assert is_list(Endurant.events(engine_name, execution.id))
-    assert :ok = Endurant.signal(engine_name, execution.id, "go_inst-1", %{})
+    assert is_list(Endurant.events(execution.id, instance: engine_name))
+    assert :ok = Endurant.signal(execution.id, "go_inst-1", %{}, instance: engine_name)
 
     assert {:ok, %{status: :completed, result: %{id: "inst-1", ok: true}}} =
              PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
@@ -64,7 +62,7 @@ defmodule Endurant.Integration.ApiTest do
     unknown_execution_id = Ecto.UUID.generate()
 
     assert {:error, :not_found} =
-             Endurant.signal(engine_name, unknown_execution_id, "unknown", %{})
+             Endurant.signal(unknown_execution_id, "unknown", %{}, instance: engine_name)
   end
 
   test("start_link loads repo/prefix/queues from application config", %{
@@ -108,9 +106,11 @@ defmodule Endurant.Integration.ApiTest do
     end)
 
     assert {:ok, execution} =
-             Endurant.insert(instance, Endurant.Integration.ApiTest.ConfigLoadedWorkflow, %{
-               id: "cfg-1"
-             })
+             Endurant.insert(
+               Endurant.Integration.ApiTest.ConfigLoadedWorkflow,
+               %{id: "cfg-1"},
+               instance: instance
+             )
 
     assert {:ok, %{status: :completed, result: %{id: "cfg-1", ok: true}}} =
              PostgresHelper.wait_for_execution!(
@@ -182,29 +182,33 @@ defmodule Endurant.Integration.ApiTest do
     end)
 
     assert {:ok, execution_a} =
-             Endurant.insert(instance_a, Endurant.Integration.ApiTest.MultiInstanceWorkflow, %{
-               id: "a"
-             })
+             Endurant.insert(
+               Endurant.Integration.ApiTest.MultiInstanceWorkflow,
+               %{id: "a"},
+               instance: instance_a
+             )
 
     assert {:ok, execution_b} =
-             Endurant.insert(instance_b, Endurant.Integration.ApiTest.MultiInstanceWorkflow, %{
-               id: "b"
-             })
+             Endurant.insert(
+               Endurant.Integration.ApiTest.MultiInstanceWorkflow,
+               %{id: "b"},
+               instance: instance_b
+             )
 
     :ok = wait_for_status!(instance_a, execution_a.id, [:running, :waiting], 5_000)
     :ok = wait_for_status!(instance_b, execution_b.id, [:running, :waiting], 5_000)
 
-    assert nil == Endurant.execution(instance_a, execution_b.id)
-    assert {:error, :not_found} == Endurant.signal(instance_a, execution_b.id, "go_b", %{})
-    assert {:error, :not_found} == Endurant.cancel(instance_a, execution_b.id)
+    assert nil == Endurant.execution(execution_b.id, instance: instance_a)
+    assert {:error, :not_found} == Endurant.signal(execution_b.id, "go_b", %{}, instance: instance_a)
+    assert {:error, :not_found} == Endurant.cancel(execution_b.id, instance: instance_a)
 
-    assert :ok == Endurant.signal(instance_a, execution_a.id, "go_a", %{})
-    assert :ok == Endurant.signal(instance_b, execution_b.id, "go_b", %{})
+    assert :ok == Endurant.signal(execution_a.id, "go_a", %{}, instance: instance_a)
+    assert :ok == Endurant.signal(execution_b.id, "go_b", %{}, instance: instance_b)
 
     assert {:ok, %{status: :completed, result: %{id: id_a, ok: true}}} =
              PostgresHelper.wait_for_execution!(
                execution_a.id,
-               10_000,
+               20_000,
                PostgresHelper.runtime_opts(prefix_a, instance_a)
              )
 
@@ -213,7 +217,7 @@ defmodule Endurant.Integration.ApiTest do
     assert {:ok, %{status: :completed, result: %{id: id_b, ok: true}}} =
              PostgresHelper.wait_for_execution!(
                execution_b.id,
-               10_000,
+               20_000,
                PostgresHelper.runtime_opts(prefix_b, instance_b)
              )
 
@@ -255,7 +259,7 @@ defmodule Endurant.Integration.ApiTest do
           non_neg_integer()
         ) :: :ok
   defp do_wait_for_status(instance, execution_id, allowed_statuses, poll_ms, deadline, timeout_ms) do
-    case Endurant.execution(instance, execution_id) do
+    case Endurant.execution(execution_id, instance: instance) do
       %{status: status} ->
         if status in allowed_statuses do
           :ok

@@ -85,18 +85,15 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.HardeningTest.CancelDuringRetryWorkflow,
-               %{id: "cdr-1"}
+               %{id: "cdr-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :execution_waiting =
              wait_for_event(execution.id, :execution_waiting, 5000, runtime_opts)
 
-    assert :ok = Endurant.cancel(Keyword.fetch!(runtime_opts, :instance), execution.id)
+    assert :ok = Endurant.cancel(execution.id, instance: Keyword.fetch!(runtime_opts, :instance))
     assert :cancelled = wait_for_status(execution.id, :cancelled, 5000, runtime_opts)
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.count(events, &(&1.type == :task_started)) == 1
@@ -129,12 +126,9 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.HardeningTest.CancelNearFinishWorkflow,
-               %{id: "cnf-1"}
+               %{id: "cnf-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     [claimed] =
@@ -149,7 +143,7 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert :task_started = wait_for_event(execution.id, :task_started, 5000, runtime_opts)
     Process.sleep(250)
-    assert :ok = Endurant.cancel(Keyword.fetch!(runtime_opts, :instance), execution.id)
+    assert :ok = Endurant.cancel(execution.id, instance: Keyword.fetch!(runtime_opts, :instance))
     assert :cancelled = wait_for_status(execution.id, :cancelled, 5000, runtime_opts)
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     refute Enum.any?(events, &(&1.type == :execution_completed))
@@ -185,12 +179,9 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.HardeningTest.RetryRecoveryWorkflow,
-               %{id: "rr-1"}
+               %{id: "rr-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :execution_waiting =
@@ -234,12 +225,9 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.HardeningTest.RecoveryIdempotencyWorkflow,
-               %{id: "ri-1"}
+               %{id: "ri-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :running = wait_for_status(execution.id, :running, 2000, runtime_opts)
@@ -284,12 +272,9 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.HardeningTest.WaitingOrphanWorkflow,
-               %{id: "wo-1"}
+               %{id: "wo-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert :execution_waiting =
@@ -333,32 +318,29 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.HardeningTest.SignalRaceWorkflow,
-               %{id: "sr-1"}
+               %{id: "sr-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     _ =
       for i <- 1..20 do
         Task.start(fn ->
-          Endurant.signal(Keyword.fetch!(runtime_opts, :instance), execution.id, "go", %{n: i})
+          Endurant.signal(execution.id, "go", %{n: i}, instance: Keyword.fetch!(runtime_opts, :instance))
         end)
       end
 
     _ =
       for i <- 1..20 do
         Task.start(fn ->
-          Endurant.signal(Keyword.fetch!(runtime_opts, :instance), execution.id, "go2", %{n: i})
+          Endurant.signal(execution.id, "go2", %{n: i}, instance: Keyword.fetch!(runtime_opts, :instance))
         end)
       end
 
     assert {:ok, %{status: :completed}} =
              PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
-    events = Endurant.events(Keyword.fetch!(runtime_opts, :instance), execution.id)
+    events = Endurant.events(execution.id, instance: Keyword.fetch!(runtime_opts, :instance))
     sequences = Enum.map(events, & &1.sequence)
     assert sequences == Enum.to_list(1..length(sequences))
   end
@@ -392,19 +374,16 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.HardeningTest.ExhaustedThenCancelWorkflow,
-               %{id: "ec-1"}
+               %{id: "ec-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     assert {:ok, %{status: :failed}} =
              PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
 
     assert {:error, :not_active} =
-             Endurant.cancel(Keyword.fetch!(runtime_opts, :instance), execution.id)
+             Endurant.cancel(execution.id, instance: Keyword.fetch!(runtime_opts, :instance))
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     refute Enum.any?(events, &(&1.type == :cancel_requested))
@@ -436,12 +415,9 @@ defmodule Endurant.Integration.HardeningTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Keyword.fetch!(
-                 runtime_opts,
-                 :instance
-               ),
                Endurant.Integration.HardeningTest.GuardHaltWorkflow,
-               %{id: "gh-1"}
+               %{id: "gh-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
              )
 
     [claimed] =
@@ -469,7 +445,7 @@ defmodule Endurant.Integration.HardeningTest do
 
   @spec do_wait_for_status(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_status(execution_id, expected_status, deadline, runtime_opts) do
-    case Endurant.execution(Keyword.fetch!(runtime_opts, :instance), execution_id) do
+    case Endurant.execution(execution_id, instance: Keyword.fetch!(runtime_opts, :instance)) do
       %{status: ^expected_status} ->
         expected_status
 
@@ -491,7 +467,7 @@ defmodule Endurant.Integration.HardeningTest do
 
   @spec do_wait_for_event(binary(), atom(), integer(), keyword()) :: atom()
   defp do_wait_for_event(execution_id, expected_type, deadline, runtime_opts) do
-    events = Endurant.events(Keyword.fetch!(runtime_opts, :instance), execution_id)
+    events = Endurant.events(execution_id, instance: Keyword.fetch!(runtime_opts, :instance))
 
     if Enum.any?(events, &(&1.type == expected_type)) do
       expected_type

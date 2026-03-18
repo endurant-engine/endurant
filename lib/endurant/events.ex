@@ -39,6 +39,24 @@ defmodule Endurant.Events do
     do_append(repo, prefix, execution_id, type, payload, opts)
   end
 
+  @doc false
+  @spec append_in_tx(binary(), atom() | String.t(), map(), keyword()) :: :ok
+  def append_in_tx(execution_id, type, payload \\ %{}, opts \\ []) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    execution_id = to_db_id(execution_id)
+    type = normalize_type(type)
+    payload = payload || %{}
+
+    case do_append_in_tx(repo, prefix, execution_id, type, payload) do
+      {:ok, _telemetry_context} ->
+        :ok
+
+      {:error, :execution_not_found} ->
+        raise ArgumentError, "execution not found: #{inspect(to_app_id(execution_id))}"
+    end
+  end
+
   @doc """
   Appends an event only when the execution is currently running and owned by the
   provided worker lease.
@@ -201,70 +219,100 @@ defmodule Endurant.Events do
 
   @spec do_append(module(), String.t(), binary(), String.t(), map(), keyword()) :: :ok
   defp do_append(repo, prefix, execution_id, type, payload, opts) do
-    lock_sql = lock_execution_for_append_sql(prefix)
-    insert_sql = insert_event_with_sequence_and_size_sql(prefix)
-    update_sql = update_execution_event_stats_sql(prefix)
     started_at = Telemetry.monotonic_time()
 
     case repo.transaction(
-           fn ->
-             case query!(repo, lock_sql, [execution_id]).rows do
-               [[next_event_sequence, queue, workflow_name, version]]
-               when is_integer(next_event_sequence) and next_event_sequence >= 1 ->
-                 case query!(repo, insert_sql, [execution_id, next_event_sequence, type, payload]).rows do
-                   [[history_size_delta]]
-                   when is_integer(history_size_delta) and history_size_delta >= 0 ->
-                     case query!(repo, update_sql, [execution_id, history_size_delta]).num_rows do
-                       1 ->
-                         %{
-                           queue: queue,
-                           workflow: workflow_name,
-                           version: version,
-                           history_size_delta_bytes: history_size_delta
-                         }
-
-                       _ ->
-                         repo.rollback(:execution_not_found)
-                     end
-
-                   _ ->
-                     repo.rollback(:execution_not_found)
-                 end
-
-               [[next_event_sequence]]
-               when is_integer(next_event_sequence) and next_event_sequence >= 1 ->
-                 case query!(repo, insert_sql, [execution_id, next_event_sequence, type, payload]).rows do
-                   [[history_size_delta]]
-                   when is_integer(history_size_delta) and history_size_delta >= 0 ->
-                     case query!(repo, update_sql, [execution_id, history_size_delta]).num_rows do
-                       1 ->
-                         %{
-                           queue: nil,
-                           workflow: nil,
-                           version: nil,
-                           history_size_delta_bytes: history_size_delta
-                         }
-
-                       _ ->
-                         repo.rollback(:execution_not_found)
-                     end
-
-                   _ ->
-                     repo.rollback(:execution_not_found)
-                 end
-
-               _ ->
-                 repo.rollback(:execution_not_found)
-             end
-           end,
+           fn -> do_append_in_tx(repo, prefix, execution_id, type, payload) end,
            log: false
          ) do
-      {:ok, telemetry_context} ->
+      {:ok, {:ok, telemetry_context}} ->
         emit_append_telemetry(opts, payload, started_at, telemetry_context)
         :ok
 
-      {:error, :execution_not_found} ->
+      {:ok, {:error, :execution_not_found}} ->
         raise ArgumentError, "execution not found: #{inspect(to_app_id(execution_id))}"
+    end
+  end
+
+  @spec do_append_in_tx(module(), String.t(), binary(), String.t(), map()) ::
+          {:ok, map()} | {:error, :execution_not_found}
+  defp do_append_in_tx(repo, prefix, execution_id, type, payload) do
+    lock_sql = lock_execution_for_append_sql(prefix)
+    insert_sql = insert_event_with_sequence_and_size_sql(prefix)
+    update_sql = update_execution_event_stats_sql(prefix)
+
+    case query!(repo, lock_sql, [execution_id]).rows do
+      [[next_event_sequence, queue, workflow_name, version]]
+      when is_integer(next_event_sequence) and next_event_sequence >= 1 ->
+        do_insert_event(
+          repo,
+          insert_sql,
+          update_sql,
+          execution_id,
+          next_event_sequence,
+          type,
+          payload,
+          %{
+            queue: queue,
+            workflow: workflow_name,
+            version: version
+          }
+        )
+
+      [[next_event_sequence]]
+      when is_integer(next_event_sequence) and next_event_sequence >= 1 ->
+        do_insert_event(
+          repo,
+          insert_sql,
+          update_sql,
+          execution_id,
+          next_event_sequence,
+          type,
+          payload,
+          %{
+            queue: nil,
+            workflow: nil,
+            version: nil
+          }
+        )
+
+      _ ->
+        {:error, :execution_not_found}
+    end
+  end
+
+  @spec do_insert_event(
+          module(),
+          String.t(),
+          String.t(),
+          binary(),
+          pos_integer(),
+          String.t(),
+          map(),
+          map()
+        ) :: {:ok, map()} | {:error, :execution_not_found}
+  defp do_insert_event(
+         repo,
+         insert_sql,
+         update_sql,
+         execution_id,
+         next_event_sequence,
+         type,
+         payload,
+         context
+       ) do
+    case query!(repo, insert_sql, [execution_id, next_event_sequence, type, payload]).rows do
+      [[history_size_delta]] when is_integer(history_size_delta) and history_size_delta >= 0 ->
+        case query!(repo, update_sql, [execution_id, history_size_delta]).num_rows do
+          1 ->
+            {:ok, Map.put(context, :history_size_delta_bytes, history_size_delta)}
+
+          _ ->
+            {:error, :execution_not_found}
+        end
+
+      _ ->
+        {:error, :execution_not_found}
     end
   end
 

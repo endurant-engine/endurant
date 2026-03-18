@@ -4,17 +4,20 @@ defmodule Endurant do
 
   Endurant is instance-addressed. The default instance name is `Endurant`.
   Public operations can be called against the default instance, or with an
-  explicit instance as the first argument.
+  explicit `:instance` option.
 
       Endurant.insert(MyApp.Workflows.OrderWorkflow, %{order_id: "o-123"})
       Endurant.signal(execution_id, "approval_requested", %{approved: true})
       Endurant.execution(execution_id)
       Endurant.events(execution_id)
 
-      Endurant.insert(MyEndurant, MyApp.Workflows.OrderWorkflow, %{order_id: "o-123"})
-      Endurant.signal(MyEndurant, execution_id, "approval_requested", %{approved: true})
+      Endurant.insert(MyApp.Workflows.OrderWorkflow, %{order_id: "o-123"}, instance: :my_endurant)
+      Endurant.signal(execution_id, "approval_requested", %{approved: true}, instance: :my_endurant)
+      Endurant.execution(execution_id, instance: :my_endurant)
+      Endurant.events(execution_id, instance: :my_endurant)
   """
 
+  alias Ecto.Multi
   alias Endurant.Config
   alias Endurant.Crons
   alias Endurant.Registry
@@ -77,7 +80,8 @@ defmodule Endurant do
           | {:queues, queues_option()}
   @type start_options :: [start_option()]
   @type instance_name :: Config.instance_name()
-  @type schedule_options :: [{:id, binary()}]
+  @type instance_option :: {:instance, instance_name()}
+  @type schedule_options :: [{:id, binary()} | instance_option()]
   @type cron_options ::
           [
             {:id, binary()}
@@ -85,9 +89,12 @@ defmodule Endurant do
             | {:timezone, String.t()}
             | {:start_at, DateTime.t()}
             | {:end_at, DateTime.t()}
+            | instance_option()
           ]
+  @type insert_options :: [instance_option()]
 
   @type insert_result :: {:ok, map()} | {:error, :unique_conflict}
+  @type insert_multi_input :: map() | (map() -> map())
   @type schedule_result :: {:ok, map()} | {:error, :id_conflict | :transient_db}
   @type scheduled_result :: [map()]
   @type cancel_scheduled_result :: :ok | {:error, :not_found | :not_pending}
@@ -130,7 +137,7 @@ defmodule Endurant do
 
   Any option not passed directly can come from application config:
 
-      config :endurant, Endurant,
+      config :endurant, :my_endurant,
         repo: MyApp.Repo,
         prefix: "public",
         queues: [default: [limit: 10]]
@@ -161,6 +168,7 @@ defmodule Endurant do
   ## Examples
 
       Endurant.start_link(
+        name: :my_endurant,
         repo: MyApp.Repo,
         prefix: "public",
         archivers: [
@@ -201,17 +209,60 @@ defmodule Endurant do
   """
   @spec insert(module(), map()) :: insert_result()
   def insert(workflow_module, input) when is_atom(workflow_module) and is_map(input) do
-    insert(@default_instance, workflow_module, input)
+    Endurant.Executions.insert(workflow_module, input, instance_runtime_opts!(@default_instance))
   end
 
   @doc """
-  Inserts a workflow execution request targeting an instance.
+  Inserts a workflow execution request with options.
+
+  Supported options:
+
+  - `:instance` target Endurant instance. Defaults to `Endurant`.
   """
-  @spec insert(instance_name(), module(), map()) :: insert_result()
-  def insert(instance, workflow_module, input)
-      when (is_atom(instance) or is_binary(instance)) and is_atom(workflow_module) and
-             is_map(input) do
-    Endurant.Executions.insert(workflow_module, input, instance_runtime_opts!(instance))
+  @spec insert(module(), map(), insert_options()) :: insert_result()
+  def insert(workflow_module, input, opts)
+      when is_atom(workflow_module) and is_map(input) and is_list(opts) do
+    runtime_opts = runtime_opts_from_public_opts!(opts)
+    Endurant.Executions.insert(workflow_module, input, runtime_opts)
+  end
+
+  @doc """
+  Inserts a workflow execution request as part of an `Ecto.Multi`.
+
+  Supported options:
+
+  - `:instance` target Endurant instance. Defaults to `Endurant`.
+
+  The repo used for the insert comes from the surrounding multi transaction.
+  The selected instance provides runtime configuration such as the prefix.
+  """
+  @spec insert(Multi.t(), Multi.name(), module(), insert_multi_input()) :: Multi.t()
+  def insert(%Multi{} = multi, name, workflow_module, input_or_fun)
+      when is_atom(workflow_module) and (is_map(input_or_fun) or is_function(input_or_fun, 1)) do
+    insert(multi, name, workflow_module, input_or_fun, [])
+  end
+
+  @doc """
+  Inserts a workflow execution request as part of an `Ecto.Multi`.
+
+  Supported options:
+
+  - `:instance` target Endurant instance. Defaults to `Endurant`.
+  """
+  @spec insert(Multi.t(), Multi.name(), module(), insert_multi_input(), insert_options()) ::
+          Multi.t()
+  def insert(%Multi{} = multi, name, workflow_module, input_or_fun, opts)
+      when is_atom(workflow_module) and
+             (is_map(input_or_fun) or is_function(input_or_fun, 1)) and
+             is_list(opts) do
+    runtime_opts = runtime_opts_from_public_opts!(opts)
+
+    Multi.run(multi, name, fn repo, changes ->
+      tx_opts = Keyword.put(runtime_opts, :repo, repo)
+      input = resolve_insert_multi_input!(input_or_fun, changes)
+
+      Endurant.Executions.insert_in_tx(workflow_module, input, tx_opts)
+    end)
   end
 
   @doc """
@@ -220,7 +271,8 @@ defmodule Endurant do
   @spec schedule(module(), map(), DateTime.t()) :: schedule_result()
   def schedule(workflow_module, input, scheduled_at)
       when is_atom(workflow_module) and is_map(input) and is_struct(scheduled_at, DateTime) do
-    schedule(@default_instance, workflow_module, input, scheduled_at, [])
+    runtime_opts = instance_runtime_opts!(@default_instance)
+    Endurant.Schedules.insert(workflow_module, input, scheduled_at, runtime_opts)
   end
 
   @doc """
@@ -234,32 +286,13 @@ defmodule Endurant do
   def schedule(workflow_module, input, scheduled_at, opts)
       when is_atom(workflow_module) and is_map(input) and is_struct(scheduled_at, DateTime) and
              is_list(opts) do
-    schedule(@default_instance, workflow_module, input, scheduled_at, opts)
-  end
-
-  @doc """
-  Schedules a workflow execution to be dispatched at a future time.
-
-  `scheduled_at` must be a UTC `DateTime`.
-
-  Supported options:
-
-  - `:id` explicit schedule id (UUID string). Defaults to generated UUID.
-
-  Returns `{:error, :id_conflict}` when the provided id already exists.
-  """
-  @spec schedule(instance_name(), module(), map(), DateTime.t(), schedule_options()) ::
-          schedule_result()
-  def schedule(instance, workflow_module, input, scheduled_at, opts \\ [])
-      when (is_atom(instance) or is_binary(instance)) and is_atom(workflow_module) and
-             is_map(input) and is_struct(scheduled_at, DateTime) and is_list(opts) do
-    runtime_opts = instance_runtime_opts!(instance)
+    {runtime_opts, local_opts} = runtime_opts_and_local_opts!(opts)
 
     Endurant.Schedules.insert(
       workflow_module,
       input,
       scheduled_at,
-      Keyword.merge(runtime_opts, opts)
+      Keyword.merge(runtime_opts, local_opts)
     )
   end
 
@@ -273,15 +306,11 @@ defmodule Endurant do
   - `:limit` positive integer (default `100`)
   """
   @spec scheduled() :: scheduled_result()
-  @spec scheduled(instance_name()) :: scheduled_result()
   @spec scheduled(keyword()) :: scheduled_result()
-  @spec scheduled(instance_name(), keyword()) :: scheduled_result()
-  def scheduled(instance_or_filters \\ @default_instance, filters \\ [])
+  def scheduled(filters \\ [])
 
-  def scheduled(instance_or_filters, filters) when is_list(filters) do
-    {instance, resolved_filters} =
-      normalize_instance_and_filters!(instance_or_filters, filters, :scheduled)
-
+  def scheduled(filters) when is_list(filters) do
+    {instance, resolved_filters} = split_instance_from_keyword(filters)
     Endurant.Schedules.list(resolved_filters, instance_runtime_opts!(instance))
   end
 
@@ -292,22 +321,12 @@ defmodule Endurant do
   """
   @spec cancel_scheduled(binary()) :: cancel_scheduled_result()
   def cancel_scheduled(schedule_id) when is_binary(schedule_id) do
-    cancel_scheduled(@default_instance, schedule_id)
+    Endurant.Schedules.cancel(schedule_id, instance_runtime_opts!(@default_instance))
   end
 
-  @doc """
-  Cancels one scheduled row on an instance.
-
-  Returns:
-
-  - `:ok` when cancelled.
-  - `{:error, :not_found}` when id doesn't exist.
-  - `{:error, :not_pending}` when already dispatched/skipped/failed/cancelled.
-  """
-  @spec cancel_scheduled(instance_name(), binary()) :: cancel_scheduled_result()
-  def cancel_scheduled(instance, schedule_id)
-      when (is_atom(instance) or is_binary(instance)) and is_binary(schedule_id) do
-    Endurant.Schedules.cancel(schedule_id, instance_runtime_opts!(instance))
+  @spec cancel_scheduled(binary(), keyword()) :: cancel_scheduled_result()
+  def cancel_scheduled(schedule_id, opts) when is_binary(schedule_id) and is_list(opts) do
+    Endurant.Schedules.cancel(schedule_id, runtime_opts_from_public_opts!(opts))
   end
 
   @doc """
@@ -334,21 +353,8 @@ defmodule Endurant do
   def cron(workflow_module, input, cron_expr, opts)
       when is_atom(workflow_module) and is_map(input) and is_binary(cron_expr) and
              is_list(opts) do
-    cron(@default_instance, workflow_module, input, cron_expr, opts)
-  end
-
-  @doc """
-  Creates a cron schedule on an instance.
-
-  Cron schedule rows have `:active | :paused` status. Runtime dispatch creates
-  fire rows in scheduled executions using overlap policy `:skip`.
-  """
-  @spec cron(instance_name(), module(), map(), String.t(), cron_options()) :: cron_result()
-  def cron(instance, workflow_module, input, cron_expr, opts \\ [])
-      when (is_atom(instance) or is_binary(instance)) and is_atom(workflow_module) and
-             is_map(input) and is_binary(cron_expr) and is_list(opts) do
-    runtime_opts = instance_runtime_opts!(instance)
-    Crons.insert(workflow_module, input, cron_expr, Keyword.merge(runtime_opts, opts))
+    {runtime_opts, local_opts} = runtime_opts_and_local_opts!(opts)
+    Crons.insert(workflow_module, input, cron_expr, Keyword.merge(runtime_opts, local_opts))
   end
 
   @doc """
@@ -360,15 +366,11 @@ defmodule Endurant do
   - `:limit` positive integer (default `100`)
   """
   @spec crons() :: crons_result()
-  @spec crons(instance_name()) :: crons_result()
   @spec crons(keyword()) :: crons_result()
-  @spec crons(instance_name(), keyword()) :: crons_result()
-  def crons(instance_or_filters \\ @default_instance, filters \\ [])
+  def crons(filters \\ [])
 
-  def crons(instance_or_filters, filters) when is_list(filters) do
-    {instance, resolved_filters} =
-      normalize_instance_and_filters!(instance_or_filters, filters, :crons)
-
+  def crons(filters) when is_list(filters) do
+    {instance, resolved_filters} = split_instance_from_keyword(filters)
     Crons.list(resolved_filters, instance_runtime_opts!(instance))
   end
 
@@ -386,21 +388,10 @@ defmodule Endurant do
     Crons.list_fires(cron_id, [], instance_runtime_opts!(@default_instance))
   end
 
-  @spec cron_fires(instance_name(), binary()) :: cron_fires_result()
-  def cron_fires(instance, cron_id)
-      when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) do
-    Crons.list_fires(cron_id, [], instance_runtime_opts!(instance))
-  end
-
   @spec cron_fires(binary(), keyword()) :: cron_fires_result()
   def cron_fires(cron_id, filters) when is_binary(cron_id) and is_list(filters) do
-    Crons.list_fires(cron_id, filters, instance_runtime_opts!(@default_instance))
-  end
-
-  @spec cron_fires(instance_name(), binary(), keyword()) :: cron_fires_result()
-  def cron_fires(instance, cron_id, filters)
-      when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) and is_list(filters) do
-    Crons.list_fires(cron_id, filters, instance_runtime_opts!(instance))
+    {instance, resolved_filters} = split_instance_from_keyword(filters)
+    Crons.list_fires(cron_id, resolved_filters, instance_runtime_opts!(instance))
   end
 
   @doc """
@@ -408,22 +399,12 @@ defmodule Endurant do
   """
   @spec pause_cron(binary()) :: pause_cron_result()
   def pause_cron(cron_id) when is_binary(cron_id) do
-    pause_cron(@default_instance, cron_id)
+    Crons.pause(cron_id, instance_runtime_opts!(@default_instance))
   end
 
-  @doc """
-  Pauses one cron schedule on an instance.
-
-  Returns:
-
-  - `:ok` when paused.
-  - `{:error, :not_found}` when id doesn't exist.
-  - `{:error, :not_active}` when already paused.
-  """
-  @spec pause_cron(instance_name(), binary()) :: pause_cron_result()
-  def pause_cron(instance, cron_id)
-      when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) do
-    Crons.pause(cron_id, instance_runtime_opts!(instance))
+  @spec pause_cron(binary(), keyword()) :: pause_cron_result()
+  def pause_cron(cron_id, opts) when is_binary(cron_id) and is_list(opts) do
+    Crons.pause(cron_id, runtime_opts_from_public_opts!(opts))
   end
 
   @doc """
@@ -431,23 +412,12 @@ defmodule Endurant do
   """
   @spec resume_cron(binary()) :: resume_cron_result()
   def resume_cron(cron_id) when is_binary(cron_id) do
-    resume_cron(@default_instance, cron_id)
+    Crons.resume(cron_id, instance_runtime_opts!(@default_instance))
   end
 
-  @doc """
-  Resumes one paused cron schedule on an instance.
-
-  Returns:
-
-  - `:ok` when resumed.
-  - `{:error, :not_found}` when id doesn't exist.
-  - `{:error, :not_paused}` when already active.
-  - `{:error, :ended}` when no future run fits within `end_at`.
-  """
-  @spec resume_cron(instance_name(), binary()) :: resume_cron_result()
-  def resume_cron(instance, cron_id)
-      when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) do
-    Crons.resume(cron_id, instance_runtime_opts!(instance))
+  @spec resume_cron(binary(), keyword()) :: resume_cron_result()
+  def resume_cron(cron_id, opts) when is_binary(cron_id) and is_list(opts) do
+    Crons.resume(cron_id, runtime_opts_from_public_opts!(opts))
   end
 
   @doc """
@@ -455,19 +425,12 @@ defmodule Endurant do
   """
   @spec delete_cron(binary()) :: delete_cron_result()
   def delete_cron(cron_id) when is_binary(cron_id) do
-    delete_cron(@default_instance, cron_id)
+    Crons.delete(cron_id, instance_runtime_opts!(@default_instance))
   end
 
-  @doc """
-  Deletes one cron schedule on an instance.
-
-  This deletes the cron schedule row. Existing generated fire rows are not
-  deleted.
-  """
-  @spec delete_cron(instance_name(), binary()) :: delete_cron_result()
-  def delete_cron(instance, cron_id)
-      when (is_atom(instance) or is_binary(instance)) and is_binary(cron_id) do
-    Crons.delete(cron_id, instance_runtime_opts!(instance))
+  @spec delete_cron(binary(), keyword()) :: delete_cron_result()
+  def delete_cron(cron_id, opts) when is_binary(cron_id) and is_list(opts) do
+    Crons.delete(cron_id, runtime_opts_from_public_opts!(opts))
   end
 
   @doc """
@@ -475,34 +438,44 @@ defmodule Endurant do
   """
   @spec signal(binary(), String.t()) :: signal_result()
   def signal(execution_id, signal) when is_binary(execution_id) and is_binary(signal) do
-    signal(@default_instance, execution_id, signal, %{})
+    Endurant.Executions.record_signal(
+      execution_id,
+      signal,
+      %{},
+      instance_runtime_opts!(@default_instance)
+    )
   end
 
   @spec signal(binary(), String.t(), map()) :: signal_result()
   def signal(execution_id, signal, payload)
       when is_binary(execution_id) and is_binary(signal) and is_map(payload) do
-    signal(@default_instance, execution_id, signal, payload)
-  end
-
-  @doc """
-  Records a signal targeting an instance.
-  """
-  @spec signal(instance_name(), binary(), String.t()) :: signal_result()
-  def signal(instance, execution_id, signal)
-      when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) and
-             is_binary(signal) do
-    signal(instance, execution_id, signal, %{})
-  end
-
-  @spec signal(instance_name(), binary(), String.t(), map()) :: signal_result()
-  def signal(instance, execution_id, signal, payload)
-      when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) and
-             is_binary(signal) and is_map(payload) do
     Endurant.Executions.record_signal(
       execution_id,
       signal,
       payload,
-      instance_runtime_opts!(instance)
+      instance_runtime_opts!(@default_instance)
+    )
+  end
+
+  @spec signal(binary(), String.t(), keyword()) :: signal_result()
+  def signal(execution_id, signal, opts)
+      when is_binary(execution_id) and is_binary(signal) and is_list(opts) do
+    Endurant.Executions.record_signal(
+      execution_id,
+      signal,
+      %{},
+      runtime_opts_from_public_opts!(opts)
+    )
+  end
+
+  @spec signal(binary(), String.t(), map(), keyword()) :: signal_result()
+  def signal(execution_id, signal, payload, opts)
+      when is_binary(execution_id) and is_binary(signal) and is_map(payload) and is_list(opts) do
+    Endurant.Executions.record_signal(
+      execution_id,
+      signal,
+      payload,
+      runtime_opts_from_public_opts!(opts)
     )
   end
 
@@ -511,16 +484,12 @@ defmodule Endurant do
   """
   @spec cancel(binary()) :: cancel_result()
   def cancel(execution_id) when is_binary(execution_id) do
-    cancel(@default_instance, execution_id)
+    Endurant.Executions.cancel(execution_id, instance_runtime_opts!(@default_instance))
   end
 
-  @doc """
-  Requests cancellation of an execution targeting an instance.
-  """
-  @spec cancel(instance_name(), binary()) :: cancel_result()
-  def cancel(instance, execution_id)
-      when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) do
-    Endurant.Executions.cancel(execution_id, instance_runtime_opts!(instance))
+  @spec cancel(binary(), keyword()) :: cancel_result()
+  def cancel(execution_id, opts) when is_binary(execution_id) and is_list(opts) do
+    Endurant.Executions.cancel(execution_id, runtime_opts_from_public_opts!(opts))
   end
 
   @doc """
@@ -528,16 +497,12 @@ defmodule Endurant do
   """
   @spec execution(binary()) :: execution_result()
   def execution(execution_id) when is_binary(execution_id) do
-    execution(@default_instance, execution_id)
+    Endurant.Executions.get(execution_id, instance_runtime_opts!(@default_instance))
   end
 
-  @doc """
-  Fetches one execution by id targeting an instance.
-  """
-  @spec execution(instance_name(), binary()) :: execution_result()
-  def execution(instance, execution_id)
-      when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) do
-    Endurant.Executions.get(execution_id, instance_runtime_opts!(instance))
+  @spec execution(binary(), keyword()) :: execution_result()
+  def execution(execution_id, opts) when is_binary(execution_id) and is_list(opts) do
+    Endurant.Executions.get(execution_id, runtime_opts_from_public_opts!(opts))
   end
 
   @doc """
@@ -545,21 +510,13 @@ defmodule Endurant do
   """
   @spec executions() :: executions_result()
   def executions do
-    executions(@default_instance, [])
+    Endurant.Executions.list([], instance_runtime_opts!(@default_instance))
   end
 
   @spec executions(keyword()) :: executions_result()
   def executions(filters) when is_list(filters) do
-    executions(@default_instance, filters)
-  end
-
-  @doc """
-  Lists executions from an instance using optional filters.
-  """
-  @spec executions(instance_name(), keyword()) :: executions_result()
-  def executions(instance, filters)
-      when (is_atom(instance) or is_binary(instance)) and is_list(filters) do
-    Endurant.Executions.list(filters, instance_runtime_opts!(instance))
+    {instance, resolved_filters} = split_instance_from_keyword(filters)
+    Endurant.Executions.list(resolved_filters, instance_runtime_opts!(instance))
   end
 
   @doc """
@@ -567,32 +524,31 @@ defmodule Endurant do
   """
   @spec events(binary()) :: events_result()
   def events(execution_id) when is_binary(execution_id) do
-    events(@default_instance, execution_id)
+    Endurant.Events.list(execution_id, instance_runtime_opts!(@default_instance))
   end
 
-  @doc """
-  Lists all events for an execution targeting an instance.
-  """
-  @spec events(instance_name(), binary()) :: events_result()
-  def events(instance, execution_id)
-      when (is_atom(instance) or is_binary(instance)) and is_binary(execution_id) do
-    Endurant.Events.list(execution_id, instance_runtime_opts!(instance))
+  @spec events(binary(), keyword()) :: events_result()
+  def events(execution_id, opts) when is_binary(execution_id) and is_list(opts) do
+    Endurant.Events.list(execution_id, runtime_opts_from_public_opts!(opts))
   end
 
-  @spec normalize_instance_and_filters!(instance_name() | keyword(), keyword(), atom()) ::
-          {instance_name(), keyword()}
-  defp normalize_instance_and_filters!(instance, filters, _kind)
-       when (is_atom(instance) or is_binary(instance)) and is_list(filters) do
-    {instance, filters}
+  @spec split_instance_from_keyword(keyword()) :: {instance_name(), keyword()}
+  defp split_instance_from_keyword(opts) when is_list(opts) do
+    {Keyword.get(opts, :instance, @default_instance), Keyword.delete(opts, :instance)}
   end
 
-  defp normalize_instance_and_filters!(filters, [], _kind) when is_list(filters) do
-    {@default_instance, filters}
+  @spec runtime_opts_from_public_opts!(keyword()) :: keyword()
+  defp runtime_opts_from_public_opts!(opts) when is_list(opts) do
+    opts
+    |> split_instance_from_keyword()
+    |> elem(0)
+    |> instance_runtime_opts!()
   end
 
-  defp normalize_instance_and_filters!(instance_or_filters, filters, kind) do
-    raise ArgumentError,
-          "invalid #{kind} arguments: #{inspect(instance_or_filters)}, #{inspect(filters)}"
+  @spec runtime_opts_and_local_opts!(keyword()) :: {keyword(), keyword()}
+  defp runtime_opts_and_local_opts!(opts) when is_list(opts) do
+    {instance, local_opts} = split_instance_from_keyword(opts)
+    {instance_runtime_opts!(instance), local_opts}
   end
 
   @spec instance_runtime_opts!(instance_name()) :: keyword()
@@ -606,6 +562,12 @@ defmodule Endurant do
               "endurant instance #{inspect(instance)} is not running on node #{inspect(node())}"
     end
   end
+
+  @spec resolve_insert_multi_input!(insert_multi_input(), map()) :: map()
+  defp resolve_insert_multi_input!(input, _changes) when is_map(input), do: input
+
+  defp resolve_insert_multi_input!(input_fun, changes) when is_function(input_fun, 1),
+    do: input_fun.(changes)
 
   @spec config_opts_from_env(instance_name()) :: keyword()
   defp config_opts_from_env(instance) when is_binary(instance), do: []
