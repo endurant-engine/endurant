@@ -50,17 +50,21 @@ end
 def start(_type, _args) do
   children = [
     MyApp.Repo,
-    {Endurant.Supervisor,
-      name: "my_endurant",
-      queues: [
-        orders: [
-          limit: 10,
-          parked_limit: 100,
-          poll_interval: 200,
-          repo: MyApp.Repo,
-          prefix: "public"
-        ]
-      ]}
+    %{
+      id: Endurant,
+      start:
+        {Endurant, :start_link,
+         [[
+           repo: MyApp.Repo,
+           queues: [
+             orders: [
+               limit: 10,
+               parked_limit: 100,
+               poll_interval: 200
+             ]
+           ]
+         ]]}
+    }
   ]
 
   Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)

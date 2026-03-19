@@ -38,6 +38,14 @@ defmodule Endurant.MixProject do
 
   defp package do
     [
+      files: [
+        ".formatter.exs",
+        "LICENSE",
+        "README.md",
+        "docs",
+        "lib",
+        "mix.exs"
+      ],
       licenses: ["MIT"],
       links: %{
         "GitHub" => "https://github.com/endurant-engine/endurant"

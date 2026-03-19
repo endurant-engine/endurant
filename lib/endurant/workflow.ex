@@ -34,19 +34,24 @@ defmodule Endurant.Workflow do
   alias Endurant.Executions
 
   defmodule AsyncHandle do
-    @moduledoc false
+    @moduledoc """
+    Handle returned by async workflow task helpers.
+
+    Endurant uses this to track in-flight async work between `task_async/3,4`,
+    `task_async_stream/3,4`, `task_await/1`, and `task_await_many/1`.
+    """
 
     @enforce_keys [:name, :task_key, :fun, :input, :opts]
     defstruct [:name, :task_key, :fun, :input, :opts, :task]
 
-    @type t :: %__MODULE__{
-            name: String.t(),
-            task_key: String.t(),
-            fun: (term() -> term()),
-            input: term(),
-            opts: keyword(),
-            task: Task.t() | nil
-          }
+    @opaque t :: %__MODULE__{
+              name: String.t(),
+              task_key: String.t(),
+              fun: (term() -> term()),
+              input: term(),
+              opts: keyword(),
+              task: Task.t() | nil
+            }
   end
 
   @typedoc "Workflow version passed to `run/2`."
