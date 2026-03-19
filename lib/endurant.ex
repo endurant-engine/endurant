@@ -25,7 +25,7 @@ defmodule Endurant do
   @default_instance Endurant
 
   @typedoc "Name for the top-level Endurant instance."
-  @type start_name :: Config.instance_name()
+  @type start_name :: atom() | String.t()
 
   @typedoc """
   Queue runtime options.
@@ -79,7 +79,8 @@ defmodule Endurant do
           | {:pruner, pruner_option()}
           | {:queues, queues_option()}
   @type start_options :: [start_option()]
-  @type instance_name :: Config.instance_name()
+  @typedoc "Name used to address a running Endurant instance."
+  @type instance_name :: atom() | String.t()
   @type instance_option :: {:instance, instance_name()}
   @type schedule_options :: [{:id, binary()} | instance_option()]
   @type cron_options ::
@@ -108,7 +109,16 @@ defmodule Endurant do
   @type cancel_result :: :ok | {:error, :not_found | :not_active}
   @type execution_result :: map() | nil
   @type executions_result :: [map()]
-  @type events_result :: [Endurant.Events.event()]
+  @typedoc "Workflow execution event returned by `events/1` and `events/2`."
+  @type event :: %{
+          id: integer(),
+          execution_id: binary(),
+          sequence: non_neg_integer(),
+          type: atom(),
+          payload: map(),
+          inserted_at: NaiveDateTime.t() | DateTime.t() | nil
+        }
+  @type events_result :: [event()]
 
   @doc """
   Starts Endurant's supervision tree.
