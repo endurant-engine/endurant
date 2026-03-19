@@ -57,4 +57,55 @@ defmodule Endurant.Integration.NestedTaskTest do
              :execution_completed
            ]
   end
+
+  test("task can be called from inside another task", %{runtime_opts: runtime_opts}) do
+    workflow_module =
+      quote do
+        defmodule Endurant.Integration.NestedTaskTest.TaskInTaskWorkflow do
+          use Endurant.Workflow, version: "1"
+
+          workflow do
+            queue("orders")
+            unique_id(fn %{id: id} -> "nested-task:#{id}" end)
+          end
+
+          @impl Endurant.Workflow
+          def run(_version, input) do
+            task(input, "outer_task", fn i ->
+              user =
+                task(i, "inner_task", fn inner ->
+                  Endurant.TestSupport.WorkflowHelpers.Accounts.fetch_user(inner["user_id"])
+                end)
+
+              %{id: i["id"], user_id: user.id, premium: user.premium}
+            end)
+          end
+        end
+      end
+
+    Code.compile_quoted(workflow_module)
+
+    assert {:ok, execution} =
+             Endurant.insert(
+               Endurant.Integration.NestedTaskTest.TaskInTaskWorkflow,
+               %{id: "n-2", user_id: "u-42"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
+             )
+
+    assert {:ok, %{status: :completed, result: result}} =
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
+
+    assert result == %{id: "n-2", user_id: "u-42", premium: true}
+    assert {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
+
+    assert Enum.map(events, & &1.type) == [
+             :execution_created,
+             :execution_started,
+             :task_started,
+             :task_started,
+             :task_completed,
+             :task_completed,
+             :execution_completed
+           ]
+  end
 end

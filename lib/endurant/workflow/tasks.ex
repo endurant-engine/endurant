@@ -75,7 +75,11 @@ defmodule Endurant.Workflow.Tasks do
             | task_results: Map.put(current_runtime.task_results, task_key, result)
           })
 
-          emit_task(runtime, :completed, %{count: 1, duration_ms: Telemetry.duration_ms(started_at)})
+          emit_task(runtime, :completed, %{
+            count: 1,
+            duration_ms: Telemetry.duration_ms(started_at)
+          })
+
           result
         rescue
           error ->
@@ -95,16 +99,30 @@ defmodule Endurant.Workflow.Tasks do
               | task_failures: Map.put(current_failures, task_key, attempt)
             })
 
-            emit_task(runtime, :failed, %{
-              count: 1,
-              duration_ms: Telemetry.duration_ms(started_at),
-              attempt: attempt
-            }, %{error_kind: Telemetry.error_kind(format_error(error))})
+            emit_task(
+              runtime,
+              :failed,
+              %{
+                count: 1,
+                duration_ms: Telemetry.duration_ms(started_at),
+                attempt: attempt
+              },
+              %{error_kind: Telemetry.error_kind(format_error(error))}
+            )
 
             retry_or_reraise(name, task_key, attempt, opts, error, __STACKTRACE__, fun)
         catch
+          :throw, {:endurant_halt, :waiting_persisted} = signal ->
+            throw(signal)
+
           :throw, {:endurant_halt, :not_running} ->
             throw({:endurant_halt, :not_running})
+
+          :throw, {:endurant_wait, _wait_spec} = signal ->
+            throw(signal)
+
+          :throw, {:endurant_continue_as_new, _continue_as_new} = signal ->
+            throw(signal)
 
           kind, reason ->
             :ok =
@@ -123,11 +141,16 @@ defmodule Endurant.Workflow.Tasks do
               | task_failures: Map.put(current_failures, task_key, attempt)
             })
 
-            emit_task(runtime, :failed, %{
-              count: 1,
-              duration_ms: Telemetry.duration_ms(started_at),
-              attempt: attempt
-            }, %{error_kind: Telemetry.error_kind(%{kind: kind, reason: inspect(reason)})})
+            emit_task(
+              runtime,
+              :failed,
+              %{
+                count: 1,
+                duration_ms: Telemetry.duration_ms(started_at),
+                attempt: attempt
+              },
+              %{error_kind: Telemetry.error_kind(%{kind: kind, reason: inspect(reason)})}
+            )
 
             retry_or_rethrow(name, task_key, attempt, opts, kind, reason, __STACKTRACE__, fun)
         end
@@ -467,6 +490,11 @@ defmodule Endurant.Workflow.Tasks do
     :ok
   end
 
+  defp handle_async_message({:endurant_async_done, task_key, {:control, signal}}) do
+    put_async_outcomes(Map.put(async_outcomes(), task_key, {:control, signal}))
+    :ok
+  end
+
   defp handle_async_message(_message), do: :ok
 
   @spec resolve_async_outcome!(String.t()) :: term() | no_return()
@@ -487,6 +515,10 @@ defmodule Endurant.Workflow.Tasks do
           {:error, %{kind: :not_running}} ->
             cleanup_handle(task_key)
             throw({:endurant_halt, :not_running})
+
+          {:control, signal} ->
+            cleanup_handle(task_key)
+            throw(signal)
 
           {:error, reason} ->
             cleanup_handle(task_key)
@@ -639,6 +671,22 @@ defmodule Endurant.Workflow.Tasks do
               started_at
             )
         catch
+          :throw, {:endurant_halt, :waiting_persisted} = signal ->
+            send(owner, {:endurant_async_done, task_key, {:control, signal}})
+            :ok
+
+          :throw, {:endurant_halt, :not_running} = signal ->
+            send(owner, {:endurant_async_done, task_key, {:control, signal}})
+            :ok
+
+          :throw, {:endurant_wait, _wait_spec} = signal ->
+            send(owner, {:endurant_async_done, task_key, {:control, signal}})
+            :ok
+
+          :throw, {:endurant_continue_as_new, _continue_as_new} = signal ->
+            send(owner, {:endurant_async_done, task_key, {:control, signal}})
+            :ok
+
           kind, reason ->
             handle_async_failure(
               owner,
@@ -728,7 +776,13 @@ defmodule Endurant.Workflow.Tasks do
 
         if retry?(next_attempt, task_opts, failure) do
           retry_delay = retry_delay_ms(next_attempt, task_opts)
-          emit_task(telemetry_metadata, :retry, %{count: 1, delay_ms: retry_delay, attempt: next_attempt})
+
+          emit_task(telemetry_metadata, :retry, %{
+            count: 1,
+            delay_ms: retry_delay,
+            attempt: next_attempt
+          })
+
           Process.sleep(retry_delay)
 
           run_async_task(
@@ -989,7 +1043,9 @@ defmodule Endurant.Workflow.Tasks do
 
   @spec async_error_kind({:exception, Exception.t()} | {:throw, atom(), term()}) :: String.t()
   defp async_error_kind({:exception, error}), do: Telemetry.error_kind(format_error(error))
-  defp async_error_kind({:throw, kind, reason}), do: Telemetry.error_kind(%{kind: kind, reason: inspect(reason)})
+
+  defp async_error_kind({:throw, kind, reason}),
+    do: Telemetry.error_kind(%{kind: kind, reason: inspect(reason)})
 
   @spec normalize_task_name!(term()) :: String.t()
   defp normalize_task_name!(name) when is_binary(name), do: name
