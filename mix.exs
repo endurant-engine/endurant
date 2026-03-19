@@ -65,6 +65,7 @@ defmodule Endurant.MixProject do
     advanced = [
       "docs/advanced/internals.md",
       "docs/advanced/parking.md",
+      "docs/advanced/limitations.md",
       "docs/state_machine.md"
     ]
 

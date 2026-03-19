@@ -36,6 +36,51 @@ defmodule Endurant.Integration.WaitingTest do
     assert :execution_waiting in Enum.map(events, & &1.type)
   end
 
+  test("sleep inside a task rethrows workflow wait control", %{runtime_opts: runtime_opts}) do
+    workflow_module =
+      quote do
+        defmodule Endurant.Integration.WaitingTest.TaskDelayWorkflow do
+          use Endurant.Workflow, version: "1"
+
+          workflow do
+            queue("orders")
+            unique_id(fn %{id: id} -> "task-delay:#{id}" end)
+          end
+
+          @impl Endurant.Workflow
+          def run(_version, input) do
+            delayed =
+              task(input, "delay_task", fn i ->
+                sleep("task-delay:#{i["id"]}", 100)
+                %{id: i["id"], delayed: true}
+              end)
+
+            %{id: input["id"], delayed: delayed}
+          end
+        end
+      end
+
+    Code.compile_quoted(workflow_module)
+
+    assert {:ok, execution} =
+             Endurant.insert(
+               Endurant.Integration.WaitingTest.TaskDelayWorkflow,
+               %{id: "td-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
+             )
+
+    assert {:ok, %{status: :completed, result: result}} =
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
+
+    assert result == %{id: "td-1", delayed: %{id: "td-1", delayed: true}}
+
+    assert {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
+    assert :execution_waiting in Enum.map(events, & &1.type)
+    assert :task_started in Enum.map(events, & &1.type)
+    assert :task_completed in Enum.map(events, & &1.type)
+    refute :task_failed in Enum.map(events, & &1.type)
+  end
+
   test("signal-based waiting resumes when signal is written", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
@@ -78,6 +123,59 @@ defmodule Endurant.Integration.WaitingTest do
              PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
 
     assert result == %{id: "s-1", approval: %{approved: true}}
+  end
+
+  test("wait_signal inside a task rethrows workflow wait control", %{runtime_opts: runtime_opts}) do
+    workflow_module =
+      quote do
+        defmodule Endurant.Integration.WaitingTest.TaskSignalWorkflow do
+          use Endurant.Workflow, version: "1"
+
+          workflow do
+            queue("orders")
+            unique_id(fn %{id: id} -> "task-signal:#{id}" end)
+          end
+
+          @impl Endurant.Workflow
+          def run(_version, input) do
+            approval =
+              task(nil, "await_signal", fn _ ->
+                wait_signal("approval_requested")
+              end)
+
+            %{id: input["id"], approval: approval}
+          end
+        end
+      end
+
+    Code.compile_quoted(workflow_module)
+
+    assert {:ok, execution} =
+             Endurant.insert(
+               Endurant.Integration.WaitingTest.TaskSignalWorkflow,
+               %{id: "ts-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
+             )
+
+    assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
+
+    assert :ok =
+             Endurant.signal(
+               execution.id,
+               "approval_requested",
+               %{approved: true},
+               instance: Keyword.fetch!(runtime_opts, :instance)
+             )
+
+    assert {:ok, %{status: :completed, result: result}} =
+             PostgresHelper.wait_for_execution!(execution.id, 5000, runtime_opts)
+
+    assert result == %{id: "ts-1", approval: %{approved: true}}
+
+    assert {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
+    assert :task_started in Enum.map(events, & &1.type)
+    assert :task_completed in Enum.map(events, & &1.type)
+    refute :task_failed in Enum.map(events, & &1.type)
   end
 
   test("multiple same signals sent before wait are consumed in order", %{

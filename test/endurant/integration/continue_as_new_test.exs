@@ -77,7 +77,8 @@ defmodule Endurant.Integration.ContinueAsNewTest do
 
     assert :waiting = wait_for_status(new_execution_id, :waiting, 5_000, runtime_opts)
 
-    assert :ok = Endurant.signal("continue-as-new:c1", "final", %{value: "done"}, instance: instance)
+    assert :ok =
+             Endurant.signal("continue-as-new:c1", "final", %{value: "done"}, instance: instance)
 
     assert {:ok, %{status: :completed, result: result}} =
              PostgresHelper.wait_for_execution!(new_execution_id, 8_000, runtime_opts)
@@ -195,6 +196,65 @@ defmodule Endurant.Integration.ContinueAsNewTest do
              id: "c2",
              final: %{value: :done}
            }
+  end
+
+  test("continue_as_new inside a task rethrows workflow control", %{runtime_opts: runtime_opts}) do
+    workflow_module =
+      quote do
+        defmodule Endurant.Integration.ContinueAsNewTest.TaskWorkflow do
+          use Endurant.Workflow, version: "1"
+
+          workflow do
+            queue("orders")
+            unique_id(fn %{id: id} -> "continue-as-new:task:#{id}" end)
+          end
+
+          @impl Endurant.Workflow
+          def run(_version, input) do
+            if input["continued"] do
+              %{id: input["id"], continued: true}
+            else
+              task(input, "continue_task", fn i ->
+                continue_as_new(%{
+                  "id" => i["id"],
+                  "continued" => true
+                })
+              end)
+            end
+          end
+        end
+      end
+
+    Code.compile_quoted(workflow_module)
+
+    instance = Keyword.fetch!(runtime_opts, :instance)
+
+    assert {:ok, execution} =
+             Endurant.insert(
+               Endurant.Integration.ContinueAsNewTest.TaskWorkflow,
+               %{id: "ct-1"},
+               instance: instance
+             )
+
+    assert :continued_as_new =
+             wait_for_status(execution.id, :continued_as_new, 5_000, runtime_opts)
+
+    {:ok, old_events} = PostgresHelper.history(execution.id, runtime_opts)
+
+    continued_event =
+      Enum.find(old_events, &(&1.type == :execution_continued_as_new)) ||
+        flunk("missing execution_continued_as_new event")
+
+    new_execution_id =
+      payload_value(continued_event.payload, "new_execution_id") ||
+        flunk("missing new_execution_id in continue-as-new event")
+
+    assert {:ok, %{status: :completed, result: result}} =
+             PostgresHelper.wait_for_execution!(new_execution_id, 8_000, runtime_opts)
+
+    assert result == %{id: "ct-1", continued: true}
+    assert :task_started in Enum.map(old_events, & &1.type)
+    refute :task_failed in Enum.map(old_events, & &1.type)
   end
 
   @spec wait_for_status(binary(), atom(), timeout(), keyword()) :: atom()
