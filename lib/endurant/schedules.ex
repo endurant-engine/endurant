@@ -345,13 +345,13 @@ defmodule Endurant.Schedules do
   defp dispatch_one(schedule, opts) do
     outcome =
       case find_open_execution_id(schedule.unique_id, opts) do
-      nil ->
-        dispatch_or_mark(schedule, opts)
+        nil ->
+          dispatch_or_mark(schedule, opts)
 
-      _execution_id ->
-        mark_skipped(schedule.id, opts)
-        :skipped
-    end
+        _execution_id ->
+          mark_skipped(schedule.id, opts)
+          :skipped
+      end
 
     Telemetry.emit(
       [:schedule, :dispatch],
@@ -363,6 +363,7 @@ defmodule Endurant.Schedules do
   rescue
     _error ->
       mark_failed(schedule.id, opts)
+
       Telemetry.emit(
         [:schedule, :dispatch],
         %{count: 1, lag_ms: lag_ms(schedule.scheduled_at)},
@@ -611,7 +612,7 @@ defmodule Endurant.Schedules do
 
   @spec query!(module(), iodata(), list()) :: map()
   defp query!(repo, sql, params) do
-    repo.query!(sql, params, log: false)
+    Endurant.DB.query!(repo, sql, params)
   end
 
   @spec repo!(keyword()) :: module()

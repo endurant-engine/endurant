@@ -214,16 +214,17 @@ defmodule Endurant.Events do
 
   @spec query!(module(), iodata(), list()) :: map()
   defp query!(repo, sql, params) do
-    repo.query!(sql, params, log: false)
+    Endurant.DB.query!(repo, sql, params)
   end
 
   @spec do_append(module(), String.t(), binary(), String.t(), map(), keyword()) :: :ok
   defp do_append(repo, prefix, execution_id, type, payload, opts) do
     started_at = Telemetry.monotonic_time()
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn -> do_append_in_tx(repo, prefix, execution_id, type, payload) end,
-           log: false
+           opts
          ) do
       {:ok, {:ok, telemetry_context}} ->
         emit_append_telemetry(opts, payload, started_at, telemetry_context)
@@ -332,7 +333,8 @@ defmodule Endurant.Events do
     update_sql = update_execution_event_stats_sql(prefix)
     started_at = Telemetry.monotonic_time()
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
              case query!(repo, lock_sql, [execution_id, worker_id]).rows do
                [[next_event_sequence, queue, workflow_name, version]]
@@ -383,7 +385,7 @@ defmodule Endurant.Events do
                  repo.rollback(:not_running)
              end
            end,
-           log: false
+           opts
          ) do
       {:ok, telemetry_context} ->
         emit_append_telemetry(opts, payload, started_at, telemetry_context)

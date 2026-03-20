@@ -86,10 +86,7 @@ defmodule Endurant.Executions do
     workflow_name = inspect(workflow_module)
     version = Map.get(workflow, :version, "1")
 
-    case repo.transaction(
-           fn -> insert_in_tx(workflow_module, input, opts) end,
-           log: false
-         ) do
+    case Endurant.DB.transaction(repo, fn -> insert_in_tx(workflow_module, input, opts) end, opts) do
       {:ok, {:ok, _execution} = result} ->
         Telemetry.emit(
           [:execution, :inserted],
@@ -152,15 +149,20 @@ defmodule Endurant.Executions do
     RETURNING id
     """
 
-    case query!(repo, sql, [
-           execution_db_id,
-           unique_id,
-           queue,
-           workflow_name,
-           version,
-           input,
-           metadata
-         ]).rows do
+    case query!(
+           repo,
+           sql,
+           [
+             execution_db_id,
+             unique_id,
+             queue,
+             workflow_name,
+             version,
+             input,
+             metadata
+           ],
+           opts
+         ).rows do
       [[_]] ->
         :ok =
           Events.append_in_tx(
@@ -218,7 +220,7 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [execution_id]).rows do
+    case query!(repo, sql, [execution_id], opts).rows do
       [
         [
           id,
@@ -300,7 +302,7 @@ defmodule Endurant.Executions do
     LIMIT $#{next_index}
     """
 
-    query!(repo, sql, params ++ [limit]).rows
+    query!(repo, sql, params ++ [limit], opts).rows
     |> Enum.map(fn [
                      id,
                      unique_id,
@@ -412,11 +414,12 @@ defmodule Endurant.Executions do
     RETURNING e.id, e.workflow_name, e.input, e.version, candidate.status::text
     """
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
              rows =
                repo
-               |> query!(sql, [queue, limit, worker_id, lease_ms])
+               |> query!(sql, [queue, limit, worker_id, lease_ms], opts)
                |> Map.fetch!(:rows)
 
              Enum.map(rows, fn [id, workflow_name, input, version, previous_status] ->
@@ -439,7 +442,7 @@ defmodule Endurant.Executions do
                execution
              end)
            end,
-           log: false
+           opts
          ) do
       {:ok, executions} ->
         Enum.each(executions, fn execution ->
@@ -527,7 +530,7 @@ defmodule Endurant.Executions do
     RETURNING queue, workflow_name, version, inserted_at
     """
 
-    case query!(repo, sql, [execution_id, worker_id]).rows do
+    case query!(repo, sql, [execution_id, worker_id], opts).rows do
       [[queue, workflow_name, version, inserted_at]] ->
         Events.append(execution_id, :execution_started, %{worker_id: worker_id}, opts)
 
@@ -543,7 +546,7 @@ defmodule Endurant.Executions do
         :ok
 
       _ ->
-        case lock_execution_status(repo, prefix, execution_id) do
+        case lock_execution_status(repo, prefix, execution_id, opts) do
           nil ->
             {:error, :not_found}
 
@@ -612,16 +615,17 @@ defmodule Endurant.Executions do
     AND locked_until > timezone('UTC', now())
     """
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
-             case query!(repo, sql, [execution_id, worker_id]).num_rows do
+             case query!(repo, sql, [execution_id, worker_id], opts).num_rows do
                1 ->
                  Events.append(execution_id, :execution_completed, %{result: result}, opts)
 
                  apply_parent_close_policies_in_tx(repo, prefix, to_app_id(execution_id), opts)
 
                  {
-                   terminal_execution_context(repo, prefix, execution_id),
+                   terminal_execution_context(repo, prefix, execution_id, opts),
                    maybe_record_child_terminal_event(
                      to_app_id(execution_id),
                      :child_execution_completed,
@@ -634,7 +638,7 @@ defmodule Endurant.Executions do
                  repo.rollback(:not_running)
              end
            end,
-           log: false
+           opts
          ) do
       {:ok, {execution_context, child_metric}} ->
         Telemetry.emit(
@@ -712,16 +716,17 @@ defmodule Endurant.Executions do
     AND locked_until > timezone('UTC', now())
     """
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
-             case query!(repo, sql, [execution_id, worker_id]).num_rows do
+             case query!(repo, sql, [execution_id, worker_id], opts).num_rows do
                1 ->
                  Events.append(execution_id, :execution_failed, %{error: error}, opts)
 
                  apply_parent_close_policies_in_tx(repo, prefix, to_app_id(execution_id), opts)
 
                  {
-                   terminal_execution_context(repo, prefix, execution_id),
+                   terminal_execution_context(repo, prefix, execution_id, opts),
                    maybe_record_child_terminal_event(
                      to_app_id(execution_id),
                      :child_execution_failed,
@@ -734,7 +739,7 @@ defmodule Endurant.Executions do
                  repo.rollback(:not_running)
              end
            end,
-           log: false
+           opts
          ) do
       {:ok, {execution_context, child_metric}} ->
         Telemetry.emit(
@@ -773,10 +778,17 @@ defmodule Endurant.Executions do
     signal_queues = Map.get(continue_as_new, :signal_queues, %{})
     first_execution_id = Map.get(continue_as_new, :first_execution_id)
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
              with {:ok, current} <-
-                    fetch_running_execution_for_continue(repo, prefix, execution_id, worker_id) do
+                    fetch_running_execution_for_continue(
+                      repo,
+                      prefix,
+                      execution_id,
+                      worker_id,
+                      opts
+                    ) do
                first_execution_id =
                  if is_binary(first_execution_id) and first_execution_id != "" do
                    first_execution_id
@@ -798,13 +810,20 @@ defmodule Endurant.Executions do
                      execution_id,
                      loaded_signal_seq,
                      repo,
-                     prefix
+                     prefix,
+                     opts
                    )
                  else
                    %{}
                  end
 
-               case update_execution_for_continue(repo, prefix, execution_id, worker_id).num_rows do
+               case update_execution_for_continue(
+                      repo,
+                      prefix,
+                      execution_id,
+                      worker_id,
+                      opts
+                    ).num_rows do
                  1 ->
                    next_execution_id = Ecto.UUID.generate()
 
@@ -816,7 +835,8 @@ defmodule Endurant.Executions do
                           next_input,
                           next_version,
                           worker_id,
-                          lease_ms
+                          lease_ms,
+                          opts
                         ) do
                      {:ok, next_execution} ->
                        Events.append(
@@ -891,7 +911,7 @@ defmodule Endurant.Executions do
                  repo.rollback(reason)
              end
            end,
-           log: false
+           opts
          ) do
       {:ok, next_execution} ->
         Telemetry.emit(
@@ -971,7 +991,7 @@ defmodule Endurant.Executions do
     AND locked_until > timezone('UTC', now())
     """
 
-    case query!(repo, sql, [execution_id, worker_id, waiting_until]).num_rows do
+    case query!(repo, sql, [execution_id, worker_id, waiting_until], opts).num_rows do
       1 -> :ok
       _ -> {:error, :not_running}
     end
@@ -1023,9 +1043,10 @@ defmodule Endurant.Executions do
     AND locked_until > timezone('UTC', now())
     """
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
-             case query!(repo, sql, [execution_id_db, worker_id]).num_rows do
+             case query!(repo, sql, [execution_id_db, worker_id], opts).num_rows do
                1 ->
                  Events.append(
                    execution_id,
@@ -1034,13 +1055,13 @@ defmodule Endurant.Executions do
                    opts
                  )
 
-                 basic_execution_context(repo, prefix, execution_id_db)
+                 basic_execution_context(repo, prefix, execution_id_db, opts)
 
                _ ->
                  repo.rollback(:not_running)
              end
            end,
-           log: false
+           opts
          ) do
       {:ok, execution_context} ->
         Telemetry.emit(
@@ -1104,14 +1125,15 @@ defmodule Endurant.Executions do
     WHERE id = $1
     """
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
-             case query!(repo, lock_sql, [execution_id_db, worker_id]).rows do
+             case query!(repo, lock_sql, [execution_id_db, worker_id], opts).rows do
                [[queue, workflow_name, version]] ->
-                 if child_terminal_event_recorded?(execution_id_db, child_key, repo, prefix) do
+                 if child_terminal_event_recorded?(execution_id_db, child_key, repo, prefix, opts) do
                    :already_resolved
                  else
-                   case query!(repo, update_sql, [execution_id_db]).num_rows do
+                   case query!(repo, update_sql, [execution_id_db], opts).num_rows do
                      1 ->
                        Events.append(
                          execution_id,
@@ -1136,7 +1158,7 @@ defmodule Endurant.Executions do
                  repo.rollback(:not_running)
              end
            end,
-           log: false
+           opts
          ) do
       {:ok, :already_resolved} ->
         :already_resolved
@@ -1203,9 +1225,10 @@ defmodule Endurant.Executions do
     AND locked_until > timezone('UTC', now())
     """
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
-             case query!(repo, sql, [execution_id_db, worker_id, waiting_until]).num_rows do
+             case query!(repo, sql, [execution_id_db, worker_id, waiting_until], opts).num_rows do
                1 ->
                  Events.append(
                    execution_id,
@@ -1219,13 +1242,13 @@ defmodule Endurant.Executions do
                    opts
                  )
 
-                 basic_execution_context(repo, prefix, execution_id_db)
+                 basic_execution_context(repo, prefix, execution_id_db, opts)
 
                _ ->
                  repo.rollback(:not_running)
              end
            end,
-           log: false
+           opts
          ) do
       {:ok, execution_context} ->
         Telemetry.emit(
@@ -1276,7 +1299,8 @@ defmodule Endurant.Executions do
     prefix = Keyword.get(opts, :prefix, @default_prefix)
     execution_id_db = to_db_id(execution_id)
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
              sql = """
              WITH locked_execution AS (
@@ -1305,7 +1329,7 @@ defmodule Endurant.Executions do
                locked_execution.version
              """
 
-             case query!(repo, sql, [execution_id_db, worker_id]).rows do
+             case query!(repo, sql, [execution_id_db, worker_id], opts).rows do
                [[locked_until, previous_status, queue, workflow_name, version]] ->
                  abandoned_at =
                    case locked_until do
@@ -1340,7 +1364,7 @@ defmodule Endurant.Executions do
                  repo.rollback(:not_running)
              end
            end,
-           log: false
+           opts
          ) do
       {:ok, execution_context} ->
         Telemetry.emit(
@@ -1415,7 +1439,8 @@ defmodule Endurant.Executions do
     queue = normalize_queue(queue)
     branch_order = claim_ready_branch_order(opts)
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
              {rows, _remaining} =
                Enum.reduce(branch_order, {[], limit}, fn branch, {acc, remaining} ->
@@ -1425,7 +1450,7 @@ defmodule Endurant.Executions do
                    sql = claim_ready_waiting_sql(prefix, branch)
 
                    branch_rows =
-                     query!(repo, sql, [queue, remaining, worker_id, lease_ms]).rows
+                     query!(repo, sql, [queue, remaining, worker_id, lease_ms], opts).rows
                      |> Enum.map(&{branch, &1})
 
                    {acc ++ branch_rows, max(remaining - length(branch_rows), 0)}
@@ -1449,7 +1474,7 @@ defmodule Endurant.Executions do
                execution
              end)
            end,
-           log: false
+           opts
          ) do
       {:ok, executions} ->
         Enum.each(executions, fn execution ->
@@ -1536,12 +1561,12 @@ defmodule Endurant.Executions do
     AND locked_until > timezone('UTC', now())
     """
 
-    case query!(repo, sql, [execution_id, worker_id, lease_ms]).num_rows do
+    case query!(repo, sql, [execution_id, worker_id, lease_ms], opts).num_rows do
       1 ->
         :ok
 
       _ ->
-        case lock_execution_status(repo, prefix, execution_id) do
+        case lock_execution_status(repo, prefix, execution_id, opts) do
           nil -> {:error, :not_found}
           status when status in [:waiting, :continuable] -> {:error, :lock_expired}
           _ -> {:error, :cancelled}
@@ -1583,7 +1608,7 @@ defmodule Endurant.Executions do
     RETURNING queue, workflow_name, version
     """
 
-    case query!(repo, sql, [execution_id]).rows do
+    case query!(repo, sql, [execution_id], opts).rows do
       [[queue, workflow_name, version]] ->
         Telemetry.emit(
           [:execution, :continuable],
@@ -1672,7 +1697,7 @@ defmodule Endurant.Executions do
     RETURNING status::text
     """
 
-    case query!(repo, sql, [execution_id, worker_id, lease_ms]).rows do
+    case query!(repo, sql, [execution_id, worker_id, lease_ms], opts).rows do
       [["cancelling"]] -> {:error, :cancelled}
       [[_status]] -> :ok
       _ -> {:error, :lock_lost}
@@ -1718,7 +1743,8 @@ defmodule Endurant.Executions do
     queue = opts |> Keyword.get(:queue) |> normalize_queue_option()
 
     telemetry =
-      repo.transaction(
+      Endurant.DB.transaction(
+        repo,
         fn ->
           clear_waiting_locks_sql = """
           WITH expired_waiting AS (
@@ -1746,7 +1772,7 @@ defmodule Endurant.Executions do
             RETURNING e.id, expired_waiting.locked_until
           """
 
-          cleared_waiting_rows = query!(repo, clear_waiting_locks_sql, [queue, limit]).rows
+          cleared_waiting_rows = query!(repo, clear_waiting_locks_sql, [queue, limit], opts).rows
 
           Enum.each(cleared_waiting_rows, fn [id, locked_until] ->
             abandoned_at =
@@ -1791,7 +1817,7 @@ defmodule Endurant.Executions do
           RETURNING e.id, e.queue, e.workflow_name, e.version, e.inserted_at
           """
 
-          cancelled_rows = query!(repo, expire_cancelling_sql, [queue, limit]).rows
+          cancelled_rows = query!(repo, expire_cancelling_sql, [queue, limit], opts).rows
 
           cancelled_telemetry =
             Enum.map(cancelled_rows, fn [id, queue_name, workflow_name, version, inserted_at] ->
@@ -1815,7 +1841,7 @@ defmodule Endurant.Executions do
                 sql = recover_runnable_sql(prefix, branch)
 
                 branch_rows =
-                  query!(repo, sql, [queue, remaining]).rows
+                  query!(repo, sql, [queue, remaining], opts).rows
                   |> Enum.map(&{branch, &1})
 
                 {acc ++ branch_rows, max(remaining - length(branch_rows), 0)}
@@ -1854,7 +1880,7 @@ defmodule Endurant.Executions do
 
           %{cancelled: cancelled_telemetry, recovered: Enum.reverse(recovered_telemetry)}
         end,
-        log: false
+        opts
       )
       |> case do
         {:ok, telemetry} -> telemetry
@@ -2155,11 +2181,12 @@ defmodule Endurant.Executions do
     signal_name = normalize_signal(signal)
     wait_signal_key = signal_name
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
-             case resolve_signal_target(repo, prefix, signal_target) do
+             case resolve_signal_target(repo, prefix, signal_target, opts) do
                nil ->
-                 repo.rollback(signal_target_not_found_reason(repo, prefix, signal_target))
+                 repo.rollback(signal_target_not_found_reason(repo, prefix, signal_target, opts))
 
                execution
                when execution.status in [:pending, :running, :waiting, :continuable, :abandoned] ->
@@ -2176,7 +2203,8 @@ defmodule Endurant.Executions do
                        to_db_id(execution.id),
                        wait_signal_key,
                        repo,
-                       prefix
+                       prefix,
+                       opts
                      )
 
                  if wakeup do
@@ -2189,7 +2217,7 @@ defmodule Endurant.Executions do
                  repo.rollback(:not_active)
              end
            end,
-           log: false
+           opts
          ) do
       {:ok, %{execution: execution, wakeup: wakeup}} ->
         Telemetry.emit(
@@ -2280,9 +2308,10 @@ defmodule Endurant.Executions do
     prefix = Keyword.get(opts, :prefix, @default_prefix)
     execution_id = to_db_id(execution_id)
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
-             case lock_execution(repo, prefix, execution_id) do
+             case lock_execution(repo, prefix, execution_id, opts) do
                nil ->
                  repo.rollback(:not_found)
 
@@ -2308,7 +2337,7 @@ defmodule Endurant.Executions do
                  repo.rollback(:not_active)
              end
            end,
-           log: false
+           opts
          ) do
       {:ok, {state, execution}} ->
         if state in [:running, :finalize_now] and execution do
@@ -2358,9 +2387,10 @@ defmodule Endurant.Executions do
     prefix = Keyword.get(opts, :prefix, @default_prefix)
     execution_id = to_db_id(execution_id)
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
-             case lock_execution(repo, prefix, execution_id) do
+             case lock_execution(repo, prefix, execution_id, opts) do
                nil ->
                  nil
 
@@ -2374,7 +2404,7 @@ defmodule Endurant.Executions do
                  repo.rollback(:invalid_transition)
              end
            end,
-           log: false
+           opts
          ) do
       {:ok, nil} ->
         :ok
@@ -2420,7 +2450,7 @@ defmodule Endurant.Executions do
     )
     """
 
-    case query!(repo, sql, [execution_id]).num_rows do
+    case query!(repo, sql, [execution_id], opts).num_rows do
       1 -> Events.append(execution_id, :cancel_requested, %{}, opts)
       _ -> :ok
     end
@@ -2444,14 +2474,14 @@ defmodule Endurant.Executions do
     RETURNING id
     """
 
-    case query!(repo, sql, [execution_id]).rows do
+    case query!(repo, sql, [execution_id], opts).rows do
       [[_id]] ->
         Events.append(execution_id, :execution_cancelled, %{}, opts)
 
         apply_parent_close_policies_in_tx(repo, prefix, to_app_id(execution_id), opts)
 
         {
-          terminal_execution_context(repo, prefix, execution_id),
+          terminal_execution_context(repo, prefix, execution_id, opts),
           maybe_record_child_terminal_event(
             to_app_id(execution_id),
             :child_execution_cancelled,
@@ -2505,7 +2535,7 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [execution_id]).rows do
+    case query!(repo, sql, [execution_id], opts).rows do
       [[status, true]] when status in ["waiting", "continuable"] -> true
       _ -> false
     end
@@ -2546,7 +2576,7 @@ defmodule Endurant.Executions do
       )
       """
 
-      query!(repo, sql, Enum.reverse(params)).rows
+      query!(repo, sql, Enum.reverse(params), opts).rows
       |> Enum.reduce(MapSet.new(), fn [id], acc ->
         MapSet.put(acc, to_app_id(id))
       end)
@@ -2950,9 +2980,9 @@ defmodule Endurant.Executions do
           "#{inspect(filter_key)} must be DateTime, NaiveDateTime, or ISO8601 string, got: #{inspect(other)}"
   end
 
-  @spec query!(module(), iodata(), list()) :: map()
-  defp query!(repo, sql, params) do
-    repo.query!(sql, params, log: false)
+  @spec query!(module(), iodata(), list(), keyword()) :: map()
+  defp query!(repo, sql, params, opts) do
+    Endurant.DB.query!(repo, sql, params, opts)
   end
 
   @spec repo!(keyword()) :: module()
@@ -2966,7 +2996,7 @@ defmodule Endurant.Executions do
     execution_id_db = to_db_id(execution_id)
 
     repo
-    |> open_task_runs(prefix, execution_id_db)
+    |> open_task_runs(prefix, execution_id_db, opts)
     |> Enum.each(fn %{task: task, task_run_id: task_run_id} ->
       Events.append(
         execution_id,
@@ -2984,10 +3014,10 @@ defmodule Endurant.Executions do
     )
   end
 
-  @spec open_task_runs(module(), String.t(), binary()) :: [
+  @spec open_task_runs(module(), String.t(), binary(), keyword()) :: [
           %{task: String.t(), task_run_id: String.t()}
         ]
-  defp open_task_runs(repo, prefix, execution_id) do
+  defp open_task_runs(repo, prefix, execution_id, opts) do
     sql = """
     SELECT type::text, payload
     FROM #{prefix}.endurant_events
@@ -2997,7 +3027,7 @@ defmodule Endurant.Executions do
     """
 
     repo
-    |> query!(sql, [execution_id])
+    |> query!(sql, [execution_id], opts)
     |> Map.fetch!(:rows)
     |> Enum.reduce(%{}, fn [type, payload], acc ->
       case {type, payload_task(payload), payload_task_run_id(payload)} do
@@ -3049,8 +3079,8 @@ defmodule Endurant.Executions do
     )
   end
 
-  @spec basic_execution_context(module(), String.t(), binary()) :: map()
-  defp basic_execution_context(repo, prefix, execution_id) do
+  @spec basic_execution_context(module(), String.t(), binary(), keyword()) :: map()
+  defp basic_execution_context(repo, prefix, execution_id, opts) do
     sql = """
     SELECT queue, workflow_name, version
     FROM #{prefix}.endurant_executions
@@ -3058,7 +3088,7 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [execution_id]).rows do
+    case query!(repo, sql, [execution_id], opts).rows do
       [[queue, workflow_name, version]] ->
         %{queue: queue, workflow: workflow_name, version: version}
 
@@ -3067,8 +3097,8 @@ defmodule Endurant.Executions do
     end
   end
 
-  @spec terminal_execution_context(module(), String.t(), binary()) :: map()
-  defp terminal_execution_context(repo, prefix, execution_id) do
+  @spec terminal_execution_context(module(), String.t(), binary(), keyword()) :: map()
+  defp terminal_execution_context(repo, prefix, execution_id, opts) do
     sql = """
     SELECT queue, workflow_name, version, inserted_at, next_event_sequence, history_size_bytes
     FROM #{prefix}.endurant_executions
@@ -3076,7 +3106,7 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [execution_id]).rows do
+    case query!(repo, sql, [execution_id], opts).rows do
       [[queue, workflow_name, version, inserted_at, next_event_sequence, history_size_bytes]] ->
         %{
           queue: queue,
@@ -3131,9 +3161,10 @@ defmodule Endurant.Executions do
          opts
        ) do
     parent_context =
-      basic_execution_context(repo, prefix, to_db_id(child_context.parent_execution_id))
+      basic_execution_context(repo, prefix, to_db_id(child_context.parent_execution_id), opts)
 
-    child_execution_context = basic_execution_context(repo, prefix, to_db_id(child_execution_id))
+    child_execution_context =
+      basic_execution_context(repo, prefix, to_db_id(child_execution_id), opts)
 
     metadata =
       execution_metadata(
@@ -3253,16 +3284,16 @@ defmodule Endurant.Executions do
   defp maybe_naive(nil), do: nil
   defp maybe_naive(%DateTime{} = dt), do: DateTime.to_naive(dt)
 
-  @spec lock_execution_status(module(), String.t(), binary()) :: atom() | nil
-  defp lock_execution_status(repo, prefix, execution_id) do
-    case lock_execution(repo, prefix, execution_id) do
+  @spec lock_execution_status(module(), String.t(), binary(), keyword()) :: atom() | nil
+  defp lock_execution_status(repo, prefix, execution_id, opts) do
+    case lock_execution(repo, prefix, execution_id, opts) do
       %{status: status} -> status
       nil -> nil
     end
   end
 
-  @spec lock_execution(module(), String.t(), binary()) :: map() | nil
-  defp lock_execution(repo, prefix, execution_id) do
+  @spec lock_execution(module(), String.t(), binary(), keyword()) :: map() | nil
+  defp lock_execution(repo, prefix, execution_id, opts) do
     sql = """
     SELECT id, unique_id, status::text, queue, workflow_name, version, metadata
     FROM #{prefix}.endurant_executions
@@ -3271,7 +3302,7 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [execution_id]).rows do
+    case query!(repo, sql, [execution_id], opts).rows do
       [[id, unique_id, status, queue, workflow_name, version, metadata]] ->
         %{
           id: to_app_id(id),
@@ -3295,9 +3326,15 @@ defmodule Endurant.Executions do
   @spec normalize_signal(String.t()) :: String.t()
   defp normalize_signal(signal) when is_binary(signal), do: signal
 
-  @spec fetch_running_execution_for_continue(module(), String.t(), binary(), String.t()) ::
+  @spec fetch_running_execution_for_continue(
+          module(),
+          String.t(),
+          binary(),
+          String.t(),
+          keyword()
+        ) ::
           {:ok, map()} | {:error, :not_running | :cancelled}
-  defp fetch_running_execution_for_continue(repo, prefix, execution_id, worker_id) do
+  defp fetch_running_execution_for_continue(repo, prefix, execution_id, worker_id, opts) do
     sql = """
     SELECT id, unique_id, queue, workflow_name, version, metadata
     FROM #{prefix}.endurant_executions
@@ -3310,7 +3347,7 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [execution_id, worker_id]).rows do
+    case query!(repo, sql, [execution_id, worker_id], opts).rows do
       [[id, unique_id, queue, workflow_name, version, metadata]] ->
         {:ok,
          %{
@@ -3323,7 +3360,7 @@ defmodule Endurant.Executions do
          }}
 
       _ ->
-        case lock_execution_status(repo, prefix, execution_id) do
+        case lock_execution_status(repo, prefix, execution_id, opts) do
           status when status in [:cancelling, :cancelled] -> {:error, :cancelled}
           _ -> {:error, :not_running}
         end
@@ -3338,7 +3375,8 @@ defmodule Endurant.Executions do
           map(),
           String.t(),
           String.t(),
-          pos_integer()
+          pos_integer(),
+          keyword()
         ) ::
           {:ok, execution()} | {:error, term()}
   defp insert_continued_execution(
@@ -3349,7 +3387,8 @@ defmodule Endurant.Executions do
          input,
          version,
          worker_id,
-         lease_ms
+         lease_ms,
+         opts
        ) do
     execution_db_id = to_db_id(next_execution_id)
 
@@ -3374,17 +3413,22 @@ defmodule Endurant.Executions do
     RETURNING id
     """
 
-    case query!(repo, sql, [
-           execution_db_id,
-           current.unique_id,
-           current.queue,
-           current.workflow,
-           version,
-           input,
-           Map.get(current, :metadata, %{}),
-           worker_id,
-           lease_ms
-         ]).rows do
+    case query!(
+           repo,
+           sql,
+           [
+             execution_db_id,
+             current.unique_id,
+             current.queue,
+             current.workflow,
+             version,
+             input,
+             Map.get(current, :metadata, %{}),
+             worker_id,
+             lease_ms
+           ],
+           opts
+         ).rows do
       [[_id]] ->
         {:ok,
          %{
@@ -3402,8 +3446,9 @@ defmodule Endurant.Executions do
     end
   end
 
-  @spec update_execution_for_continue(module(), String.t(), binary(), String.t()) :: map()
-  defp update_execution_for_continue(repo, prefix, execution_id, worker_id) do
+  @spec update_execution_for_continue(module(), String.t(), binary(), String.t(), keyword()) ::
+          map()
+  defp update_execution_for_continue(repo, prefix, execution_id, worker_id, opts) do
     sql = """
     UPDATE #{prefix}.endurant_executions
     SET
@@ -3419,11 +3464,12 @@ defmodule Endurant.Executions do
     AND locked_until > timezone('UTC', now())
     """
 
-    query!(repo, sql, [execution_id, worker_id])
+    query!(repo, sql, [execution_id, worker_id], opts)
   end
 
-  @spec merge_late_signals(map(), binary(), non_neg_integer(), module(), String.t()) :: map()
-  defp merge_late_signals(signal_queues, execution_id, loaded_signal_seq, repo, prefix) do
+  @spec merge_late_signals(map(), binary(), non_neg_integer(), module(), String.t(), keyword()) ::
+          map()
+  defp merge_late_signals(signal_queues, execution_id, loaded_signal_seq, repo, prefix, opts) do
     sql = """
     SELECT payload
     FROM #{prefix}.endurant_events
@@ -3433,7 +3479,7 @@ defmodule Endurant.Executions do
     ORDER BY sequence ASC
     """
 
-    Enum.reduce(query!(repo, sql, [execution_id, loaded_signal_seq]).rows, signal_queues, fn
+    Enum.reduce(query!(repo, sql, [execution_id, loaded_signal_seq], opts).rows, signal_queues, fn
       [%{"signal" => signal, "payload" => payload}], acc ->
         enqueue_signal_payload(acc, signal, payload)
 
@@ -3458,22 +3504,23 @@ defmodule Endurant.Executions do
     end)
   end
 
-  @spec resolve_signal_target(module(), String.t(), binary()) :: map() | nil
-  defp resolve_signal_target(repo, prefix, execution_or_unique_id) do
+  @spec resolve_signal_target(module(), String.t(), binary(), keyword()) :: map() | nil
+  defp resolve_signal_target(repo, prefix, execution_or_unique_id, opts) do
     case maybe_to_db_id(execution_or_unique_id) do
       {:ok, execution_id} ->
-        case lock_execution(repo, prefix, execution_id) do
-          nil -> lock_open_execution_by_unique_id(repo, prefix, execution_or_unique_id)
+        case lock_execution(repo, prefix, execution_id, opts) do
+          nil -> lock_open_execution_by_unique_id(repo, prefix, execution_or_unique_id, opts)
           execution -> execution
         end
 
       :error ->
-        lock_open_execution_by_unique_id(repo, prefix, execution_or_unique_id)
+        lock_open_execution_by_unique_id(repo, prefix, execution_or_unique_id, opts)
     end
   end
 
-  @spec signal_target_not_found_reason(module(), String.t(), binary()) :: :not_found | :not_active
-  defp signal_target_not_found_reason(repo, prefix, unique_id) do
+  @spec signal_target_not_found_reason(module(), String.t(), binary(), keyword()) ::
+          :not_found | :not_active
+  defp signal_target_not_found_reason(repo, prefix, unique_id, opts) do
     sql = """
     SELECT status::text
     FROM #{prefix}.endurant_executions
@@ -3482,7 +3529,7 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [unique_id]).rows do
+    case query!(repo, sql, [unique_id], opts).rows do
       [[status]] when status in ["completed", "failed", "cancelled", "continued_as_new"] ->
         :not_active
 
@@ -3491,8 +3538,9 @@ defmodule Endurant.Executions do
     end
   end
 
-  @spec lock_open_execution_by_unique_id(module(), String.t(), binary()) :: map() | nil
-  defp lock_open_execution_by_unique_id(repo, prefix, unique_id) do
+  @spec lock_open_execution_by_unique_id(module(), String.t(), binary(), keyword()) ::
+          map() | nil
+  defp lock_open_execution_by_unique_id(repo, prefix, unique_id, opts) do
     sql = """
     SELECT id, unique_id, status::text, queue, workflow_name, version
     FROM #{prefix}.endurant_executions
@@ -3510,7 +3558,7 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [unique_id]).rows do
+    case query!(repo, sql, [unique_id], opts).rows do
       [[id, open_unique_id, status, queue, workflow_name, version]] ->
         %{
           id: to_app_id(id),
@@ -3526,8 +3574,9 @@ defmodule Endurant.Executions do
     end
   end
 
-  @spec latest_wait_signal_matches?(binary(), String.t(), module(), String.t()) :: boolean()
-  defp latest_wait_signal_matches?(execution_id, signal_key, repo, prefix) do
+  @spec latest_wait_signal_matches?(binary(), String.t(), module(), String.t(), keyword()) ::
+          boolean()
+  defp latest_wait_signal_matches?(execution_id, signal_key, repo, prefix, opts) do
     sql = """
     SELECT payload
     FROM #{prefix}.endurant_events
@@ -3537,15 +3586,16 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [execution_id]).rows do
+    case query!(repo, sql, [execution_id], opts).rows do
       [[%{"mode" => "signal", "signal" => ^signal_key}]] -> true
       [[%{mode: :signal, signal: ^signal_key}]] -> true
       _ -> false
     end
   end
 
-  @spec latest_wait_child_matches?(binary(), String.t(), module(), String.t()) :: boolean()
-  defp latest_wait_child_matches?(execution_id, child_key, repo, prefix) do
+  @spec latest_wait_child_matches?(binary(), String.t(), module(), String.t(), keyword()) ::
+          boolean()
+  defp latest_wait_child_matches?(execution_id, child_key, repo, prefix, opts) do
     sql = """
     SELECT payload
     FROM #{prefix}.endurant_events
@@ -3555,15 +3605,16 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [execution_id]).rows do
+    case query!(repo, sql, [execution_id], opts).rows do
       [[%{"mode" => "child", "child_key" => ^child_key}]] -> true
       [[%{mode: :child, child_key: ^child_key}]] -> true
       _ -> false
     end
   end
 
-  @spec child_terminal_event_recorded?(binary(), String.t(), module(), String.t()) :: boolean()
-  defp child_terminal_event_recorded?(execution_id, child_key, repo, prefix) do
+  @spec child_terminal_event_recorded?(binary(), String.t(), module(), String.t(), keyword()) ::
+          boolean()
+  defp child_terminal_event_recorded?(execution_id, child_key, repo, prefix, opts) do
     sql = """
     SELECT 1
     FROM #{prefix}.endurant_events
@@ -3577,7 +3628,7 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    match?(%{rows: [[1]]}, query!(repo, sql, [execution_id, child_key]))
+    match?(%{rows: [[1]]}, query!(repo, sql, [execution_id, child_key], opts))
   end
 
   @spec maybe_record_child_terminal_event(binary(), atom(), map(), keyword()) :: map() | nil
@@ -3585,12 +3636,12 @@ defmodule Endurant.Executions do
     repo = repo!(opts)
     prefix = Keyword.get(opts, :prefix, @default_prefix)
 
-    case child_parent_context(child_execution_id, repo, prefix) do
+    case child_parent_context(child_execution_id, repo, prefix, opts) do
       nil ->
         nil
 
       child_context ->
-        if lock_open_parent_execution(child_context.parent_execution_id, repo, prefix) do
+        if lock_open_parent_execution(child_context.parent_execution_id, repo, prefix, opts) do
           child_metric =
             child_metric_context(
               repo,
@@ -3618,7 +3669,8 @@ defmodule Endurant.Executions do
                to_db_id(child_context.parent_execution_id),
                child_context.parent_child_key,
                repo,
-               prefix
+               prefix,
+               opts
              ) do
             mark_continuable(child_context.parent_execution_id, opts)
           end
@@ -3631,7 +3683,7 @@ defmodule Endurant.Executions do
   @spec apply_parent_close_policies_in_tx(module(), String.t(), binary(), keyword()) :: :ok
   defp apply_parent_close_policies_in_tx(repo, prefix, parent_execution_id, opts) do
     parent_execution_id
-    |> list_open_child_executions_in_tx(repo, prefix)
+    |> list_open_child_executions_in_tx(repo, prefix, opts)
     |> Enum.each(fn child ->
       if child.parent_close_policy == "request_cancel" do
         _ = request_cancel_in_tx(repo, prefix, child.execution_id, opts)
@@ -3641,8 +3693,8 @@ defmodule Endurant.Executions do
     :ok
   end
 
-  @spec lock_open_parent_execution(binary(), module(), String.t()) :: boolean()
-  defp lock_open_parent_execution(parent_execution_id, repo, prefix) do
+  @spec lock_open_parent_execution(binary(), module(), String.t(), keyword()) :: boolean()
+  defp lock_open_parent_execution(parent_execution_id, repo, prefix, opts) do
     sql = """
     SELECT 1
     FROM #{prefix}.endurant_executions
@@ -3659,14 +3711,14 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [to_db_id(parent_execution_id)]).rows do
+    case query!(repo, sql, [to_db_id(parent_execution_id)], opts).rows do
       [[1]] -> true
       _ -> false
     end
   end
 
-  @spec child_parent_context(binary(), module(), String.t()) :: map() | nil
-  defp child_parent_context(child_execution_id, repo, prefix) do
+  @spec child_parent_context(binary(), module(), String.t(), keyword()) :: map() | nil
+  defp child_parent_context(child_execution_id, repo, prefix, opts) do
     sql = """
     SELECT unique_id, metadata
     FROM #{prefix}.endurant_executions
@@ -3674,7 +3726,7 @@ defmodule Endurant.Executions do
     LIMIT 1
     """
 
-    case query!(repo, sql, [to_db_id(child_execution_id)]).rows do
+    case query!(repo, sql, [to_db_id(child_execution_id)], opts).rows do
       [[child_unique_id, metadata]] ->
         metadata = metadata || %{}
 
@@ -3703,8 +3755,8 @@ defmodule Endurant.Executions do
     end
   end
 
-  @spec list_open_child_executions_in_tx(binary(), module(), String.t()) :: [map()]
-  defp list_open_child_executions_in_tx(parent_execution_id, repo, prefix) do
+  @spec list_open_child_executions_in_tx(binary(), module(), String.t(), keyword()) :: [map()]
+  defp list_open_child_executions_in_tx(parent_execution_id, repo, prefix, opts) do
     sql = """
     SELECT
       id,
@@ -3723,7 +3775,7 @@ defmodule Endurant.Executions do
     FOR UPDATE
     """
 
-    query!(repo, sql, [parent_execution_id]).rows
+    query!(repo, sql, [parent_execution_id], opts).rows
     |> Enum.map(fn [id, status, parent_close_policy] ->
       %{
         execution_id: to_app_id(id),
@@ -3737,7 +3789,7 @@ defmodule Endurant.Executions do
   defp request_cancel_in_tx(repo, prefix, execution_id, opts) do
     execution_id_db = to_db_id(execution_id)
 
-    case lock_execution(repo, prefix, execution_id_db) do
+    case lock_execution(repo, prefix, execution_id_db, opts) do
       nil ->
         :ok
 

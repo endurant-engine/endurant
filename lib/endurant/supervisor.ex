@@ -103,6 +103,7 @@ defmodule Endurant.Supervisor do
       archiver: archiver,
       archiver_module: module,
       archiver_opts: Keyword.drop(archiver_opts, worker_keys),
+      db_log: config.db_log,
       repo: config.repo,
       prefix: config.prefix
     ]
@@ -132,6 +133,7 @@ defmodule Endurant.Supervisor do
   defp pruner_opts(%Config{} = config) do
     [
       instance: config.name,
+      db_log: config.db_log,
       repo: config.repo,
       prefix: config.prefix
     ]

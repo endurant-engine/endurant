@@ -87,7 +87,7 @@ defmodule Endurant.ArchiveWorker do
       batch_size: batch_size,
       archiver_module: archiver_module,
       archiver_opts: archiver_opts,
-      runtime_opts: [repo: repo, prefix: prefix]
+      runtime_opts: [repo: repo, prefix: prefix, db_log: Keyword.get(opts, :db_log, false)]
     }
 
     {:ok, state, {:continue, :acquire}}
@@ -371,7 +371,12 @@ defmodule Endurant.ArchiveWorker do
     """
 
     rows =
-      repo.query!(sql, [state.archiver | cursor_params] ++ [state.batch_size], log: false).rows
+      Endurant.DB.query!(
+        repo,
+        sql,
+        [state.archiver | cursor_params] ++ [state.batch_size],
+        state.runtime_opts
+      ).rows
 
     {:ok, Enum.map(rows, &execution_batch_row/1)}
   rescue
@@ -402,7 +407,7 @@ defmodule Endurant.ArchiveWorker do
     """
 
     events_by_execution =
-      repo.query!(sql, Enum.reverse(params), log: false).rows
+      Endurant.DB.query!(repo, sql, Enum.reverse(params), state.runtime_opts).rows
       |> Enum.map(&event_row/1)
       |> Enum.group_by(& &1.execution_id)
 
@@ -434,7 +439,7 @@ defmodule Endurant.ArchiveWorker do
     ON CONFLICT (backend, execution_id) DO NOTHING
     """
 
-    _ = repo.query!(sql, Enum.reverse(params), log: false)
+    _ = Endurant.DB.query!(repo, sql, Enum.reverse(params), state.runtime_opts)
     :ok
   rescue
     DBConnection.ConnectionError -> {:error, :transient_db}

@@ -56,6 +56,7 @@ def start(_type, _args) do
         {Endurant, :start_link,
          [[
            repo: MyApp.Repo,
+           db_log: false,
            queues: [
              orders: [
                concurrency: 10,
@@ -70,3 +71,6 @@ def start(_type, _args) do
   Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
 end
 ```
+
+`db_log` defaults to `false`. Set it to `true` or a Logger level like `:debug`
+or `:info` if you want Endurant-issued database queries logged.

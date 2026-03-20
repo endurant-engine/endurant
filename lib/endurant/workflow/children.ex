@@ -360,10 +360,14 @@ defmodule Endurant.Workflow.Children do
     FOR UPDATE
     """
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
-             case repo.query!(lock_sql, [to_db_id(runtime.execution_id), runtime.worker_id],
-                    log: false
+             case Endurant.DB.query!(
+                    repo,
+                    lock_sql,
+                    [to_db_id(runtime.execution_id), runtime.worker_id],
+                    runtime.opts
                   ).rows do
                [[1]] ->
                  case Executions.insert_in_tx(
@@ -409,7 +413,7 @@ defmodule Endurant.Workflow.Children do
                  repo.rollback(:not_running)
              end
            end,
-           log: false
+           runtime.opts
          ) do
       {:ok, handle} ->
         emit_child(runtime, handle, :started, %{count: 1})

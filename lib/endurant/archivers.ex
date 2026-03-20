@@ -306,7 +306,7 @@ defmodule Endurant.Archivers do
 
   @spec query!(module(), iodata(), list()) :: map()
   defp query!(repo, sql, params) do
-    repo.query!(sql, params, log: false)
+    Endurant.DB.query!(repo, sql, params)
   end
 
   @spec repo!(keyword()) :: module()

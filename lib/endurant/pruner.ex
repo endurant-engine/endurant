@@ -70,7 +70,7 @@ defmodule Endurant.Pruner do
         positive_integer(Keyword.get(opts, :batch_size, @default_batch_size), :batch_size),
       retention_ms:
         positive_integer(Keyword.get(opts, :retention_ms, @default_retention_ms), :retention_ms),
-      runtime_opts: [repo: repo, prefix: prefix]
+      runtime_opts: [repo: repo, prefix: prefix, db_log: Keyword.get(opts, :db_log, false)]
     }
 
     {:ok, state, {:continue, :acquire}}
@@ -189,7 +189,8 @@ defmodule Endurant.Pruner do
       |> DateTime.truncate(:microsecond)
 
     {pruned, deleted_events, deleted_deliveries} =
-      repo.transaction(
+      Endurant.DB.transaction(
+        repo,
         fn ->
           execution_ids =
             select_prunable_execution_ids(
@@ -197,20 +198,24 @@ defmodule Endurant.Pruner do
               prefix,
               enabled_archivers,
               cutoff,
-              state.batch_size
+              state.batch_size,
+              state.runtime_opts
             )
 
           if execution_ids != [] do
-            deleted_events = delete_events(repo, prefix, execution_ids)
-            deleted_deliveries = delete_deliveries(repo, prefix, execution_ids)
-            pruned = delete_executions(repo, prefix, execution_ids)
+            deleted_events = delete_events(repo, prefix, execution_ids, state.runtime_opts)
+
+            deleted_deliveries =
+              delete_deliveries(repo, prefix, execution_ids, state.runtime_opts)
+
+            pruned = delete_executions(repo, prefix, execution_ids, state.runtime_opts)
             {pruned, deleted_events, deleted_deliveries}
           else
             {0, 0, 0}
           end
         end,
-        timeout: :infinity,
-        log: false
+        state.runtime_opts,
+        timeout: :infinity
       )
       |> case do
         {:ok, counts} -> counts
@@ -246,10 +251,18 @@ defmodule Endurant.Pruner do
           String.t(),
           [String.t()],
           DateTime.t(),
-          pos_integer()
+          pos_integer(),
+          keyword()
         ) ::
           [Ecto.UUID.t() | binary()]
-  defp select_prunable_execution_ids(repo, prefix, enabled_archivers, cutoff, batch_size) do
+  defp select_prunable_execution_ids(
+         repo,
+         prefix,
+         enabled_archivers,
+         cutoff,
+         batch_size,
+         runtime_opts
+       ) do
     sql = """
     SELECT e.id
     FROM #{prefix}.endurant_executions e
@@ -272,28 +285,34 @@ defmodule Endurant.Pruner do
     FOR UPDATE OF e SKIP LOCKED
     """
 
-    repo.query!(sql, [enabled_archivers, cutoff, length(enabled_archivers), batch_size],
-      log: false
+    Endurant.DB.query!(
+      repo,
+      sql,
+      [enabled_archivers, cutoff, length(enabled_archivers), batch_size],
+      runtime_opts
     ).rows
     |> Enum.map(fn [execution_id] -> execution_id end)
   end
 
-  @spec delete_events(module(), String.t(), [Ecto.UUID.t() | binary()]) :: non_neg_integer()
-  defp delete_events(repo, prefix, execution_ids) do
+  @spec delete_events(module(), String.t(), [Ecto.UUID.t() | binary()], keyword()) ::
+          non_neg_integer()
+  defp delete_events(repo, prefix, execution_ids, runtime_opts) do
     sql = "DELETE FROM #{prefix}.endurant_events WHERE execution_id = ANY($1)"
-    repo.query!(sql, [execution_ids], log: false).num_rows
+    Endurant.DB.query!(repo, sql, [execution_ids], runtime_opts).num_rows
   end
 
-  @spec delete_deliveries(module(), String.t(), [Ecto.UUID.t() | binary()]) :: non_neg_integer()
-  defp delete_deliveries(repo, prefix, execution_ids) do
+  @spec delete_deliveries(module(), String.t(), [Ecto.UUID.t() | binary()], keyword()) ::
+          non_neg_integer()
+  defp delete_deliveries(repo, prefix, execution_ids, runtime_opts) do
     sql = "DELETE FROM #{prefix}.endurant_archive_deliveries WHERE execution_id = ANY($1)"
-    repo.query!(sql, [execution_ids], log: false).num_rows
+    Endurant.DB.query!(repo, sql, [execution_ids], runtime_opts).num_rows
   end
 
-  @spec delete_executions(module(), String.t(), [Ecto.UUID.t() | binary()]) :: non_neg_integer()
-  defp delete_executions(repo, prefix, execution_ids) do
+  @spec delete_executions(module(), String.t(), [Ecto.UUID.t() | binary()], keyword()) ::
+          non_neg_integer()
+  defp delete_executions(repo, prefix, execution_ids, runtime_opts) do
     sql = "DELETE FROM #{prefix}.endurant_executions WHERE id = ANY($1)"
-    repo.query!(sql, [execution_ids], log: false).num_rows
+    Endurant.DB.query!(repo, sql, [execution_ids], runtime_opts).num_rows
   end
 
   @spec owner_id(atom() | String.t()) :: String.t()

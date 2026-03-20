@@ -45,7 +45,8 @@ defmodule Endurant.Crons do
       when is_list(config_crons) and is_list(opts) do
     repo = repo!(opts)
 
-    case repo.transaction(
+    case Endurant.DB.transaction(
+           repo,
            fn ->
              Enum.each(config_crons, fn config_cron ->
                case upsert_config_cron(config_cron, opts) do
@@ -56,7 +57,7 @@ defmodule Endurant.Crons do
 
              :ok
            end,
-           log: false
+           opts
          ) do
       {:ok, :ok} -> :ok
       {:error, reason} -> {:error, reason}
@@ -525,7 +526,7 @@ defmodule Endurant.Crons do
   defp dispatch_one_due(opts) do
     repo = repo!(opts)
 
-    case repo.transaction(fn -> dispatch_one_due_tx(opts) end, log: false) do
+    case Endurant.DB.transaction(repo, fn -> dispatch_one_due_tx(opts) end, opts) do
       {:ok, :none} ->
         :none
 
@@ -538,7 +539,8 @@ defmodule Endurant.Crons do
 
         :ok
 
-      _ -> :none
+      _ ->
+        :none
     end
   end
 
@@ -856,7 +858,7 @@ defmodule Endurant.Crons do
 
   @spec query!(module(), iodata(), list()) :: map()
   defp query!(repo, sql, params) do
-    repo.query!(sql, params, log: false)
+    Endurant.DB.query!(repo, sql, params)
   end
 
   @spec repo!(keyword()) :: module()

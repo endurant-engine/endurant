@@ -4,15 +4,18 @@ defmodule Endurant.Config do
   @default_name Endurant
   @default_prefix "public"
   @default_queue_defaults [concurrency: 1]
+  @default_db_log false
 
   @type instance_name :: atom() | String.t()
   @type archiver_name :: String.t()
   @type archiver_options :: keyword()
+  @type db_log_option :: boolean() | :debug | :info | :notice | :warning | :error | :critical
 
   @type t :: %__MODULE__{
           name: instance_name(),
           repo: module(),
           prefix: String.t(),
+          db_log: db_log_option(),
           queues: keyword(keyword()),
           archivers: [{archiver_name(), archiver_options()}],
           pruner: keyword(),
@@ -20,8 +23,28 @@ defmodule Endurant.Config do
           crons: [map()]
         }
 
-  @enforce_keys [:name, :repo, :prefix, :queues, :archivers, :pruner, :queue_defaults, :crons]
-  defstruct [:name, :repo, :prefix, :queues, :archivers, :pruner, :queue_defaults, :crons]
+  @enforce_keys [
+    :name,
+    :repo,
+    :prefix,
+    :db_log,
+    :queues,
+    :archivers,
+    :pruner,
+    :queue_defaults,
+    :crons
+  ]
+  defstruct [
+    :name,
+    :repo,
+    :prefix,
+    :db_log,
+    :queues,
+    :archivers,
+    :pruner,
+    :queue_defaults,
+    :crons
+  ]
 
   @spec new!(keyword()) :: t()
   def new!(opts) when is_list(opts) do
@@ -33,12 +56,14 @@ defmodule Endurant.Config do
     crons = crons!(opts)
     repo = repo!(opts)
     prefix = prefix!(opts)
+    db_log = db_log!(opts)
 
     normalized_queues =
       Enum.map(queues, fn {queue, queue_opts} ->
         merged =
           queue_defaults
           |> Keyword.merge(queue_opts)
+          |> Keyword.put(:db_log, db_log)
           |> Keyword.put(:repo, repo)
           |> Keyword.put(:prefix, prefix)
 
@@ -49,6 +74,7 @@ defmodule Endurant.Config do
       name: name,
       repo: repo,
       prefix: prefix,
+      db_log: db_log,
       queues: normalized_queues,
       archivers: archivers,
       pruner: pruner,
@@ -59,7 +85,7 @@ defmodule Endurant.Config do
 
   @spec runtime_opts(t()) :: keyword()
   def runtime_opts(%__MODULE__{} = config) do
-    [repo: config.repo, prefix: config.prefix, instance: config.name]
+    [repo: config.repo, prefix: config.prefix, instance: config.name, db_log: config.db_log]
   end
 
   @spec require_name!(keyword()) :: instance_name()
@@ -98,6 +124,24 @@ defmodule Endurant.Config do
       other ->
         raise ArgumentError,
               ":queue_defaults must be a keyword list, got: #{inspect(other)}"
+    end
+  end
+
+  @spec db_log!(keyword()) :: db_log_option()
+  defp db_log!(opts) do
+    case Keyword.get(opts, :db_log, @default_db_log) do
+      false ->
+        false
+
+      true ->
+        :debug
+
+      level when level in [:debug, :info, :notice, :warning, :error, :critical] ->
+        level
+
+      other ->
+        raise ArgumentError,
+              ":db_log must be false, true, or a Logger level atom, got: #{inspect(other)}"
     end
   end
 

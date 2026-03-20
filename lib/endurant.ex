@@ -73,6 +73,7 @@ defmodule Endurant do
           {:name, start_name()}
           | {:repo, module()}
           | {:prefix, String.t()}
+          | {:db_log, Config.db_log_option()}
           | {:queue_defaults, keyword()}
           | {:crons, [keyword() | map()]}
           | {:archivers, archivers_option()}
@@ -128,6 +129,7 @@ defmodule Endurant do
   - `:name` non-empty string or atom instance name (defaults to `Endurant`).
   - `:repo` Ecto repo module for this instance.
   - `:prefix` database schema prefix (default `"public"`).
+  - `:db_log` DB query logging for Endurant-issued queries (default `false`).
   - `:queue_defaults` queue defaults merged into each queue config.
   - `:crons` config-managed cron schedules synced on startup.
   - `:archivers` archive worker definitions.

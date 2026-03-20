@@ -120,6 +120,7 @@ You can define cron schedules in `Endurant.start_link/1` via `:crons`.
     name: :my_endurant,
     repo: MyApp.Repo,
     prefix: "public",
+    db_log: :debug,
     queues: [default: [concurrency: 10]],
     crons: [
       [
@@ -133,6 +134,9 @@ You can define cron schedules in `Endurant.start_link/1` via `:crons`.
     ]
   )
 ```
+
+`db_log` is optional and defaults to `false`; set it when you want Endurant's
+database queries logged for that instance.
 
 Config cron semantics:
 
