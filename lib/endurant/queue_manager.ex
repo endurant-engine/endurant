@@ -22,7 +22,15 @@ defmodule Endurant.QueueManager do
           opts: keyword(),
           tick: non_neg_integer(),
           running: %{reference() => %{execution_id: term(), pid: pid()}},
-          cached: %{reference() => %{execution_id: term(), pid: pid(), ready?: boolean()}},
+          cached: %{
+            reference() => %{
+              execution_id: term(),
+              pid: pid(),
+              ready?: boolean(),
+              cached_ttl_ms: :infinity | pos_integer(),
+              timer_ref: reference() | nil
+            }
+          },
           ready: :queue.queue(reference())
         }
 
@@ -138,7 +146,10 @@ defmodule Endurant.QueueManager do
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %__MODULE__{} = state) do
     {:noreply,
-     %{state | running: Map.delete(state.running, ref), cached: Map.delete(state.cached, ref)}}
+     state
+     |> maybe_cancel_cached_timer(ref)
+     |> Map.update!(:running, &Map.delete(&1, ref))
+     |> Map.update!(:cached, &Map.delete(&1, ref))}
   end
 
   @impl true
@@ -146,10 +157,40 @@ defmodule Endurant.QueueManager do
     {:noreply, state}
   end
 
+  def handle_info({:cached_ttl, ref, execution_id}, %__MODULE__{} = state) do
+    case Map.get(state.cached, ref) do
+      %{execution_id: ^execution_id, pid: pid} = info ->
+        _ =
+          Endurant.Executions.release_waiting_as_abandoned_owned(
+            execution_id,
+            worker_id(state.instance, state.queue),
+            state.opts
+          )
+
+        send(pid, :cached_ttl)
+        next_state = drop_cached_ref(state, ref)
+
+        Telemetry.emit(
+          [:queue_manager, :cached_ttl],
+          %{count: 1, running: map_size(next_state.running), cached: map_size(next_state.cached)},
+          queue_manager_metadata(next_state, %{execution_id: execution_id, ready: info.ready?})
+        )
+
+        {:noreply, next_state}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   @impl true
-  def handle_call({:executor_cached, pid, execution_id}, _from, %__MODULE__{} = state) do
+  def handle_call(
+        {:executor_cached, pid, execution_id, cached_ttl_ms},
+        _from,
+        %__MODULE__{} = state
+      ) do
     if map_size(state.cached) < cached_limit(state.opts) do
-      next_state = move_running_to_cached(state, pid, execution_id)
+      next_state = move_running_to_cached(state, pid, execution_id, cached_ttl_ms)
 
       Telemetry.emit(
         [:queue_manager, :cached],
@@ -212,8 +253,8 @@ defmodule Endurant.QueueManager do
     end)
   end
 
-  @spec move_running_to_cached(state(), pid(), term()) :: state()
-  defp move_running_to_cached(%__MODULE__{} = state, pid, execution_id) do
+  @spec move_running_to_cached(state(), pid(), term(), :infinity | pos_integer()) :: state()
+  defp move_running_to_cached(%__MODULE__{} = state, pid, execution_id, cached_ttl_ms) do
     match =
       Enum.find(state.running, fn {_ref, info} ->
         info.pid == pid
@@ -222,11 +263,14 @@ defmodule Endurant.QueueManager do
     case match do
       {ref, %{execution_id: ^execution_id} = info} ->
         running = Map.delete(state.running, ref)
+        timer_ref = start_cached_ttl_timer(ref, execution_id, cached_ttl_ms)
 
         cached_info =
           info
           |> Map.put(:execution_id, execution_id)
           |> Map.put(:ready?, false)
+          |> Map.put(:cached_ttl_ms, cached_ttl_ms)
+          |> Map.put(:timer_ref, timer_ref)
 
         cached = Map.put(state.cached, ref, cached_info)
         %{state | running: running, cached: cached}
@@ -361,6 +405,8 @@ defmodule Endurant.QueueManager do
             )
 
           {info, cached_after_pop} ->
+            cancel_timer(info)
+
             case Endurant.Executions.mark_running(
                    info.execution_id,
                    worker_id,
@@ -444,6 +490,55 @@ defmodule Endurant.QueueManager do
 
   @spec worker_id(atom() | String.t(), atom()) :: String.t()
   defp worker_id(instance, queue), do: "#{instance_tag(instance)}:#{node()}:#{queue}"
+
+  @spec start_cached_ttl_timer(reference(), term(), :infinity | pos_integer()) ::
+          reference() | nil
+  defp start_cached_ttl_timer(_ref, _execution_id, :infinity), do: nil
+
+  defp start_cached_ttl_timer(ref, execution_id, cached_ttl_ms)
+       when is_integer(cached_ttl_ms) and cached_ttl_ms > 0 do
+    Process.send_after(self(), {:cached_ttl, ref, execution_id}, cached_ttl_ms)
+  end
+
+  @spec cancel_timer(map()) :: :ok
+  defp cancel_timer(%{timer_ref: nil}), do: :ok
+
+  defp cancel_timer(%{timer_ref: timer_ref}) when is_reference(timer_ref) do
+    _ = Process.cancel_timer(timer_ref)
+    :ok
+  end
+
+  @spec maybe_cancel_cached_timer(state(), reference()) :: state()
+  defp maybe_cancel_cached_timer(%__MODULE__{} = state, ref) do
+    case Map.get(state.cached, ref) do
+      nil ->
+        state
+
+      info ->
+        cancel_timer(info)
+        state
+    end
+  end
+
+  @spec drop_cached_ref(state(), reference()) :: state()
+  defp drop_cached_ref(%__MODULE__{} = state, ref) do
+    case Map.pop(state.cached, ref) do
+      {nil, cached} ->
+        %{state | cached: cached, ready: drop_ready_ref(state.ready, ref)}
+
+      {info, cached} ->
+        cancel_timer(info)
+        %{state | cached: cached, ready: drop_ready_ref(state.ready, ref)}
+    end
+  end
+
+  @spec drop_ready_ref(:queue.queue(reference()), reference()) :: :queue.queue(reference())
+  defp drop_ready_ref(ready_queue, ref) do
+    ready_queue
+    |> :queue.to_list()
+    |> Enum.reject(&(&1 == ref))
+    |> :queue.from_list()
+  end
 
   @spec instance_tag(atom() | String.t()) :: String.t()
   defp instance_tag(instance) when is_binary(instance), do: instance

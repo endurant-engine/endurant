@@ -2,7 +2,7 @@ defmodule Endurant.Workflow.Signals do
   @moduledoc """
   Signal waiting primitives for workflows.
 
-  Use `wait_signal/1` inside `run/2` (or helper functions called from `run/2`)
+  Use `wait_signal/1` or `wait_signal/2` inside `run/2` (or helper functions called from `run/2`)
   to block workflow progress until a matching signal payload is available.
 
   Signal consumption is deterministic:
@@ -27,14 +27,23 @@ defmodule Endurant.Workflow.Signals do
   signal history, it is returned immediately. Otherwise the execution enters
   waiting state and resumes when a matching signal is recorded.
 
+  ## Options
+
+    * `:cached_ttl_ms` overrides the cached TTL for this wait only
+
   ## Example
 
       message = wait_signal("user_message")
   """
   @spec wait_signal(String.t()) :: term() | no_return()
-  def wait_signal(name) do
+  @spec wait_signal(String.t(), keyword()) :: term() | no_return()
+  def wait_signal(name, opts \\ []) when is_binary(name) and is_list(opts) do
     signal_key = normalize_signal_name!(name)
-    runtime = Workflow.runtime!()
+
+    runtime =
+      Workflow.runtime!()
+      |> Workflow.apply_wait_opts(opts)
+
     runtime = ensure_signal_runtime(runtime)
 
     case pop_signal(runtime, signal_key) do
@@ -82,11 +91,11 @@ defmodule Endurant.Workflow.Signals do
 
     case notify_waiting(runtime) do
       :cache ->
-        emit_signal(runtime, :park_decision, %{count: 1}, %{decision: :cache})
+        emit_signal(runtime, :cache_decision, %{count: 1}, %{decision: :cache})
         :ok
 
       :release ->
-        emit_signal(runtime, :park_decision, %{count: 1}, %{decision: :release})
+        emit_signal(runtime, :cache_decision, %{count: 1}, %{decision: :release})
 
         case Executions.release_waiting_as_abandoned_owned(
                runtime.execution_id,
@@ -127,13 +136,22 @@ defmodule Endurant.Workflow.Signals do
 
       {:error, :cancelled} ->
         throw({:endurant_halt, :not_running})
+
+      :released ->
+        throw({:endurant_halt, :waiting_persisted})
     end
   end
 
   @spec notify_waiting(map()) :: :cache | :release
   defp notify_waiting(runtime) do
     manager = queue_manager!(runtime)
-    GenServer.call(manager, {:executor_cached, self(), runtime.execution_id}, 5_000)
+
+    GenServer.call(
+      manager,
+      {:executor_cached, self(), runtime.execution_id,
+       Map.get(runtime, :cached_ttl_ms, :infinity)},
+      5_000
+    )
   end
 
   @spec notify_ready(map()) :: :ok
@@ -155,10 +173,11 @@ defmodule Endurant.Workflow.Signals do
     end
   end
 
-  @spec await_resume() :: :ok | {:error, :cancelled}
+  @spec await_resume() :: :ok | :released | {:error, :cancelled}
   defp await_resume do
     receive do
       :resume -> :ok
+      :cached_ttl -> :released
       :heartbeat_cancelled -> {:error, :cancelled}
       :heartbeat_lock_lost -> {:error, :cancelled}
       {:heartbeat_failed, reason} -> raise "heartbeat failed while waiting: #{inspect(reason)}"

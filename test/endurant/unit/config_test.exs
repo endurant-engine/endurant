@@ -16,6 +16,33 @@ defmodule Endurant.ConfigTest do
     assert Keyword.fetch!(Keyword.fetch!(config.queues, :default), :db_log) == false
   end
 
+  test "cached_ttl_ms defaults to :infinity in queue opts" do
+    config =
+      Endurant.Config.new!(
+        repo: Repo,
+        queues: [default: [concurrency: 2]]
+      )
+
+    assert Keyword.fetch!(Keyword.fetch!(config.queues, :default), :cached_ttl_ms) ==
+             :infinity
+  end
+
+  test "cached_ttl_ms accepts positive integers" do
+    config =
+      Endurant.Config.new!(
+        repo: Repo,
+        queues: [default: [cached_ttl_ms: 5_000]]
+      )
+
+    assert Keyword.fetch!(Keyword.fetch!(config.queues, :default), :cached_ttl_ms) == 5_000
+  end
+
+  test "cached_ttl_ms rejects invalid values" do
+    assert_raise ArgumentError, ~r/:cached_ttl_ms/, fn ->
+      Endurant.Config.new!(repo: Repo, queues: [default: [cached_ttl_ms: 0]])
+    end
+  end
+
   test "db_log true normalizes to :debug" do
     config = Endurant.Config.new!(repo: Repo, db_log: true)
 

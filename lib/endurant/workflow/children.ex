@@ -40,6 +40,7 @@ defmodule Endurant.Workflow.Children do
     * `:unique_id` - child workflow unique id override
     * `:close_policy` - behavior when the parent execution closes:
       `:abandon` or `:request_cancel` (default `:abandon`)
+    * `:cached_ttl_ms` - overrides the cached TTL for the parent wait only
   """
   @spec child_workflow(String.t(), module(), map()) :: term() | no_return()
   @spec child_workflow(String.t(), module(), map(), keyword()) :: term() | no_return()
@@ -47,7 +48,7 @@ defmodule Endurant.Workflow.Children do
       when is_binary(name) and is_atom(workflow_module) and is_map(input) and is_list(opts) do
     name
     |> child_workflow_async(workflow_module, input, opts)
-    |> child_workflow_await()
+    |> child_workflow_await(opts)
   end
 
   @doc """
@@ -99,8 +100,12 @@ defmodule Endurant.Workflow.Children do
   Raises when the child fails or is cancelled.
   """
   @spec child_workflow_await(Handle.t()) :: term() | no_return()
-  def child_workflow_await(%Handle{} = handle) do
-    runtime = ensure_child_runtime(Workflow.runtime!())
+  @spec child_workflow_await(Handle.t(), keyword()) :: term() | no_return()
+  def child_workflow_await(%Handle{} = handle, opts \\ []) when is_list(opts) do
+    runtime =
+      Workflow.runtime!()
+      |> Workflow.apply_wait_opts(opts)
+      |> ensure_child_runtime()
 
     case child_state(runtime, handle.child_key) do
       {:ok, state, next_runtime} ->
@@ -158,12 +163,12 @@ defmodule Endurant.Workflow.Children do
         emit_child(runtime, handle, :wait_started, %{count: 1})
 
         case notify_waiting(runtime) do
-          :park ->
-            emit_child(runtime, handle, :park_decision, %{count: 1}, %{decision: :park})
+          :cache ->
+            emit_child(runtime, handle, :cache_decision, %{count: 1}, %{decision: :cache})
             :ok
 
           :release ->
-            emit_child(runtime, handle, :park_decision, %{count: 1}, %{decision: :release})
+            emit_child(runtime, handle, :cache_decision, %{count: 1}, %{decision: :release})
 
             case Executions.release_waiting_as_abandoned_owned(
                    runtime.execution_id,
@@ -210,6 +215,9 @@ defmodule Endurant.Workflow.Children do
 
       {:error, :cancelled} ->
         throw({:endurant_halt, :not_running})
+
+      :released ->
+        throw({:endurant_halt, :waiting_persisted})
     end
   end
 
@@ -522,7 +530,13 @@ defmodule Endurant.Workflow.Children do
   @spec notify_waiting(map()) :: :cache | :release
   defp notify_waiting(runtime) do
     manager = queue_manager!(runtime)
-    GenServer.call(manager, {:executor_cached, self(), runtime.execution_id}, 5_000)
+
+    GenServer.call(
+      manager,
+      {:executor_cached, self(), runtime.execution_id,
+       Map.get(runtime, :cached_ttl_ms, :infinity)},
+      5_000
+    )
   end
 
   @spec notify_ready(map()) :: :ok
@@ -540,10 +554,11 @@ defmodule Endurant.Workflow.Children do
     end
   end
 
-  @spec await_resume() :: :ok | {:error, :cancelled}
+  @spec await_resume() :: :ok | :released | {:error, :cancelled}
   defp await_resume do
     receive do
       :resume -> :ok
+      :cached_ttl -> :released
       :heartbeat_cancelled -> {:error, :cancelled}
       :heartbeat_lock_lost -> {:error, :cancelled}
       {:heartbeat_failed, reason} -> raise "heartbeat failed while waiting: #{inspect(reason)}"

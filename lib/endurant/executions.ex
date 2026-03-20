@@ -7,6 +7,8 @@ defmodule Endurant.Executions do
   @default_prefix "public"
   @default_list_limit 50
   @max_list_limit 1000
+  @endurant_metadata_key "endurant"
+  @cached_ttl_metadata_key "cached_ttl_ms"
 
   @open_status_strings ["pending", "running", "waiting", "continuable", "abandoned", "cancelling"]
   @terminal_status_strings ["completed", "failed", "cancelled", "continued_as_new"]
@@ -129,7 +131,11 @@ defmodule Endurant.Executions do
     queue = resolve_queue(workflow)
     workflow_name = inspect(workflow_module)
     version = normalize_version!(Keyword.get(opts, :version, Map.get(workflow, :version, "1")))
-    metadata = normalize_execution_row_metadata(Keyword.get(opts, :metadata, %{}))
+
+    metadata =
+      Keyword.get(opts, :metadata, %{})
+      |> normalize_execution_row_metadata()
+      |> maybe_put_cached_ttl_metadata(Map.get(workflow, :cached_ttl_ms))
 
     sql = """
     INSERT INTO #{prefix}.endurant_executions
@@ -2953,6 +2959,31 @@ defmodule Endurant.Executions do
 
   defp normalize_execution_row_metadata(other) do
     raise ArgumentError, "metadata must be a map, got: #{inspect(other)}"
+  end
+
+  @spec maybe_put_cached_ttl_metadata(map(), nil | pos_integer() | :infinity) :: map()
+  defp maybe_put_cached_ttl_metadata(metadata, nil), do: metadata
+
+  defp maybe_put_cached_ttl_metadata(metadata, cached_ttl_ms) do
+    internal_metadata =
+      metadata
+      |> Map.get(@endurant_metadata_key, Map.get(metadata, :endurant, %{}))
+      |> normalize_execution_row_metadata()
+      |> Map.put(@cached_ttl_metadata_key, dump_cached_ttl_ms!(cached_ttl_ms))
+
+    Map.put(metadata, @endurant_metadata_key, internal_metadata)
+  end
+
+  @spec dump_cached_ttl_ms!(pos_integer() | :infinity) :: pos_integer() | String.t()
+  defp dump_cached_ttl_ms!(:infinity), do: "infinity"
+
+  defp dump_cached_ttl_ms!(cached_ttl_ms)
+       when is_integer(cached_ttl_ms) and cached_ttl_ms > 0,
+       do: cached_ttl_ms
+
+  defp dump_cached_ttl_ms!(other) do
+    raise ArgumentError,
+          "cached_ttl_ms must be a positive integer or :infinity, got: #{inspect(other)}"
   end
 
   @spec normalize_filter_timestamp!(term(), atom()) :: NaiveDateTime.t()

@@ -14,6 +14,7 @@ defmodule Endurant.Workflow do
 
         workflow do
           queue("orders")
+          cached_ttl_ms(30_000)
           unique_id(fn %{"order_id" => id} -> "order:\#{id}" end)
         end
 
@@ -27,6 +28,12 @@ defmodule Endurant.Workflow do
   ## `use` options
 
     * `:version` - workflow version string (default `"1"`)
+
+  ## Workflow DSL
+
+    * `queue/1` sets the workflow queue
+    * `cached_ttl_ms/1` overrides the queue cached TTL for this workflow
+    * `unique_id/1` sets workflow uniqueness
   """
 
   @runtime_key :endurant_workflow_runtime
@@ -84,8 +91,10 @@ defmodule Endurant.Workflow do
         only: [
           workflow: 1,
           queue: 1,
+          cached_ttl_ms: 1,
           unique_id: 1,
           sleep: 2,
+          sleep: 3,
           continue_as_new: 1,
           continue_as_new: 2,
           execution_id: 0,
@@ -106,7 +115,7 @@ defmodule Endurant.Workflow do
           task_async_stream: 4
         ]
 
-      import Endurant.Workflow.Signals, only: [wait_signal: 1]
+      import Endurant.Workflow.Signals, only: [wait_signal: 1, wait_signal: 2]
 
       import Endurant.Workflow.Children,
         only: [
@@ -114,7 +123,8 @@ defmodule Endurant.Workflow do
           child_workflow: 4,
           child_workflow_async: 3,
           child_workflow_async: 4,
-          child_workflow_await: 1
+          child_workflow_await: 1,
+          child_workflow_await: 2
         ]
 
       Module.register_attribute(__MODULE__, :endurant_workflow_version, persist: true)
@@ -125,6 +135,10 @@ defmodule Endurant.Workflow do
       def __workflow_queue__, do: nil
       defoverridable __workflow_queue__: 0
 
+      @spec __workflow_cached_ttl_ms__() :: pos_integer() | :infinity | nil
+      def __workflow_cached_ttl_ms__, do: nil
+      defoverridable __workflow_cached_ttl_ms__: 0
+
       @spec __unique_id__(map()) :: String.t() | nil
       def __unique_id__(_input), do: nil
       defoverridable __unique_id__: 1
@@ -133,6 +147,7 @@ defmodule Endurant.Workflow do
       def __workflow__ do
         %{
           queue: __workflow_queue__(),
+          cached_ttl_ms: __workflow_cached_ttl_ms__(),
           unique_id: &__MODULE__.__unique_id__/1,
           version: @endurant_workflow_version
         }
@@ -168,6 +183,33 @@ defmodule Endurant.Workflow do
 
   defmacro queue(value) do
     raise ArgumentError, "queue/1 expects a string, got: #{Macro.to_string(value)}"
+  end
+
+  @doc """
+  Sets the maximum time a waiting executor may stay cached in memory.
+
+  Accepted values:
+
+    * `cached_ttl_ms(5_000)`
+    * `cached_ttl_ms(:infinity)`
+  """
+  defmacro cached_ttl_ms(value) when is_integer(value) and value > 0 do
+    quote do
+      @spec __workflow_cached_ttl_ms__() :: pos_integer()
+      def __workflow_cached_ttl_ms__, do: unquote(value)
+    end
+  end
+
+  defmacro cached_ttl_ms(:infinity) do
+    quote do
+      @spec __workflow_cached_ttl_ms__() :: :infinity
+      def __workflow_cached_ttl_ms__, do: :infinity
+    end
+  end
+
+  defmacro cached_ttl_ms(value) do
+    raise ArgumentError,
+          "cached_ttl_ms/1 expects a positive integer or :infinity, got: #{Macro.to_string(value)}"
   end
 
   @doc """
@@ -220,14 +262,21 @@ defmodule Endurant.Workflow do
   `wait_key` identifies this logical wait across replay. Use a stable key per
   wait site/iteration.
 
+  ## Options
+
+    * `:cached_ttl_ms` overrides the cached TTL for this wait only
+
   ## Example
 
       sleep("retry:\#{attempt}", 1_000)
   """
   @spec sleep(String.t(), pos_integer()) :: :ok | no_return()
-  def sleep(wait_key, delay_ms)
-      when is_binary(wait_key) and is_integer(delay_ms) and delay_ms > 0 do
-    runtime = runtime!()
+  @spec sleep(String.t(), pos_integer(), keyword()) :: :ok | no_return()
+  def sleep(wait_key, delay_ms, opts \\ [])
+      when is_binary(wait_key) and is_integer(delay_ms) and delay_ms > 0 and is_list(opts) do
+    runtime =
+      runtime!()
+      |> apply_wait_opts(opts)
 
     if MapSet.member?(runtime.waits, wait_key) do
       :ok
@@ -308,6 +357,7 @@ defmodule Endurant.Workflow do
       :cache ->
         case await_resume() do
           :ok -> :ok
+          :released -> throw({:endurant_halt, :waiting_persisted})
           {:error, :cancelled} -> throw({:endurant_halt, :not_running})
         end
 
@@ -329,7 +379,13 @@ defmodule Endurant.Workflow do
   @spec notify_waiting(map()) :: :cache | :release
   defp notify_waiting(runtime) do
     manager = queue_manager!(runtime)
-    GenServer.call(manager, {:executor_cached, self(), runtime.execution_id}, 5_000)
+
+    GenServer.call(
+      manager,
+      {:executor_cached, self(), runtime.execution_id,
+       Map.get(runtime, :cached_ttl_ms, :infinity)},
+      5_000
+    )
   end
 
   @spec queue_manager!(map()) :: pid() | atom() | {:via, module(), term()}
@@ -343,10 +399,11 @@ defmodule Endurant.Workflow do
     end
   end
 
-  @spec await_resume() :: :ok | {:error, :cancelled}
+  @spec await_resume() :: :ok | :released | {:error, :cancelled}
   defp await_resume do
     receive do
       :resume -> :ok
+      :cached_ttl -> :released
       :heartbeat_cancelled -> {:error, :cancelled}
       :heartbeat_lock_lost -> {:error, :cancelled}
       {:heartbeat_failed, reason} -> raise "heartbeat failed while waiting: #{inspect(reason)}"
@@ -425,6 +482,25 @@ defmodule Endurant.Workflow do
 
       runtime ->
         runtime
+    end
+  end
+
+  @doc false
+  @spec apply_wait_opts(map(), keyword()) :: map()
+  def apply_wait_opts(runtime, opts) when is_map(runtime) and is_list(opts) do
+    case Keyword.fetch(opts, :cached_ttl_ms) do
+      :error ->
+        runtime
+
+      {:ok, :infinity} ->
+        Map.put(runtime, :cached_ttl_ms, :infinity)
+
+      {:ok, value} when is_integer(value) and value > 0 ->
+        Map.put(runtime, :cached_ttl_ms, value)
+
+      {:ok, other} ->
+        raise ArgumentError,
+              ":cached_ttl_ms must be a positive integer or :infinity, got: #{inspect(other)}"
     end
   end
 end

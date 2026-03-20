@@ -61,6 +61,7 @@ def start(_type, _args) do
              orders: [
                concurrency: 10,
                cached_limit: 100,
+               cached_ttl_ms: :infinity,
                poll_interval: 200
              ]
            ]
@@ -74,3 +75,7 @@ end
 
 `db_log` defaults to `false`. Set it to `true` or a Logger level like `:debug`
 or `:info` if you want Endurant-issued database queries logged.
+
+`cached_ttl_ms` controls how long a waiting executor may stay cached in
+memory before it is shut down and left in durable waiting state.
+defaults to `:infinity`

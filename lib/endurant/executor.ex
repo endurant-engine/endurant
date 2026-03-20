@@ -119,6 +119,7 @@ defmodule Endurant.Executor do
       execution_id: execution.id,
       worker_id: worker_id,
       opts: opts,
+      cached_ttl_ms: Keyword.get(opts, :cached_ttl_ms, :infinity),
       instance: Keyword.get(opts, :instance),
       queue: execution.queue,
       workflow: execution.workflow,
@@ -168,6 +169,7 @@ defmodule Endurant.Executor do
   @spec execute_execution(Executions.execution(), module(), String.t(), keyword(), boolean()) ::
           execution_outcome()
   defp execute_execution(execution, workflow_module, worker_id, opts, already_started?) do
+    opts = execution_runtime_opts(execution, workflow_module, opts)
     lease_ms = Keyword.get(opts, :lease_ms, 30_000)
     heartbeat_ms = heartbeat_interval_ms(opts, lease_ms)
 
@@ -410,9 +412,17 @@ defmodule Endurant.Executor do
       :ok ->
         case notify_waiting(execution_id, opts) do
           :cache ->
-            wait_for_time(run_at, heartbeat_ms)
-            notify_ready(execution_id, opts)
-            await_resume_signal()
+            case wait_for_time(run_at, heartbeat_ms) do
+              :ok ->
+                notify_ready(execution_id, opts)
+                await_resume_signal()
+
+              :released ->
+                :released
+
+              {:error, _} = error ->
+                error
+            end
 
           :release ->
             case Executions.release_waiting_as_abandoned_owned(execution_id, worker_id, opts) do
@@ -426,7 +436,12 @@ defmodule Endurant.Executor do
     end
   end
 
-  @spec wait_for_time(DateTime.t(), pos_integer()) :: :ok | {:error, :cancelled}
+  @spec wait_for_time(DateTime.t(), pos_integer()) ::
+          :ok
+          | :released
+          | {:error, :cancelled}
+          | {:error, :lock_lost}
+          | {:error, {:heartbeat_failed, term()}}
   defp wait_for_time(run_at, heartbeat_ms) do
     now = DateTime.utc_now()
 
@@ -437,8 +452,22 @@ defmodule Endurant.Executor do
         |> min(heartbeat_ms)
         |> max(1)
 
-      Process.sleep(sleep_ms)
-      wait_for_time(run_at, heartbeat_ms)
+      receive do
+        :cached_ttl ->
+          :released
+
+        :heartbeat_cancelled ->
+          {:error, :cancelled}
+
+        :heartbeat_lock_lost ->
+          {:error, :lock_lost}
+
+        {:heartbeat_failed, reason} ->
+          {:error, {:heartbeat_failed, reason}}
+      after
+        sleep_ms ->
+          wait_for_time(run_at, heartbeat_ms)
+      end
     else
       :ok
     end
@@ -447,7 +476,12 @@ defmodule Endurant.Executor do
   @spec notify_waiting(binary(), keyword()) :: :cache | :release
   defp notify_waiting(execution_id, opts) do
     manager = queue_manager!(opts)
-    GenServer.call(manager, {:executor_cached, self(), execution_id}, 5_000)
+
+    GenServer.call(
+      manager,
+      {:executor_cached, self(), execution_id, Keyword.get(opts, :cached_ttl_ms, :infinity)},
+      5_000
+    )
   end
 
   @spec notify_ready(binary(), keyword()) :: :ok
@@ -471,6 +505,7 @@ defmodule Endurant.Executor do
 
   @spec await_resume_signal() ::
           :ok
+          | :released
           | {:error, :cancelled}
           | {:error, :lock_lost}
           | {:error, {:heartbeat_failed, term()}}
@@ -478,6 +513,9 @@ defmodule Endurant.Executor do
     receive do
       :resume ->
         :ok
+
+      :cached_ttl ->
+        :released
 
       :heartbeat_cancelled ->
         {:error, :cancelled}
@@ -915,5 +953,48 @@ defmodule Endurant.Executor do
   @spec heartbeat_interval_ms(keyword(), pos_integer()) :: pos_integer()
   defp heartbeat_interval_ms(opts, lease_ms) do
     Keyword.get(opts, :heartbeat_interval, max(div(lease_ms, 3), 1_000))
+  end
+
+  @spec execution_runtime_opts(Executions.execution(), module(), keyword()) :: keyword()
+  defp execution_runtime_opts(execution, workflow_module, opts) do
+    Keyword.put(
+      opts,
+      :cached_ttl_ms,
+      resolve_cached_ttl_ms(execution, workflow_module, opts)
+    )
+  end
+
+  @spec resolve_cached_ttl_ms(Executions.execution(), module(), keyword()) ::
+          :infinity | pos_integer()
+  defp resolve_cached_ttl_ms(execution, workflow_module, opts) do
+    case cached_ttl_ms_from_metadata(Map.get(execution, :metadata, %{})) do
+      nil ->
+        workflow_module.__workflow__()
+        |> Map.get(:cached_ttl_ms)
+        |> case do
+          nil -> Keyword.get(opts, :cached_ttl_ms, :infinity)
+          value -> value
+        end
+
+      value ->
+        value
+    end
+  end
+
+  @spec cached_ttl_ms_from_metadata(map()) :: nil | :infinity | pos_integer()
+  defp cached_ttl_ms_from_metadata(metadata) when is_map(metadata) do
+    internal = metadata["endurant"] || metadata[:endurant]
+
+    case internal do
+      %{} = values ->
+        case values["cached_ttl_ms"] || values[:cached_ttl_ms] do
+          "infinity" -> :infinity
+          value when is_integer(value) and value > 0 -> value
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
   end
 end
