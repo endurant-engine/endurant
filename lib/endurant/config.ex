@@ -3,7 +3,7 @@ defmodule Endurant.Config do
 
   @default_name Endurant
   @default_prefix "public"
-  @default_queue_defaults [limit: 1]
+  @default_queue_defaults [concurrency: 1]
 
   @type instance_name :: atom() | String.t()
   @type archiver_name :: String.t()

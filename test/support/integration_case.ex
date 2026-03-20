@@ -30,7 +30,7 @@ defmodule Endurant.TestSupport.IntegrationCase do
          repo: PostgresHelper.Repo,
          prefix: prefix,
          queues: [
-           orders: [limit: 1, parked_limit: 1, poll_interval: 25]
+           orders: [concurrency: 1, cached_limit: 1, poll_interval: 25]
          ]}
       )
 

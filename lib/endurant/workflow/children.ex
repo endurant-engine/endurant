@@ -515,10 +515,10 @@ defmodule Endurant.Workflow.Children do
     Map.get(payload, key) || Map.get(payload, String.to_atom(key))
   end
 
-  @spec notify_waiting(map()) :: :park | :release
+  @spec notify_waiting(map()) :: :cache | :release
   defp notify_waiting(runtime) do
     manager = queue_manager!(runtime)
-    GenServer.call(manager, {:executor_parked, self(), runtime.execution_id}, 5_000)
+    GenServer.call(manager, {:executor_cached, self(), runtime.execution_id}, 5_000)
   end
 
   @spec notify_ready(map()) :: :ok

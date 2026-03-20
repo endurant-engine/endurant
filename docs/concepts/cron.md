@@ -120,7 +120,7 @@ You can define cron schedules in `Endurant.start_link/1` via `:crons`.
     name: :my_endurant,
     repo: MyApp.Repo,
     prefix: "public",
-    queues: [default: [limit: 10]],
+    queues: [default: [concurrency: 10]],
     crons: [
       [
         name: "daily_cleanup",

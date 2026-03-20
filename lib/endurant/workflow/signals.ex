@@ -81,8 +81,8 @@ defmodule Endurant.Workflow.Signals do
     emit_signal(runtime, :wait_started, %{count: 1})
 
     case notify_waiting(runtime) do
-      :park ->
-        emit_signal(runtime, :park_decision, %{count: 1}, %{decision: :park})
+      :cache ->
+        emit_signal(runtime, :park_decision, %{count: 1}, %{decision: :cache})
         :ok
 
       :release ->
@@ -112,11 +112,13 @@ defmodule Endurant.Workflow.Signals do
           {:ok, payload, next_runtime} ->
             Workflow.put_runtime(next_runtime)
             notify_ready(next_runtime)
+
             emit_signal(
               next_runtime,
               :resumed,
               %{count: 1, wait_duration_ms: Telemetry.duration_ms(wait_started_at)}
             )
+
             payload
 
           :empty ->
@@ -128,10 +130,10 @@ defmodule Endurant.Workflow.Signals do
     end
   end
 
-  @spec notify_waiting(map()) :: :park | :release
+  @spec notify_waiting(map()) :: :cache | :release
   defp notify_waiting(runtime) do
     manager = queue_manager!(runtime)
-    GenServer.call(manager, {:executor_parked, self(), runtime.execution_id}, 5_000)
+    GenServer.call(manager, {:executor_cached, self(), runtime.execution_id}, 5_000)
   end
 
   @spec notify_ready(map()) :: :ok

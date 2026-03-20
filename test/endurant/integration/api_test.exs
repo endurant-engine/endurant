@@ -94,7 +94,7 @@ defmodule Endurant.Integration.ApiTest do
     Application.put_env(:endurant, instance,
       repo: repo,
       prefix: prefix,
-      queues: [orders: [limit: 1, parked_limit: 1, poll_interval: 25]]
+      queues: [orders: [concurrency: 1, cached_limit: 1, poll_interval: 25]]
     )
 
     assert {:ok, supervisor_pid} = Endurant.start_link(name: instance)
@@ -160,7 +160,7 @@ defmodule Endurant.Integration.ApiTest do
                name: instance_a,
                repo: repo,
                prefix: prefix_a,
-               queues: [orders: [limit: 1, parked_limit: 1, poll_interval: 25]]
+               queues: [orders: [concurrency: 1, cached_limit: 1, poll_interval: 25]]
              )
 
     assert {:ok, pid_b} =
@@ -168,7 +168,7 @@ defmodule Endurant.Integration.ApiTest do
                name: instance_b,
                repo: repo,
                prefix: prefix_b,
-               queues: [orders: [limit: 1, parked_limit: 1, poll_interval: 25]]
+               queues: [orders: [concurrency: 1, cached_limit: 1, poll_interval: 25]]
              )
 
     on_exit(fn ->
@@ -199,7 +199,10 @@ defmodule Endurant.Integration.ApiTest do
     :ok = wait_for_status!(instance_b, execution_b.id, [:running, :waiting], 5_000)
 
     assert nil == Endurant.execution(execution_b.id, instance: instance_a)
-    assert {:error, :not_found} == Endurant.signal(execution_b.id, "go_b", %{}, instance: instance_a)
+
+    assert {:error, :not_found} ==
+             Endurant.signal(execution_b.id, "go_b", %{}, instance: instance_a)
+
     assert {:error, :not_found} == Endurant.cancel(execution_b.id, instance: instance_a)
 
     assert :ok == Endurant.signal(execution_a.id, "go_a", %{}, instance: instance_a)
