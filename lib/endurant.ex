@@ -185,7 +185,7 @@ defmodule Endurant do
         prefix: "public",
         archivers: [
           clickhouse: [
-            module: Endurant.Archivers.ClickHouse,
+            module: EndurantClickhouseArchiver,
             enabled: true,
             url: "http://localhost:8123",
             database: "endurant",
