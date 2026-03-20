@@ -1,7 +1,7 @@
 defmodule Endurant.Integration.QueueManagerTest do
   use Endurant.TestSupport.IntegrationCase
 
-  test "parked_limit saturation parks up to limit but additional executions still reach waiting state",
+  test "cached_limit saturation caches up to concurrency but additional executions still reach waiting state",
        %{
          runtime_opts: runtime_opts
        } do
@@ -12,7 +12,7 @@ defmodule Endurant.Integration.QueueManagerTest do
 
           workflow do
             queue("orders")
-            unique_id(fn %{id: id} -> "waiting-limit:#{id}" end)
+            unique_id(fn %{id: id} -> "waiting-concurrency:#{id}" end)
           end
 
           @impl Endurant.Workflow
@@ -212,7 +212,7 @@ defmodule Endurant.Integration.QueueManagerTest do
     assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
 
     queue_manager = queue_manager_pid!(engine_name)
-    waiting_executor = parked_executor_pid!(queue_manager, execution.id)
+    waiting_executor = cached_executor_pid!(queue_manager, execution.id)
     Process.exit(waiting_executor, :kill)
     force_lock_expired!(execution.id, runtime_opts)
 
@@ -281,26 +281,26 @@ defmodule Endurant.Integration.QueueManagerTest do
     end
   end
 
-  @spec parked_executor_pid!(pid(), binary()) :: pid()
-  defp parked_executor_pid!(queue_manager, execution_id) when is_pid(queue_manager) do
+  @spec cached_executor_pid!(pid(), binary()) :: pid()
+  defp cached_executor_pid!(queue_manager, execution_id) when is_pid(queue_manager) do
     deadline = System.monotonic_time(:millisecond) + 2_000
-    do_find_parked_executor_pid(queue_manager, execution_id, deadline)
+    do_find_cached_executor_pid(queue_manager, execution_id, deadline)
   end
 
-  @spec do_find_parked_executor_pid(pid(), binary(), integer()) :: pid()
-  defp do_find_parked_executor_pid(queue_manager, execution_id, deadline) do
+  @spec do_find_cached_executor_pid(pid(), binary(), integer()) :: pid()
+  defp do_find_cached_executor_pid(queue_manager, execution_id, deadline) do
     state = :sys.get_state(queue_manager)
 
-    case Enum.find(state.parked, fn {_ref, info} -> info.execution_id == execution_id end) do
+    case Enum.find(state.cached, fn {_ref, info} -> info.execution_id == execution_id end) do
       {_ref, info} ->
         info.pid
 
       nil ->
         if System.monotonic_time(:millisecond) >= deadline do
-          flunk("executor for #{execution_id} not found in parked set")
+          flunk("executor for #{execution_id} not found in cached set")
         else
           Process.sleep(20)
-          do_find_parked_executor_pid(queue_manager, execution_id, deadline)
+          do_find_cached_executor_pid(queue_manager, execution_id, deadline)
         end
     end
   end

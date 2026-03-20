@@ -7,7 +7,7 @@ defmodule Endurant.QueueManager do
     :queue,
     :opts,
     running: %{},
-    parked: %{},
+    cached: %{},
     ready: :queue.new()
   ]
 
@@ -15,7 +15,7 @@ defmodule Endurant.QueueManager do
           queue: atom(),
           opts: keyword(),
           running: %{reference() => %{execution_id: term(), pid: pid()}},
-          parked: %{reference() => %{execution_id: term(), pid: pid(), ready?: boolean()}},
+          cached: %{reference() => %{execution_id: term(), pid: pid(), ready?: boolean()}},
           ready: :queue.queue(reference())
         }
 
@@ -45,7 +45,7 @@ defmodule Endurant.QueueManager do
     worker_id = worker_id(state.queue)
     {state, _resumed} = resume_ready_waiters(state, worker_id)
 
-    capacity_after_resume = max(limit(state.opts) - map_size(state.running), 0)
+    capacity_after_resume = max(concurrency(state.opts) - map_size(state.running), 0)
 
     ready_waiting =
       if capacity_after_resume > 0 do
@@ -63,7 +63,7 @@ defmodule Endurant.QueueManager do
     running_after_waiting =
       spawn_executions(ready_waiting, state.running, worker_id, self(), state.opts)
 
-    capacity = max(limit(state.opts) - map_size(running_after_waiting), 0)
+    capacity = max(concurrency(state.opts) - map_size(running_after_waiting), 0)
 
     executions =
       if capacity > 0 do
@@ -89,7 +89,7 @@ defmodule Endurant.QueueManager do
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %__MODULE__{} = state) do
     {:noreply,
-     %{state | running: Map.delete(state.running, ref), parked: Map.delete(state.parked, ref)}}
+     %{state | running: Map.delete(state.running, ref), cached: Map.delete(state.cached, ref)}}
   end
 
   @impl true
@@ -98,16 +98,16 @@ defmodule Endurant.QueueManager do
   end
 
   @impl true
-  def handle_call({:executor_parked, pid, execution_id}, _from, %__MODULE__{} = state) do
-    if map_size(state.parked) < parked_limit(state.opts) do
-      {:reply, :park, move_running_to_parked(state, pid, execution_id)}
+  def handle_call({:executor_cached, pid, execution_id}, _from, %__MODULE__{} = state) do
+    if map_size(state.cached) < cached_limit(state.opts) do
+      {:reply, :cache, move_running_to_cached(state, pid, execution_id)}
     else
       {:reply, :release, remove_from_running(state, pid, execution_id)}
     end
   end
 
   def handle_call({:executor_ready, pid, execution_id}, _from, %__MODULE__{} = state) do
-    {:reply, :ok, mark_parked_ready(state, pid, execution_id)}
+    {:reply, :ok, mark_cached_ready(state, pid, execution_id)}
   end
 
   @spec spawn_executions(list(term()), map(), String.t(), pid(), keyword()) :: map()
@@ -131,8 +131,8 @@ defmodule Endurant.QueueManager do
     end)
   end
 
-  @spec move_running_to_parked(state(), pid(), term()) :: state()
-  defp move_running_to_parked(%__MODULE__{} = state, pid, execution_id) do
+  @spec move_running_to_cached(state(), pid(), term()) :: state()
+  defp move_running_to_cached(%__MODULE__{} = state, pid, execution_id) do
     match =
       Enum.find(state.running, fn {_ref, info} ->
         info.pid == pid
@@ -142,13 +142,13 @@ defmodule Endurant.QueueManager do
       {ref, %{execution_id: ^execution_id} = info} ->
         running = Map.delete(state.running, ref)
 
-        parked_info =
+        cached_info =
           info
           |> Map.put(:execution_id, execution_id)
           |> Map.put(:ready?, false)
 
-        parked = Map.put(state.parked, ref, parked_info)
-        %{state | running: running, parked: parked}
+        cached = Map.put(state.cached, ref, cached_info)
+        %{state | running: running, cached: cached}
 
       {_ref, _info} ->
         state
@@ -177,10 +177,10 @@ defmodule Endurant.QueueManager do
     end
   end
 
-  @spec mark_parked_ready(state(), pid(), term()) :: state()
-  defp mark_parked_ready(%__MODULE__{} = state, pid, execution_id) do
+  @spec mark_cached_ready(state(), pid(), term()) :: state()
+  defp mark_cached_ready(%__MODULE__{} = state, pid, execution_id) do
     match =
-      Enum.find(state.parked, fn {_ref, info} ->
+      Enum.find(state.cached, fn {_ref, info} ->
         info.pid == pid
       end)
 
@@ -189,9 +189,9 @@ defmodule Endurant.QueueManager do
         if info.ready? do
           state
         else
-          parked = Map.put(state.parked, ref, %{info | ready?: true})
+          cached = Map.put(state.cached, ref, %{info | ready?: true})
           ready = :queue.in(ref, state.ready)
-          %{state | parked: parked, ready: ready}
+          %{state | cached: cached, ready: ready}
         end
 
       {_ref, _info} ->
@@ -205,38 +205,38 @@ defmodule Endurant.QueueManager do
   @spec promote_db_ready_waiters(state()) :: state()
   defp promote_db_ready_waiters(%__MODULE__{} = state) do
     pending_refs =
-      state.parked
+      state.cached
       |> Enum.filter(fn {_ref, info} -> not info.ready? end)
       |> Enum.map(fn {ref, _info} -> ref end)
 
     execution_ids =
       pending_refs
-      |> Enum.map(fn ref -> state.parked[ref].execution_id end)
+      |> Enum.map(fn ref -> state.cached[ref].execution_id end)
       |> Enum.uniq()
 
     ready_ids = Endurant.Executions.ready_for_resume_many(execution_ids, state.opts)
 
-    {parked, ready} =
-      Enum.reduce(pending_refs, {state.parked, state.ready}, fn ref, {parked_acc, ready_acc} ->
-        case Map.get(parked_acc, ref) do
+    {cached, ready} =
+      Enum.reduce(pending_refs, {state.cached, state.ready}, fn ref, {cached_acc, ready_acc} ->
+        case Map.get(cached_acc, ref) do
           %{execution_id: execution_id} = current ->
             if MapSet.member?(ready_ids, execution_id) do
-              {Map.put(parked_acc, ref, %{current | ready?: true}), :queue.in(ref, ready_acc)}
+              {Map.put(cached_acc, ref, %{current | ready?: true}), :queue.in(ref, ready_acc)}
             else
-              {parked_acc, ready_acc}
+              {cached_acc, ready_acc}
             end
 
           _ ->
-            {parked_acc, ready_acc}
+            {cached_acc, ready_acc}
         end
       end)
 
-    %{state | parked: parked, ready: ready}
+    %{state | cached: cached, ready: ready}
   end
 
   @spec resume_ready_waiters(state(), String.t()) :: {state(), non_neg_integer()}
   defp resume_ready_waiters(%__MODULE__{} = state, worker_id) do
-    capacity = max(limit(state.opts) - map_size(state.running), 0)
+    capacity = max(concurrency(state.opts) - map_size(state.running), 0)
     do_resume(state, worker_id, capacity, 0)
   end
 
@@ -247,16 +247,16 @@ defmodule Endurant.QueueManager do
   defp do_resume(%__MODULE__{} = state, worker_id, remaining, resumed) do
     case :queue.out(state.ready) do
       {{:value, ref}, ready_queue} ->
-        case Map.pop(state.parked, ref) do
-          {nil, parked_after_pop} ->
+        case Map.pop(state.cached, ref) do
+          {nil, cached_after_pop} ->
             do_resume(
-              %{state | parked: parked_after_pop, ready: ready_queue},
+              %{state | cached: cached_after_pop, ready: ready_queue},
               worker_id,
               remaining,
               resumed
             )
 
-          {info, parked_after_pop} ->
+          {info, cached_after_pop} ->
             case Endurant.Executions.mark_running(
                    info.execution_id,
                    worker_id,
@@ -268,7 +268,7 @@ defmodule Endurant.QueueManager do
                 running = Map.put(state.running, ref, Map.take(info, [:execution_id, :pid]))
 
                 do_resume(
-                  %{state | running: running, parked: parked_after_pop, ready: ready_queue},
+                  %{state | running: running, cached: cached_after_pop, ready: ready_queue},
                   worker_id,
                   remaining - 1,
                   resumed + 1
@@ -276,7 +276,7 @@ defmodule Endurant.QueueManager do
 
               {:error, :cancelled} ->
                 do_resume(
-                  %{state | parked: parked_after_pop, ready: ready_queue},
+                  %{state | cached: cached_after_pop, ready: ready_queue},
                   worker_id,
                   remaining,
                   resumed
@@ -284,7 +284,7 @@ defmodule Endurant.QueueManager do
 
               {:error, :lock_expired} ->
                 do_resume(
-                  %{state | parked: parked_after_pop, ready: ready_queue},
+                  %{state | cached: cached_after_pop, ready: ready_queue},
                   worker_id,
                   remaining,
                   resumed
@@ -292,7 +292,7 @@ defmodule Endurant.QueueManager do
 
               {:error, :not_found} ->
                 do_resume(
-                  %{state | parked: parked_after_pop, ready: ready_queue},
+                  %{state | cached: cached_after_pop, ready: ready_queue},
                   worker_id,
                   remaining,
                   resumed
@@ -308,11 +308,11 @@ defmodule Endurant.QueueManager do
   @spec poll_interval(keyword()) :: pos_integer()
   defp poll_interval(opts), do: Keyword.get(opts, :poll_interval, 1_000)
 
-  @spec limit(keyword()) :: pos_integer()
-  defp limit(opts), do: Keyword.get(opts, :limit, 1)
+  @spec concurrency(keyword()) :: pos_integer()
+  defp concurrency(opts), do: Keyword.get(opts, :concurrency, 1)
 
-  @spec parked_limit(keyword()) :: pos_integer()
-  defp parked_limit(opts), do: Keyword.get(opts, :parked_limit, 1_000)
+  @spec cached_limit(keyword()) :: pos_integer()
+  defp cached_limit(opts), do: Keyword.get(opts, :cached_limit, 1_000)
 
   @spec lease_ms(keyword()) :: pos_integer()
   defp lease_ms(opts), do: Keyword.get(opts, :lease_ms, 30_000)

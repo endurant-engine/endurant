@@ -29,7 +29,7 @@ defmodule Endurant.TestSupport.IntegrationCase do
          name: engine_name,
          queues: [
            orders:
-             [limit: 1, parked_limit: 1, poll_interval: 25] ++
+             [concurrency: 1, cached_limit: 1, poll_interval: 25] ++
                PostgresHelper.runtime_opts(prefix)
          ]}
       )

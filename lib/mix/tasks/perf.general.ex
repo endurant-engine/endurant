@@ -14,7 +14,7 @@ defmodule Mix.Tasks.Perf.General do
   Options:
   - `--count` number of executions per run (default: `1000`)
   - `--repeats` number of runs (default: `5`)
-  - `--limit` queue limit (default: `8`)
+  - `--concurrency` queue concurrency (default: `8`)
   - `--poll` queue poll interval ms (default: `50`)
   - `--lease` lock lease ms (default: `30000`)
   """
@@ -26,7 +26,7 @@ defmodule Mix.Tasks.Perf.General do
   @switches [
     count: :integer,
     repeats: :integer,
-    limit: :integer,
+    concurrency: :integer,
     poll: :integer,
     lease: :integer
   ]
@@ -45,7 +45,7 @@ defmodule Mix.Tasks.Perf.General do
     {opts, _, _} = OptionParser.parse(args, strict: @switches)
     count = positive(Keyword.get(opts, :count, 1_000), 1_000)
     repeats = positive(Keyword.get(opts, :repeats, 5), 5)
-    limit = positive(Keyword.get(opts, :limit, 8), 8)
+    concurrency = positive(Keyword.get(opts, :concurrency, 8), 8)
     poll_interval = positive(Keyword.get(opts, :poll, 50), 50)
     lease_ms = positive(Keyword.get(opts, :lease, 30_000), 30_000)
     prefix = "perf_general_#{System.system_time(:millisecond)}"
@@ -63,8 +63,8 @@ defmodule Mix.Tasks.Perf.General do
           ensure_clean_prefix!(prefix)
 
           queue_opts = [
-            limit: limit,
-            parked_limit: max(count * 2, 1_000),
+            concurrency: concurrency,
+            cached_limit: max(count * 2, 1_000),
             poll_interval: poll_interval,
             lease_ms: lease_ms
           ]
@@ -110,7 +110,7 @@ defmodule Mix.Tasks.Perf.General do
           }
         end)
 
-      print_summary(count, repeats, limit, poll_interval, results)
+      print_summary(count, repeats, concurrency, poll_interval, results)
     after
       helper_call!(:cleanup_prefix!, [prefix])
       Process.exit(repo_pid, :normal)
@@ -269,11 +269,13 @@ defmodule Mix.Tasks.Perf.General do
   end
 
   @spec print_summary(pos_integer(), pos_integer(), pos_integer(), pos_integer(), [map()]) :: :ok
-  defp print_summary(count, repeats, limit, poll_interval, results) do
+  defp print_summary(count, repeats, concurrency, poll_interval, results) do
     Mix.shell().info("")
     Mix.shell().info("Endurant General Performance Benchmark")
 
-    Mix.shell().info("count=#{count} repeats=#{repeats} limit=#{limit} poll=#{poll_interval}ms")
+    Mix.shell().info(
+      "count=#{count} repeats=#{repeats} concurrency=#{concurrency} poll=#{poll_interval}ms"
+    )
 
     Mix.shell().info("")
 

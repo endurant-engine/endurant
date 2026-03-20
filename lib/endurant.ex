@@ -15,7 +15,7 @@ defmodule Endurant do
       {:ok, _pid} =
         Endurant.start_link(
           name: "my_endurant",
-          queues: [default: [limit: 10]]
+          queues: [default: [concurrency: 10]]
         )
 
   Insert a workflow execution:
@@ -36,12 +36,12 @@ defmodule Endurant do
   Queue runtime options.
 
   Supported keys:
-  - `:limit` maximum number of concurrently running executions for that queue.
-  - `:parked_limit` maximum number of parked executions tracked in-memory.
+  - `:concurrency` maximum number of concurrently running executions for that queue.
+  - `:cached_limit` maximum number of cached executions tracked in-memory.
   - `:poll_interval` queue polling interval in milliseconds.
   - `:lease_ms` execution lock lease in milliseconds.
   - `:recovery_limit` maximum number of expired locked executions recovered per poll.
-  - `:heartbeat_interval` heartbeat interval used by long-running/parked executions.
+  - `:heartbeat_interval` heartbeat interval used by long-running/cached executions.
   - `:repo` Ecto repo module used for persistence.
   - `:prefix` database schema prefix.
   """
@@ -81,8 +81,8 @@ defmodule Endurant do
       Endurant.start_link(
         name: "my_endurant",
         queues: [
-          default: [limit: 10, poll_interval: 200],
-          emails: [limit: 5, poll_interval: 100]
+          default: [concurrency: 10, poll_interval: 200],
+          emails: [concurrency: 5, poll_interval: 100]
         ]
       )
   """

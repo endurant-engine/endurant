@@ -14,7 +14,7 @@ defmodule Endurant.Supervisor do
 
   @impl true
   def init(opts) do
-    queues = Keyword.get(opts, :queues, default: [limit: 1])
+    queues = Keyword.get(opts, :queues, default: [concurrency: 1])
     validate_unique_queues!(queues)
     instance = Keyword.fetch!(opts, :name)
 

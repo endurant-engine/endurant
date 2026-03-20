@@ -287,7 +287,7 @@ defmodule Endurant.Executor do
     |> case do
       :ok ->
         case notify_waiting(execution_id, opts) do
-          :park ->
+          :cache ->
             wait_for_time(run_at, heartbeat_ms)
             notify_ready(execution_id, opts)
             await_resume_signal()
@@ -322,10 +322,10 @@ defmodule Endurant.Executor do
     end
   end
 
-  @spec notify_waiting(binary(), keyword()) :: :park | :release
+  @spec notify_waiting(binary(), keyword()) :: :cache | :release
   defp notify_waiting(execution_id, opts) do
     manager = queue_manager!(opts)
-    GenServer.call(manager, {:executor_parked, self(), execution_id}, 5_000)
+    GenServer.call(manager, {:executor_cached, self(), execution_id}, 5_000)
   end
 
   @spec notify_ready(binary(), keyword()) :: :ok
