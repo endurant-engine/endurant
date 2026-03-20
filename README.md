@@ -3,84 +3,74 @@
 ## Description
 Endurant is a durable workflow engine where workflows are written as Elixir code. It has built-in retries, signals, and crash-safe recovery. It uses an event log and replays it during recovery to reconstruct workflow state.
 
-## Workflow Example: Shop Order With Vendor Choice
+## Workflow Example: Order Approval
 
 ```elixir
-defmodule MyApp.Workflows.ShopOrderWorkflow do
+defmodule MyApp.Workflows.OrderApprovalWorkflow do
   use Endurant.Workflow, version: "1"
 
   workflow do
     queue("orders")
-    unique_id(fn %{"order_id" => order_id} ->
-      "shop-order:#{order_id}"
-    end)
+    unique_id(fn %{"order_id" => order_id} -> "order:#{order_id}" end)
   end
 
   @impl Endurant.Workflow
   def run(_version, input) do
-    vendors = Map.get(input, "vendors", ["shop_a", "shop_b", "shop_c"])
-
     order =
       task(input, "load_order", fn i ->
         MyApp.Shop.load_order!(i["order_id"])
       end)
 
-    shipping_h = task_async(order, "quote_shipping", &MyApp.Shop.quote_shipping!/1)
-    tax_h = task_async(order, "quote_tax", &MyApp.Shop.quote_tax!/1)
+    pricing_h =
+      task_async(order, "quote_pricing", fn o ->
+        MyApp.Shop.quote_pricing!(o)
+      end)
 
-    offers =
-      task_async_stream(
-        vendors,
-        fn vendor -> "offer:#{vendor}" end,
-        fn vendor -> MyApp.Marketplace.fetch_offer!(vendor, order) end,
-        max_concurrency: 5
-      )
-      |> Enum.map(fn {_task_key, offer} -> offer end)
+    stock_h =
+      task_async(order, "check_stock", fn o ->
+        MyApp.Shop.check_stock!(o)
+      end)
 
-    totals = task_await_many([shipping_h, tax_h])
+    checks = task_await_many([pricing_h, stock_h])
 
-    task({order, offers, totals}, "ask_user_to_choose_vendor", fn {o, candidate_offers, quoted} ->
-      MyApp.Shop.notify_vendor_options!(o, candidate_offers, quoted)
+    task({order, checks}, "request_approval", fn {o, result} ->
+      MyApp.Shop.request_approval!(o, result)
       :ok
     end)
 
-    # Expected signal payload: %{"vendor_id" => "shop_b"}
-    selection = wait_signal("vendor_selected")
+    approval = wait_signal("approval_requested")
 
-    chosen_offer =
-      task({offers, selection}, "pick_vendor", fn {candidate_offers, picked} ->
-        vendor_id = picked["vendor_id"]
-
-        Enum.find(candidate_offers, fn offer -> offer.vendor_id == vendor_id end) ||
-          raise("unknown vendor: #{vendor_id}")
-      end)
-
-    payment =
-      task(
-        {order, chosen_offer, totals},
-        "charge_payment",
-        fn {o, offer, t} ->
-          MyApp.Payments.charge!(
-            order: o,
-            vendor_offer: offer,
-            shipping: t["quote_shipping"],
-            tax: t["quote_tax"]
-          )
-        end,
-        retry: [max_attempts: 3, backoff: :exponential, base_ms: 200]
-      )
-
-    task({order, chosen_offer, payment}, "place_order", fn {o, offer, p} ->
-      MyApp.Shop.place_order!(o, offer, p)
-      %{
-        order_id: o.id,
-        vendor_id: offer.vendor_id,
-        payment_id: p.id,
-        status: "confirmed"
-      }
-    end)
+    task(
+      {order, approval, checks},
+      "finalize_order",
+      fn {o, a, result} ->
+        MyApp.Shop.finalize_order!(o, a, result)
+      end,
+      retry: [max_attempts: 3, backoff: :exponential, base_ms: 250]
+    )
   end
 end
+```
+
+Start a workflow:
+
+```elixir
+{:ok, execution} =
+  Endurant.insert(
+    MyApp.Workflows.OrderApprovalWorkflow,
+    %{"order_id" => "o-123"}
+  )
+```
+
+Resume it later with external input:
+
+```elixir
+:ok =
+  Endurant.signal(
+    execution.id,
+    "approval_requested",
+    %{"approved" => true, "approved_by" => "ops@example.com"}
+  )
 ```
 
 

@@ -14,7 +14,6 @@ defmodule Endurant.Pruner do
   @default_retry_ms 2_000
   @default_scan_ms 30_000
   @default_batch_size 100
-  @default_retention_ms 30 * 24 * 60 * 60 * 1_000
 
   defstruct [
     :instance,
@@ -68,8 +67,7 @@ defmodule Endurant.Pruner do
       scan_ms: positive_integer(Keyword.get(opts, :scan_ms, @default_scan_ms), :scan_ms),
       batch_size:
         positive_integer(Keyword.get(opts, :batch_size, @default_batch_size), :batch_size),
-      retention_ms:
-        positive_integer(Keyword.get(opts, :retention_ms, @default_retention_ms), :retention_ms),
+      retention_ms: positive_integer(Keyword.fetch!(opts, :retention_ms), :retention_ms),
       runtime_opts: [repo: repo, prefix: prefix, db_log: Keyword.get(opts, :db_log, false)]
     }
 

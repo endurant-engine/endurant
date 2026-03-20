@@ -135,6 +135,9 @@ defmodule Endurant.Integration.ArchiversTest do
                 name: instance,
                 repo: Keyword.fetch!(runtime_opts, :repo),
                 prefix: prefix,
+                queues: [
+                  orders: [concurrency: 1, cached_limit: 1, poll_interval: 25]
+                ],
                 archivers: [
                   configured: [
                     module: TestArchiver,
@@ -185,6 +188,9 @@ defmodule Endurant.Integration.ArchiversTest do
                 name: instance,
                 repo: Keyword.fetch!(runtime_opts, :repo),
                 prefix: prefix,
+                queues: [
+                  orders: [concurrency: 1, cached_limit: 1, poll_interval: 25]
+                ],
                 archivers: [
                   configured: [
                     module: TestArchiver,

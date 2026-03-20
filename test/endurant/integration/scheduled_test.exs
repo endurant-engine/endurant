@@ -32,6 +32,19 @@ defmodule Endurant.Integration.ScheduledTest do
     end
   end
 
+  defmodule QueueRequiredScheduleWorkflow do
+    use Endurant.Workflow, version: "1"
+
+    workflow do
+      unique_id(fn %{"id" => id} -> "scheduled-no-queue:#{id}" end)
+    end
+
+    @impl Endurant.Workflow
+    def run(_version, input) do
+      %{id: input["id"], kind: "no-queue"}
+    end
+  end
+
   test "scheduled row dispatches to execution", %{
     engine_name: engine_name,
     runtime_opts: runtime_opts
@@ -116,6 +129,17 @@ defmodule Endurant.Integration.ScheduledTest do
                _ -> false
              end
            end)
+  end
+
+  test "schedule requires workflows to declare a queue", %{engine_name: engine_name} do
+    assert_raise ArgumentError, ~r/workflow must define queue/, fn ->
+      Endurant.schedule(
+        QueueRequiredScheduleWorkflow,
+        %{"id" => "missing-queue"},
+        DateTime.utc_now(),
+        instance: engine_name
+      )
+    end
   end
 
   @spec wait_for_execution_status(

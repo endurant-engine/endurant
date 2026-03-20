@@ -459,10 +459,10 @@ defmodule Endurant.QueueManager do
   defp poll_interval(opts), do: Keyword.get(opts, :poll_interval, 1_000)
 
   @spec concurrency(keyword()) :: pos_integer()
-  defp concurrency(opts), do: Keyword.get(opts, :concurrency, 1)
+  defp concurrency(opts), do: Keyword.fetch!(opts, :concurrency)
 
-  @spec cached_limit(keyword()) :: pos_integer()
-  defp cached_limit(opts), do: Keyword.get(opts, :cached_limit, 1_000)
+  @spec cached_limit(keyword()) :: non_neg_integer()
+  defp cached_limit(opts), do: Keyword.fetch!(opts, :cached_limit)
 
   @spec lease_ms(keyword()) :: pos_integer()
   defp lease_ms(opts), do: Keyword.get(opts, :lease_ms, 30_000)

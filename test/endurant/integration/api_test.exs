@@ -20,6 +20,19 @@ defmodule Endurant.Integration.ApiTest do
     end
   end
 
+  defmodule QueueRequiredWorkflow do
+    use Endurant.Workflow, version: "1"
+
+    workflow do
+      unique_id(fn %{id: id} -> "api-no-queue:#{id}" end)
+    end
+
+    @impl Endurant.Workflow
+    def run(_version, input) do
+      %{id: input["id"], ok: true}
+    end
+  end
+
   test("instance-targeted API resolves repo/prefix from local instance config", %{
     engine_name: engine_name,
     runtime_opts: runtime_opts
@@ -63,6 +76,12 @@ defmodule Endurant.Integration.ApiTest do
 
     assert {:error, :not_found} =
              Endurant.signal(unknown_execution_id, "unknown", %{}, instance: engine_name)
+  end
+
+  test("insert requires workflows to declare a queue", %{engine_name: engine_name}) do
+    assert_raise ArgumentError, ~r/workflow must define queue/, fn ->
+      Endurant.insert(QueueRequiredWorkflow, %{id: "missing-queue"}, instance: engine_name)
+    end
   end
 
   test("start_link loads repo/prefix/queues from application config", %{
