@@ -33,6 +33,7 @@ defmodule Endurant do
   Supported keys:
   - `:concurrency` maximum number of concurrently running executions for that queue.
   - `:cached_limit` maximum number of cached executions tracked in-memory.
+  - `:cached_ttl_ms` maximum time a cached waiting executor stays in memory before it is released back to persisted waiting state.
   - `:poll_interval` queue polling interval in milliseconds.
   - `:lease_ms` execution lock lease in milliseconds.
   - `:recovery_limit` maximum number of expired locked executions recovered per poll.
@@ -200,7 +201,7 @@ defmodule Endurant do
           scan_ms: 30_000
         ],
         queues: [
-          default: [concurrency: 10, poll_interval: 200],
+          default: [concurrency: 10, cached_ttl_ms: :infinity, poll_interval: 200],
           emails: [concurrency: 5, poll_interval: 100]
         ]
       )

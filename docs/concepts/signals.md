@@ -2,10 +2,16 @@
 
 Signals let you push data into a running or waiting workflow.
 
-Inside a workflow, use `wait_signal/1`:
+Inside a workflow, use `wait_signal/1` or `wait_signal/2`:
 
 ```elixir
 approval = wait_signal("approval_requested")
+```
+
+You can override the cached TTL for a specific wait:
+
+```elixir
+approval = wait_signal("approval_requested", cached_ttl_ms: 5_000)
 ```
 
 From outside the workflow, send a signal with `Endurant.signal/3` or `Endurant.signal/4`:
@@ -46,7 +52,8 @@ waiting and the queue manager either:
 - caches the executor process in memory for fast resume, or
 - releases it and lets another claim resume it later.
 
-Which path is used depends on queue settings such as `cached_limit`.
+Which path is used depends on queue settings such as `cached_limit` and
+`cached_ttl_ms`, plus any workflow-level `cached_ttl_ms/1` override.
 Both paths are durable because resume is driven by persisted events.
 
-See [Parking](../advanced/parking.md) for tuning and runtime behavior.
+See [Caching](../advanced/caching.md) for tuning and runtime behavior.

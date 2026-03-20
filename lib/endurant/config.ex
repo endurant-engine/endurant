@@ -5,11 +5,13 @@ defmodule Endurant.Config do
   @default_prefix "public"
   @default_queue_defaults [concurrency: 1]
   @default_db_log false
+  @default_cached_ttl_ms :infinity
 
   @type instance_name :: atom() | String.t()
   @type archiver_name :: String.t()
   @type archiver_options :: keyword()
   @type db_log_option :: boolean() | :debug | :info | :notice | :warning | :error | :critical
+  @type cached_ttl_option :: :infinity | pos_integer()
 
   @type t :: %__MODULE__{
           name: instance_name(),
@@ -63,6 +65,7 @@ defmodule Endurant.Config do
         merged =
           queue_defaults
           |> Keyword.merge(queue_opts)
+          |> normalize_cached_ttl_queue_opt!()
           |> Keyword.put(:db_log, db_log)
           |> Keyword.put(:repo, repo)
           |> Keyword.put(:prefix, prefix)
@@ -143,6 +146,24 @@ defmodule Endurant.Config do
         raise ArgumentError,
               ":db_log must be false, true, or a Logger level atom, got: #{inspect(other)}"
     end
+  end
+
+  @spec normalize_cached_ttl_queue_opt!(keyword()) :: keyword()
+  defp normalize_cached_ttl_queue_opt!(queue_opts) do
+    Keyword.put(
+      queue_opts,
+      :cached_ttl_ms,
+      normalize_cached_ttl_ms!(Keyword.get(queue_opts, :cached_ttl_ms, @default_cached_ttl_ms))
+    )
+  end
+
+  @spec normalize_cached_ttl_ms!(term()) :: cached_ttl_option()
+  defp normalize_cached_ttl_ms!(:infinity), do: :infinity
+  defp normalize_cached_ttl_ms!(value) when is_integer(value) and value > 0, do: value
+
+  defp normalize_cached_ttl_ms!(other) do
+    raise ArgumentError,
+          ":cached_ttl_ms must be a positive integer or :infinity, got: #{inspect(other)}"
   end
 
   @spec crons!(keyword()) :: [map()]

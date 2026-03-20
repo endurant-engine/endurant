@@ -239,6 +239,87 @@ defmodule Endurant.Integration.QueueManagerTest do
     assert Enum.any?(events, &(&1.type == :execution_resumed))
   end
 
+  test("wait_signal cached_ttl_ms releases cached waiting executors", %{
+    runtime_opts: runtime_opts,
+    engine_name: engine_name
+  }) do
+    instance = Keyword.fetch!(runtime_opts, :instance)
+
+    workflow_module =
+      quote do
+        defmodule Endurant.Integration.QueueManagerTest.CachedTimeoutWorkflow do
+          use Endurant.Workflow, version: "1"
+
+          workflow do
+            queue("orders")
+            cached_ttl_ms(100)
+            unique_id(fn %{id: id} -> "cached-timeout:#{id}" end)
+          end
+
+          @impl Endurant.Workflow
+          def run(_version, input) do
+            wait_signal("go_#{input["id"]}", cached_ttl_ms: 100)
+            %{id: input["id"], ok: true}
+          end
+        end
+      end
+
+    Code.compile_quoted(workflow_module)
+
+    assert {:ok, execution} =
+             Endurant.insert(
+               Endurant.Integration.QueueManagerTest.CachedTimeoutWorkflow,
+               %{id: "ct1"},
+               instance: instance
+             )
+
+    assert :waiting = wait_for_status(execution.id, :waiting, 2_000, runtime_opts)
+
+    queue_manager = queue_manager_pid!(engine_name)
+    cached_pid = cached_executor_pid!(queue_manager, execution.id)
+    assert_pid_exits!(cached_pid, 2_000)
+
+    assert %{status: :waiting} = Endurant.execution(execution.id, instance: instance)
+
+    assert :ok = Endurant.signal(execution.id, "go_ct1", %{}, instance: instance)
+
+    assert {:ok, %{status: :completed, result: %{id: "ct1", ok: true}}} =
+             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+  end
+
+  test("workflow cached_ttl_ms persists on execution metadata", %{runtime_opts: runtime_opts}) do
+    instance = Keyword.fetch!(runtime_opts, :instance)
+
+    workflow_module =
+      quote do
+        defmodule Endurant.Integration.QueueManagerTest.WorkflowCachedTimeoutMetadataWorkflow do
+          use Endurant.Workflow, version: "1"
+
+          workflow do
+            queue("orders")
+            cached_ttl_ms(:infinity)
+            unique_id(fn %{id: id} -> "workflow-cached-timeout-metadata:#{id}" end)
+          end
+
+          @impl Endurant.Workflow
+          def run(_version, input), do: input
+        end
+      end
+
+    Code.compile_quoted(workflow_module)
+
+    assert {:ok, execution} =
+             Endurant.insert(
+               Endurant.Integration.QueueManagerTest.WorkflowCachedTimeoutMetadataWorkflow,
+               %{id: "ct2"},
+               instance: instance
+             )
+
+    assert execution_metadata!(execution.id, runtime_opts) == %{
+             "endurant" => %{"cached_ttl_ms" => "infinity"}
+           }
+  end
+
   @spec wait_for_status(binary(), atom(), pos_integer(), keyword()) :: atom()
   defp wait_for_status(execution_id, expected_status, timeout_ms, runtime_opts) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
@@ -331,6 +412,44 @@ defmodule Endurant.Integration.QueueManagerTest do
     )
 
     :ok
+  end
+
+  @spec assert_pid_exits!(pid(), pos_integer()) :: :ok
+  defp assert_pid_exits!(pid, timeout_ms) when is_pid(pid) do
+    ref = Process.monitor(pid)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} ->
+        :ok
+    after
+      timeout_ms ->
+        flunk("process #{inspect(pid)} did not exit within #{timeout_ms}ms")
+    end
+  end
+
+  @spec execution_metadata!(binary(), keyword()) :: map()
+  defp execution_metadata!(execution_id, runtime_opts) do
+    prefix = Keyword.fetch!(runtime_opts, :prefix)
+
+    db_id =
+      case Ecto.UUID.dump(execution_id) do
+        {:ok, dumped} -> dumped
+        :error -> execution_id
+      end
+
+    case PostgresHelper.Repo.query!(
+           "SELECT metadata FROM #{prefix}.endurant_executions WHERE id = $1",
+           [db_id]
+         ).rows do
+      [[metadata]] when is_map(metadata) ->
+        metadata
+
+      [[nil]] ->
+        %{}
+
+      _ ->
+        flunk("execution #{execution_id} metadata not found")
+    end
   end
 
   @spec event_inserted_at!(binary(), atom(), keyword()) :: NaiveDateTime.t()
