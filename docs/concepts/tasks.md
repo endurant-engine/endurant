@@ -11,8 +11,25 @@ result =
   end)
 ```
 
+If you want to know whether a task result was executed in the current run or
+reused from workflow history, call `task_source/1` after the task resolves:
+
+```elixir
+result =
+  task(input, "fetch_user", fn i ->
+    MyApp.Accounts.fetch_user!(i["user_id"])
+  end)
+
+source = task_source("fetch_user")
+```
+
 Task names are important: Endurant keys task results by name. On replay, the
 result for the same task name is reused instead of rerunning the task.
+
+`task_source/1` returns:
+
+- `:executed` when the task ran in the current workflow execution pass
+- `:history` when the result came from existing workflow history during replay
 
 ## Retry
 

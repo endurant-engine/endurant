@@ -11,6 +11,42 @@ defmodule Endurant.Workflow.Tasks do
 
   # Sync
   @doc """
+  Returns whether a task result came from workflow history or was executed in the
+  current run.
+
+  This is intended to be called with the same task name used in `task/3,4` or an
+  async handle returned by `task_async/3,4`.
+
+  ## Examples
+
+      user = task(input, "fetch_user", fn i -> Accounts.get_user!(i["user_id"]) end)
+
+      case task_source("fetch_user") do
+        :executed -> Logger.info("fresh fetch")
+        :history -> Logger.info("replayed fetch")
+      end
+  """
+  @spec task_source(String.t() | AsyncHandle.t()) :: :executed | :history
+  def task_source(name_or_handle) do
+    runtime = Workflow.runtime!()
+
+    task_key =
+      case name_or_handle do
+        %AsyncHandle{task_key: task_key} -> task_key
+        other -> normalize_task_name!(other)
+      end
+
+    case Map.fetch(Map.get(runtime, :task_sources, %{}), task_key) do
+      {:ok, source} when source in [:executed, :history] ->
+        source
+
+      _ ->
+        raise ArgumentError,
+              "task source is unavailable for #{inspect(task_key)}; call task_source/1 after the task has been resolved"
+    end
+  end
+
+  @doc """
   Runs a deterministic task and returns its result.
 
   If a result for `name` already exists in workflow runtime state, it is returned without
@@ -72,7 +108,9 @@ defmodule Endurant.Workflow.Tasks do
 
           Workflow.put_runtime(%{
             current_runtime
-            | task_results: Map.put(current_runtime.task_results, task_key, result)
+            | task_results: Map.put(current_runtime.task_results, task_key, result),
+              task_sources:
+                Map.put(Map.get(current_runtime, :task_sources, %{}), task_key, :executed)
           })
 
           emit_task(runtime, :completed, %{
@@ -478,7 +516,8 @@ defmodule Endurant.Workflow.Tasks do
 
     Workflow.put_runtime(%{
       runtime
-      | task_results: Map.put(runtime.task_results, task_key, result)
+      | task_results: Map.put(runtime.task_results, task_key, result),
+        task_sources: Map.put(Map.get(runtime, :task_sources, %{}), task_key, :executed)
     })
 
     put_async_outcomes(Map.put(async_outcomes(), task_key, {:ok, result}))

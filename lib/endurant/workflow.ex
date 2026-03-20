@@ -97,6 +97,7 @@ defmodule Endurant.Workflow do
         only: [
           task: 3,
           task: 4,
+          task_source: 1,
           task_async: 3,
           task_async: 4,
           task_await: 1,

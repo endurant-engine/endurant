@@ -108,6 +108,7 @@ defmodule Endurant.Executor do
           | {:error, term(), binary()}
   defp run_workflow(workflow_module, execution, history, worker_id, opts) do
     task_results = task_results_from_history(history)
+    task_sources = task_sources_from_history(history)
     {signal_queues, loaded_signal_seq} = signal_state_from_history(history)
     {child_states, loaded_child_seq} = child_state_from_history(history)
 
@@ -123,6 +124,7 @@ defmodule Endurant.Executor do
       workflow: execution.workflow,
       version: execution.version,
       task_results: task_results,
+      task_sources: task_sources,
       task_failures: task_failures_from_history(history),
       waits: waits_from_history(history),
       signal_queues: signal_queues,
@@ -567,6 +569,22 @@ defmodule Endurant.Executor do
 
         %{type: :task_completed, payload: %{task: task, result: result}} ->
           Map.put(acc, task, result)
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
+  @spec task_sources_from_history([Events.event()]) :: %{optional(String.t()) => :history}
+  defp task_sources_from_history(events) do
+    Enum.reduce(events, %{}, fn event, acc ->
+      case event do
+        %{type: :task_completed, payload: %{"task" => task}} when is_binary(task) ->
+          Map.put(acc, task, :history)
+
+        %{type: :task_completed, payload: %{task: task}} when is_binary(task) ->
+          Map.put(acc, task, :history)
 
         _ ->
           acc
