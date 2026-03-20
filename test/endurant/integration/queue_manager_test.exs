@@ -2,7 +2,7 @@ defmodule Endurant.Integration.QueueManagerTest do
   use Endurant.TestSupport.IntegrationCase
 
   test(
-    "parked_limit saturation parks up to limit but additional executions still reach waiting state",
+    "cached_limit saturation caches up to concurrency but additional executions still reach waiting state",
     %{runtime_opts: runtime_opts}
   ) do
     workflow_module =
@@ -12,7 +12,7 @@ defmodule Endurant.Integration.QueueManagerTest do
 
           workflow do
             queue("orders")
-            unique_id(fn %{id: id} -> "waiting-limit:#{id}" end)
+            unique_id(fn %{id: id} -> "waiting-concurrency:#{id}" end)
           end
 
           @impl Endurant.Workflow
@@ -42,13 +42,17 @@ defmodule Endurant.Integration.QueueManagerTest do
              )
 
     assert :waiting = wait_for_status(b.id, :waiting, 2000, runtime_opts)
-    assert :ok = Endurant.signal(a.id, "go_a", %{}, instance: Keyword.fetch!(runtime_opts, :instance))
+
+    assert :ok =
+             Endurant.signal(a.id, "go_a", %{}, instance: Keyword.fetch!(runtime_opts, :instance))
 
     assert {:ok, %{status: :completed}} =
              PostgresHelper.wait_for_execution!(a.id, 5000, runtime_opts)
 
     assert :waiting = wait_for_status(b.id, :waiting, 2000, runtime_opts)
-    assert :ok = Endurant.signal(b.id, "go_b", %{}, instance: Keyword.fetch!(runtime_opts, :instance))
+
+    assert :ok =
+             Endurant.signal(b.id, "go_b", %{}, instance: Keyword.fetch!(runtime_opts, :instance))
 
     assert {:ok, %{status: :completed}} =
              PostgresHelper.wait_for_execution!(b.id, 5000, runtime_opts)
@@ -112,7 +116,9 @@ defmodule Endurant.Integration.QueueManagerTest do
              )
 
     assert %{status: :pending} =
-             Endurant.execution(pending_execution.id, instance: Keyword.fetch!(runtime_opts, :instance))
+             Endurant.execution(pending_execution.id,
+               instance: Keyword.fetch!(runtime_opts, :instance)
+             )
 
     assert :ok =
              Endurant.signal(
@@ -212,7 +218,7 @@ defmodule Endurant.Integration.QueueManagerTest do
 
     assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
     queue_manager = queue_manager_pid!(engine_name)
-    waiting_executor = parked_executor_pid!(queue_manager, execution.id)
+    waiting_executor = cached_executor_pid!(queue_manager, execution.id)
     Process.exit(waiting_executor, :kill)
     force_lock_expired!(execution.id, runtime_opts)
     Process.sleep(150)
@@ -221,7 +227,9 @@ defmodule Endurant.Integration.QueueManagerTest do
              Endurant.execution(execution.id, instance: Keyword.fetch!(runtime_opts, :instance))
 
     assert :ok =
-             Endurant.signal(execution.id, "go_wr1", %{}, instance: Keyword.fetch!(runtime_opts, :instance))
+             Endurant.signal(execution.id, "go_wr1", %{},
+               instance: Keyword.fetch!(runtime_opts, :instance)
+             )
 
     assert {:ok, %{status: :completed, result: %{id: "wr1", ok: true}}} =
              PostgresHelper.wait_for_execution!(execution.id, 8000, runtime_opts)
@@ -283,26 +291,26 @@ defmodule Endurant.Integration.QueueManagerTest do
     end
   end
 
-  @spec parked_executor_pid!(pid(), binary()) :: pid()
-  defp parked_executor_pid!(queue_manager, execution_id) when is_pid(queue_manager) do
+  @spec cached_executor_pid!(pid(), binary()) :: pid()
+  defp cached_executor_pid!(queue_manager, execution_id) when is_pid(queue_manager) do
     deadline = System.monotonic_time(:millisecond) + 2000
-    do_find_parked_executor_pid(queue_manager, execution_id, deadline)
+    do_find_cached_executor_pid(queue_manager, execution_id, deadline)
   end
 
-  @spec do_find_parked_executor_pid(pid(), binary(), integer()) :: pid()
-  defp do_find_parked_executor_pid(queue_manager, execution_id, deadline) do
+  @spec do_find_cached_executor_pid(pid(), binary(), integer()) :: pid()
+  defp do_find_cached_executor_pid(queue_manager, execution_id, deadline) do
     state = :sys.get_state(queue_manager)
 
-    case Enum.find(state.parked, fn {_ref, info} -> info.execution_id == execution_id end) do
+    case Enum.find(state.cached, fn {_ref, info} -> info.execution_id == execution_id end) do
       {_ref, info} ->
         info.pid
 
       nil ->
         if System.monotonic_time(:millisecond) >= deadline do
-          flunk("executor for #{execution_id} not found in parked set")
+          flunk("executor for #{execution_id} not found in cached set")
         else
           Process.sleep(20)
-          do_find_parked_executor_pid(queue_manager, execution_id, deadline)
+          do_find_cached_executor_pid(queue_manager, execution_id, deadline)
         end
     end
   end

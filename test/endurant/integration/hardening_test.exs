@@ -281,7 +281,7 @@ defmodule Endurant.Integration.HardeningTest do
              wait_for_event(execution.id, :execution_waiting, 5000, runtime_opts)
 
     assert :waiting = wait_for_status(execution.id, :waiting, 2000, runtime_opts)
-    kill_parked_executor!(execution.id, engine_name)
+    kill_cached_executor!(execution.id, engine_name)
     force_lock_expired!(execution.id, runtime_opts)
     _ = Endurant.Executions.recover_expired_locks(100, runtime_opts)
 
@@ -326,14 +326,18 @@ defmodule Endurant.Integration.HardeningTest do
     _ =
       for i <- 1..20 do
         Task.start(fn ->
-          Endurant.signal(execution.id, "go", %{n: i}, instance: Keyword.fetch!(runtime_opts, :instance))
+          Endurant.signal(execution.id, "go", %{n: i},
+            instance: Keyword.fetch!(runtime_opts, :instance)
+          )
         end)
       end
 
     _ =
       for i <- 1..20 do
         Task.start(fn ->
-          Endurant.signal(execution.id, "go2", %{n: i}, instance: Keyword.fetch!(runtime_opts, :instance))
+          Endurant.signal(execution.id, "go2", %{n: i},
+            instance: Keyword.fetch!(runtime_opts, :instance)
+          )
         end)
       end
 
@@ -554,25 +558,25 @@ WHERE id = $1
     end
   end
 
-  @spec kill_parked_executor!(binary(), String.t(), pos_integer()) :: :ok
-  defp kill_parked_executor!(execution_id, engine_name, timeout_ms \\ 2000) do
+  @spec kill_cached_executor!(binary(), String.t(), pos_integer()) :: :ok
+  defp kill_cached_executor!(execution_id, engine_name, timeout_ms \\ 2000) do
     manager_name = Endurant.Supervisor.queue_manager_name(engine_name, :orders)
     deadline = System.monotonic_time(:millisecond) + timeout_ms
-    pid = find_parked_executor_pid!(manager_name, execution_id, deadline)
+    pid = find_cached_executor_pid!(manager_name, execution_id, deadline)
     ref = Process.monitor(pid)
     Process.exit(pid, :kill)
 
     receive do
       {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
     after
-      timeout_ms -> raise "parked executor #{inspect(pid)} did not exit in #{timeout_ms}ms"
+      timeout_ms -> raise "cached executor #{inspect(pid)} did not exit in #{timeout_ms}ms"
     end
   end
 
-  @spec find_parked_executor_pid!(term(), binary(), integer()) :: pid()
-  defp find_parked_executor_pid!(manager_name, execution_id, deadline_ms) do
+  @spec find_cached_executor_pid!(term(), binary(), integer()) :: pid()
+  defp find_cached_executor_pid!(manager_name, execution_id, deadline_ms) do
     state = :sys.get_state(manager_name)
-    match = Enum.find(state.parked, fn {_ref, info} -> info.execution_id == execution_id end)
+    match = Enum.find(state.cached, fn {_ref, info} -> info.execution_id == execution_id end)
 
     case match do
       {_ref, %{pid: pid}} when is_pid(pid) ->
@@ -580,10 +584,10 @@ WHERE id = $1
 
       _ ->
         if System.monotonic_time(:millisecond) >= deadline_ms do
-          raise "parked executor not found for #{execution_id}"
+          raise "cached executor not found for #{execution_id}"
         else
           Process.sleep(20)
-          find_parked_executor_pid!(manager_name, execution_id, deadline_ms)
+          find_cached_executor_pid!(manager_name, execution_id, deadline_ms)
         end
     end
   end
@@ -595,7 +599,7 @@ WHERE id = $1
 
     pids =
       (state.running |> Map.values() |> Enum.map(& &1.pid)) ++
-        (state.parked |> Map.values() |> Enum.map(& &1.pid))
+        (state.cached |> Map.values() |> Enum.map(& &1.pid))
 
     pids
     |> Enum.uniq()
@@ -613,7 +617,7 @@ WHERE id = $1
   defp do_wait_for_queue_idle!(manager_name, deadline_ms) do
     state = :sys.get_state(manager_name)
 
-    if map_size(state.running) == 0 and map_size(state.parked) == 0 do
+    if map_size(state.running) == 0 and map_size(state.cached) == 0 do
       :ok
     else
       if System.monotonic_time(:millisecond) >= deadline_ms do

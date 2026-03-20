@@ -763,18 +763,18 @@ defmodule Endurant.Integration.ChildWorkflowTest do
     assert %{status: :running} = Endurant.Executions.get(execution.id, runtime_opts)
   end
 
-  test("parent waiting on child resumes after parked executor crash", %{
+  test("parent waiting on child resumes after cached executor crash", %{
     runtime_opts: runtime_opts,
     engine_name: engine_name
   }) do
     workflow_module =
       quote do
-        defmodule Endurant.Integration.ChildWorkflowTest.ParkedRecoveryChildWorkflow do
+        defmodule Endurant.Integration.ChildWorkflowTest.CachedRecoveryChildWorkflow do
           use Endurant.Workflow, version: "1"
 
           workflow do
             queue("orders")
-            unique_id(fn %{"id" => id} -> "child-workflow:parked-recovery-child:#{id}" end)
+            unique_id(fn %{"id" => id} -> "child-workflow:cached-recovery-child:#{id}" end)
           end
 
           @impl Endurant.Workflow
@@ -784,12 +784,12 @@ defmodule Endurant.Integration.ChildWorkflowTest do
           end
         end
 
-        defmodule Endurant.Integration.ChildWorkflowTest.ParkedRecoveryParentWorkflow do
+        defmodule Endurant.Integration.ChildWorkflowTest.CachedRecoveryParentWorkflow do
           use Endurant.Workflow, version: "1"
 
           workflow do
             queue("orders")
-            unique_id(fn %{"id" => id} -> "child-workflow:parked-recovery-parent:#{id}" end)
+            unique_id(fn %{"id" => id} -> "child-workflow:cached-recovery-parent:#{id}" end)
           end
 
           @impl Endurant.Workflow
@@ -797,7 +797,7 @@ defmodule Endurant.Integration.ChildWorkflowTest do
             child =
               child_workflow(
                 "child",
-                Endurant.Integration.ChildWorkflowTest.ParkedRecoveryChildWorkflow,
+                Endurant.Integration.ChildWorkflowTest.CachedRecoveryChildWorkflow,
                 %{"id" => input["id"]}
               )
 
@@ -812,7 +812,7 @@ defmodule Endurant.Integration.ChildWorkflowTest do
 
     assert {:ok, execution} =
              Endurant.insert(
-               Endurant.Integration.ChildWorkflowTest.ParkedRecoveryParentWorkflow,
+               Endurant.Integration.ChildWorkflowTest.CachedRecoveryParentWorkflow,
                %{"id" => "p12"},
                instance: instance
              )
@@ -821,7 +821,7 @@ defmodule Endurant.Integration.ChildWorkflowTest do
     assert :waiting = wait_for_status(execution.id, :waiting, 8_000, runtime_opts)
     assert :waiting = wait_for_status(child_execution_id, :waiting, 8_000, runtime_opts)
 
-    kill_parked_executor!(execution.id, engine_name)
+    kill_cached_executor!(execution.id, engine_name)
     force_lock_expired!(execution.id, runtime_opts)
     Process.sleep(150)
 
@@ -880,7 +880,10 @@ defmodule Endurant.Integration.ChildWorkflowTest do
     {:ok, events} = PostgresHelper.history(execution_id, runtime_opts)
 
     case Enum.find_value(events, fn
-           %{type: :child_execution_started, payload: %{"child_execution_id" => child_execution_id}} ->
+           %{
+             type: :child_execution_started,
+             payload: %{"child_execution_id" => child_execution_id}
+           } ->
              child_execution_id
 
            %{type: :child_execution_started, payload: %{child_execution_id: child_execution_id}} ->
@@ -986,25 +989,25 @@ defmodule Endurant.Integration.ChildWorkflowTest do
     end
   end
 
-  @spec kill_parked_executor!(binary(), String.t(), pos_integer()) :: :ok
-  defp kill_parked_executor!(execution_id, engine_name, timeout_ms \\ 2000) do
+  @spec kill_cached_executor!(binary(), String.t(), pos_integer()) :: :ok
+  defp kill_cached_executor!(execution_id, engine_name, timeout_ms \\ 2000) do
     manager_name = Endurant.Supervisor.queue_manager_name(engine_name, :orders)
     deadline = System.monotonic_time(:millisecond) + timeout_ms
-    pid = find_parked_executor_pid!(manager_name, execution_id, deadline)
+    pid = find_cached_executor_pid!(manager_name, execution_id, deadline)
     ref = Process.monitor(pid)
     Process.exit(pid, :kill)
 
     receive do
       {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
     after
-      timeout_ms -> raise "parked executor #{inspect(pid)} did not exit in #{timeout_ms}ms"
+      timeout_ms -> raise "cached executor #{inspect(pid)} did not exit in #{timeout_ms}ms"
     end
   end
 
-  @spec find_parked_executor_pid!(term(), binary(), integer()) :: pid()
-  defp find_parked_executor_pid!(manager_name, execution_id, deadline_ms) do
+  @spec find_cached_executor_pid!(term(), binary(), integer()) :: pid()
+  defp find_cached_executor_pid!(manager_name, execution_id, deadline_ms) do
     state = :sys.get_state(manager_name)
-    match = Enum.find(state.parked, fn {_ref, info} -> info.execution_id == execution_id end)
+    match = Enum.find(state.cached, fn {_ref, info} -> info.execution_id == execution_id end)
 
     case match do
       {_ref, %{pid: pid}} when is_pid(pid) ->
@@ -1012,10 +1015,10 @@ defmodule Endurant.Integration.ChildWorkflowTest do
 
       _ ->
         if System.monotonic_time(:millisecond) >= deadline_ms do
-          raise "parked executor not found for #{execution_id}"
+          raise "cached executor not found for #{execution_id}"
         else
           Process.sleep(20)
-          find_parked_executor_pid!(manager_name, execution_id, deadline_ms)
+          find_cached_executor_pid!(manager_name, execution_id, deadline_ms)
         end
     end
   end

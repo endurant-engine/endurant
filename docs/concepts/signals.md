@@ -38,15 +38,15 @@ To target a named instance:
 - A signal sent before `wait_signal/1` is still available when the workflow
   later waits for that key.
 
-## Signals and Parking
+## Signals and Caching
 
 When a workflow waits on `wait_signal/1`, Endurant marks the execution as
 waiting and the queue manager either:
 
-- parks the executor process in memory for fast resume, or
+- caches the executor process in memory for fast resume, or
 - releases it and lets another claim resume it later.
 
-Which path is used depends on queue settings such as `parked_limit`.
+Which path is used depends on queue settings such as `cached_limit`.
 Both paths are durable because resume is driven by persisted events.
 
 See [Parking](../advanced/parking.md) for tuning and runtime behavior.

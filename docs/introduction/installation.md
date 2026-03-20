@@ -58,8 +58,8 @@ def start(_type, _args) do
            repo: MyApp.Repo,
            queues: [
              orders: [
-               limit: 10,
-               parked_limit: 100,
+               concurrency: 10,
+               cached_limit: 100,
                poll_interval: 200
              ]
            ]
@@ -70,4 +70,3 @@ def start(_type, _args) do
   Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
 end
 ```
-

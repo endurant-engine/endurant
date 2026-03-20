@@ -165,7 +165,7 @@ defmodule Endurant.Integration.CronTest do
       name: sync_engine,
       repo: PostgresHelper.Repo,
       prefix: prefix,
-      queues: [orders: [limit: 1, parked_limit: 1, poll_interval: 25]]
+      queues: [orders: [concurrency: 1, cached_limit: 1, poll_interval: 25]]
     ]
 
     assert {:ok, pid1} =

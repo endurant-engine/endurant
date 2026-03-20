@@ -1,17 +1,32 @@
 defmodule Mix.Tasks.Perf.Waiting do
-  @moduledoc false
+  @moduledoc """
+  Measures runtime performance as DB waiting cardinality grows.
+
+  Metrics per step:
+  - signal->resume latency (p50/p95/p99)
+  - BEAM process count
+  - BEAM memory
+  - cached waiter count
+  - DB waiting row count
+
+  Run in test env:
+
+      MIX_ENV=test mix perf.waiting
+  """
   use Mix.Task
   require Logger
   @shortdoc "Run waiting-cardinality performance benchmark"
-  @switches steps: :integer,
-            batch: :integer,
-            limit: :integer,
-            parked_limit: :integer,
-            poll: :integer,
-            lease: :integer,
-            signal_sample: :integer,
-            insert_concurrency: :integer,
-            progress_every: :integer
+  @switches [
+    steps: :integer,
+    batch: :integer,
+    concurrency: :integer,
+    cached_limit: :integer,
+    poll: :integer,
+    lease: :integer,
+    signal_sample: :integer,
+    insert_concurrency: :integer,
+    progress_every: :integer
+  ]
   @impl Mix.Task
   @spec run([String.t()]) :: :ok
   def run(args) do
@@ -25,8 +40,8 @@ defmodule Mix.Tasks.Perf.Waiting do
     {opts, _, _} = OptionParser.parse(args, strict: @switches)
     steps = positive(Keyword.get(opts, :steps, 5), 5)
     batch = positive(Keyword.get(opts, :batch, 10000), 10000)
-    limit = positive(Keyword.get(opts, :limit, 8), 8)
-    parked_limit = non_negative(Keyword.get(opts, :parked_limit, 0), 0)
+    concurrency = positive(Keyword.get(opts, :concurrency, 8), 8)
+    cached_limit = non_negative(Keyword.get(opts, :cached_limit, 0), 0)
     poll_interval = positive(Keyword.get(opts, :poll, 50), 50)
     lease_ms = positive(Keyword.get(opts, :lease, 30000), 30000)
     signal_sample = positive(Keyword.get(opts, :signal_sample, 20), 20)
@@ -51,8 +66,8 @@ defmodule Mix.Tasks.Perf.Waiting do
           prefix: schema_prefix,
           queues: [
             perf: [
-              limit: limit,
-              parked_limit: parked_limit,
+              concurrency: concurrency,
+              cached_limit: cached_limit,
               poll_interval: poll_interval,
               lease_ms: lease_ms
             ]
@@ -63,8 +78,8 @@ defmodule Mix.Tasks.Perf.Waiting do
         print_header(
           steps,
           batch,
-          limit,
-          parked_limit,
+          concurrency,
+          cached_limit,
           poll_interval,
           signal_sample,
           insert_concurrency
@@ -138,7 +153,7 @@ defmodule Mix.Tasks.Perf.Waiting do
             waiting_rows: waiting_rows,
             processes: :erlang.system_info(:process_count),
             memory_mb: :erlang.memory(:total) / 1_048_576.0,
-            parked_count: parked_count(engine_name, :perf),
+            cached_count: cached_count(engine_name, :perf),
             resume_p50: percentile(signal_latencies, 50),
             resume_p95: percentile(signal_latencies, 95),
             resume_p99: percentile(signal_latencies, 99)
@@ -332,12 +347,12 @@ WHERE status = 'waiting'::#{prefix}.endurant_execution_status
     end
   end
 
-  @spec parked_count(String.t(), atom()) :: non_neg_integer()
-  defp parked_count(engine_name, queue) do
+  @spec cached_count(String.t(), atom()) :: non_neg_integer()
+  defp cached_count(engine_name, queue) do
     queue_name = Endurant.Supervisor.queue_manager_name(engine_name, queue)
 
     case :sys.get_state(queue_name) do
-      %{parked: parked} when is_map(parked) -> map_size(parked)
+      %{cached: cached} when is_map(cached) -> map_size(cached)
       _ -> 0
     end
   end
@@ -352,7 +367,11 @@ WHERE status = 'waiting'::#{prefix}.endurant_execution_status
     ids = waiting_ids(sample_size, runtime_opts)
 
     Enum.map(ids, fn id ->
-      :ok = Endurant.signal(id, "go", %{bench: true}, instance: Keyword.fetch!(runtime_opts, :instance))
+      :ok =
+        Endurant.signal(id, "go", %{bench: true},
+          instance: Keyword.fetch!(runtime_opts, :instance)
+        )
+
       {signal_seq, signal_at} = last_signal_event!(id, runtime_opts)
       latency = wait_resume_started_latency!(id, signal_seq, signal_at, runtime_opts, 30000)
       latency
@@ -456,8 +475,8 @@ LIMIT 1
   defp print_header(
          steps,
          batch,
-         limit,
-         parked_limit,
+         concurrency,
+         cached_limit,
          poll_interval,
          signal_sample,
          insert_concurrency
@@ -466,7 +485,7 @@ LIMIT 1
     Mix.shell().info("Endurant Waiting Cardinality Benchmark")
 
     Mix.shell().info(
-      "steps=#{steps} batch=#{batch} limit=#{limit} parked_limit=#{parked_limit} " <>
+      "steps=#{steps} batch=#{batch} concurrency=#{concurrency} cached_limit=#{cached_limit} " <>
         "poll=#{poll_interval}ms signal_sample=#{signal_sample} insert_concurrency=#{insert_concurrency}"
     )
 
@@ -482,7 +501,7 @@ LIMIT 1
         pad("waiting_rows", 13),
         pad("processes", 10),
         pad("memory_mb", 10),
-        pad("parked", 8),
+        pad("cached", 8),
         pad("resume_p95", 11),
         pad("resume_p99", 11)
       ]
@@ -498,7 +517,7 @@ LIMIT 1
         pad("#{row.waiting_rows}", 13),
         pad("#{row.processes}", 10),
         pad(fmt(row.memory_mb), 10),
-        pad("#{row.parked_count}", 8),
+        pad("#{row.cached_count}", 8),
         pad(fmt(row.resume_p95), 11),
         pad(fmt(row.resume_p99), 11)
       ]

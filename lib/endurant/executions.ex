@@ -1479,7 +1479,7 @@ defmodule Endurant.Executions do
   @doc """
   Transitions an owned waiting execution back to `running`.
 
-  This is used by the queue manager when resuming a parked executor process.
+  This is used by the queue manager when resuming a cached executor process.
   It only succeeds when:
 
     * execution exists
@@ -1602,7 +1602,7 @@ defmodule Endurant.Executions do
   Renews an execution lease heartbeat for the current worker.
 
   This is called by the executor heartbeat loop to keep ownership alive while
-  work is in progress or parked waiting.
+  work is in progress or cached waiting.
 
   Success requires:
 

@@ -5,13 +5,13 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
   @shortdoc "Run waiting benchmark with detailed slow-query output"
   @switches steps: :integer,
             batch: :integer,
-            limit: :integer,
+            concurrency: :integer,
             queues: :integer,
             time_wait_percent: :integer,
             time_wait_delay_ms: :integer,
             cancel_sample: :integer,
             retry_percent: :integer,
-            parked_limit: :integer,
+            cached_limit: :integer,
             poll: :integer,
             lease: :integer,
             signal_sample: :integer,
@@ -34,20 +34,20 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
         invalid |> Enum.map(fn {switch, _value} -> to_string(switch) end) |> Enum.join(", ")
 
       Mix.raise(
-        "invalid options: #{invalid_switches}. Use dashed names (for example --parked-limit, --signal-sample)."
+        "invalid options: #{invalid_switches}. Use dashed names (for example --cached-limit, --signal-sample)."
       )
     end
 
     steps = positive(Keyword.get(opts, :steps, 5), 5)
     batch = positive(Keyword.get(opts, :batch, 10000), 10000)
-    limit = positive(Keyword.get(opts, :limit, 8), 8)
+    concurrency = positive(Keyword.get(opts, :concurrency, 8), 8)
     queue_count = positive(Keyword.get(opts, :queues, 1), 1)
     queues = build_queues(queue_count)
     time_wait_percent = percent(Keyword.get(opts, :time_wait_percent, 0), 0)
     time_wait_delay_ms = positive(Keyword.get(opts, :time_wait_delay_ms, 1000), 1000)
     cancel_sample = non_negative(Keyword.get(opts, :cancel_sample, 0), 0)
     retry_percent = percent(Keyword.get(opts, :retry_percent, 0), 0)
-    parked_limit = non_negative(Keyword.get(opts, :parked_limit, 0), 0)
+    cached_limit = non_negative(Keyword.get(opts, :cached_limit, 0), 0)
     poll_interval = positive(Keyword.get(opts, :poll, 50), 50)
     lease_ms = positive(Keyword.get(opts, :lease, 30000), 30000)
     signal_sample = positive(Keyword.get(opts, :signal_sample, 20), 20)
@@ -73,8 +73,8 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
           queues:
             Enum.map(queues, fn queue ->
               {queue,
-               limit: limit,
-               parked_limit: parked_limit,
+               concurrency: concurrency,
+               cached_limit: cached_limit,
                poll_interval: poll_interval,
                lease_ms: lease_ms}
             end)
@@ -84,8 +84,8 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
         print_header(
           steps,
           batch,
-          limit,
-          parked_limit,
+          concurrency,
+          cached_limit,
           poll_interval,
           signal_sample,
           insert_concurrency,
@@ -185,7 +185,7 @@ defmodule Mix.Tasks.Perf.Waiting.Slow do
             waiting_rows: waiting_rows,
             processes: :erlang.system_info(:process_count),
             memory_mb: :erlang.memory(:total) / 1_048_576.0,
-            parked_count: parked_count(engine_name, queues),
+            cached_count: cached_count(engine_name, queues),
             resume_p50: percentile(signal_latencies, 50),
             resume_p95: percentile(signal_latencies, 95),
             resume_p99: percentile(signal_latencies, 99)
@@ -481,18 +481,18 @@ LIMIT $1
     repo.query!(sql, [limit], log: false).rows |> Enum.map(fn [id] -> to_app_id(id) end)
   end
 
-  @spec parked_count(String.t(), [atom()]) :: non_neg_integer()
-  defp parked_count(engine_name, queues) when is_list(queues) do
+  @spec cached_count(String.t(), [atom()]) :: non_neg_integer()
+  defp cached_count(engine_name, queues) when is_list(queues) do
     Enum.reduce(queues, 0, fn queue, acc ->
       queue_name = Endurant.Supervisor.queue_manager_name(engine_name, queue)
 
-      parked =
+      cached =
         case :sys.get_state(queue_name) do
-          %{parked: parked} when is_map(parked) -> map_size(parked)
+          %{cached: cached} when is_map(cached) -> map_size(cached)
           _ -> 0
         end
 
-      acc + parked
+      acc + cached
     end)
   end
 
@@ -506,7 +506,10 @@ LIMIT $1
     ids = waiting_ids(sample_size, runtime_opts)
 
     Enum.each(ids, fn id ->
-      :ok = Endurant.signal(id, "go", %{bench: true}, instance: Keyword.fetch!(runtime_opts, :instance))
+      :ok =
+        Endurant.signal(id, "go", %{bench: true},
+          instance: Keyword.fetch!(runtime_opts, :instance)
+        )
     end)
 
     signal_events = last_signal_events!(ids, runtime_opts)
@@ -651,8 +654,8 @@ LIMIT 1
   defp print_header(
          steps,
          batch,
-         limit,
-         parked_limit,
+         concurrency,
+         cached_limit,
          poll_interval,
          signal_sample,
          insert_concurrency,
@@ -666,7 +669,7 @@ LIMIT 1
     Mix.shell().info("Endurant Waiting Cardinality Benchmark")
 
     Mix.shell().info(
-      "steps=#{steps} batch=#{batch} limit=#{limit} parked_limit=#{parked_limit} " <>
+      "steps=#{steps} batch=#{batch} concurrency=#{concurrency} cached_limit=#{cached_limit} " <>
         "poll=#{poll_interval}ms signal_sample=#{signal_sample} insert_concurrency=#{insert_concurrency} " <>
         "queues=#{queue_count} time_wait_percent=#{time_wait_percent} " <>
         "time_wait_delay_ms=#{time_wait_delay_ms} cancel_sample=#{cancel_sample} " <>
@@ -685,7 +688,7 @@ LIMIT 1
         pad("waiting_rows", 13),
         pad("processes", 10),
         pad("memory_mb", 10),
-        pad("parked", 8),
+        pad("cached", 8),
         pad("resume_p95", 11),
         pad("resume_p99", 11)
       ]
@@ -701,7 +704,7 @@ LIMIT 1
         pad("#{row.waiting_rows}", 13),
         pad("#{row.processes}", 10),
         pad(fmt(row.memory_mb), 10),
-        pad("#{row.parked_count}", 8),
+        pad("#{row.cached_count}", 8),
         pad(fmt(row.resume_p95), 11),
         pad(fmt(row.resume_p99), 11)
       ]
