@@ -20,7 +20,7 @@ defmodule Endurant.ConfigTest do
     config =
       Endurant.Config.new!(
         repo: Repo,
-        queues: [default: [concurrency: 2]]
+        queues: [default: [concurrency: 2, cached_limit: 2]]
       )
 
     assert Keyword.fetch!(Keyword.fetch!(config.queues, :default), :cached_ttl_ms) ==
@@ -31,7 +31,7 @@ defmodule Endurant.ConfigTest do
     config =
       Endurant.Config.new!(
         repo: Repo,
-        queues: [default: [cached_ttl_ms: 5_000]]
+        queues: [default: [concurrency: 1, cached_limit: 1, cached_ttl_ms: 5_000]]
       )
 
     assert Keyword.fetch!(Keyword.fetch!(config.queues, :default), :cached_ttl_ms) == 5_000
@@ -39,7 +39,10 @@ defmodule Endurant.ConfigTest do
 
   test "cached_ttl_ms rejects invalid values" do
     assert_raise ArgumentError, ~r/:cached_ttl_ms/, fn ->
-      Endurant.Config.new!(repo: Repo, queues: [default: [cached_ttl_ms: 0]])
+      Endurant.Config.new!(
+        repo: Repo,
+        queues: [default: [concurrency: 1, cached_limit: 1, cached_ttl_ms: 0]]
+      )
     end
   end
 
