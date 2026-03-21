@@ -3,7 +3,7 @@ defmodule Endurant.Config do
 
   @default_name Endurant
   @default_prefix "public"
-  @default_queue_defaults [concurrency: 1]
+  @default_queue_defaults []
   @default_db_log false
   @default_cached_ttl_ms :infinity
 
@@ -118,6 +118,16 @@ defmodule Endurant.Config do
     case Keyword.get(opts, :queue_defaults, @default_queue_defaults) do
       defaults when is_list(defaults) ->
         if Keyword.keyword?(defaults) do
+          if Keyword.has_key?(defaults, :concurrency) do
+            raise ArgumentError,
+                  ":queue_defaults cannot set :concurrency; declare :concurrency on each queue explicitly"
+          end
+
+          if Keyword.has_key?(defaults, :cached_limit) do
+            raise ArgumentError,
+                  ":queue_defaults cannot set :cached_limit; declare :cached_limit on each queue explicitly"
+          end
+
           defaults
         else
           raise ArgumentError,
@@ -306,7 +316,11 @@ defmodule Endurant.Config do
 
   @spec queues!(keyword()) :: keyword(keyword())
   defp queues!(opts) do
-    queues = Keyword.get(opts, :queues, default: [])
+    queues =
+      case Keyword.fetch(opts, :queues) do
+        {:ok, queues} -> queues
+        :error -> raise ArgumentError, ":queues is required and must be a keyword list"
+      end
 
     if not Keyword.keyword?(queues) do
       raise ArgumentError, ":queues must be a keyword list, got: #{inspect(queues)}"
@@ -331,8 +345,39 @@ defmodule Endurant.Config do
               "queue options for #{inspect(normalized_queue)} must be keyword list, got: #{inspect(queue_opts)}"
       end
 
+      validate_queue_limits!(normalized_queue, queue_opts)
+
       {normalized_queue, queue_opts}
     end)
+  end
+
+  @spec validate_queue_limits!(atom(), keyword()) :: :ok
+  defp validate_queue_limits!(queue, queue_opts) do
+    case Keyword.fetch(queue_opts, :concurrency) do
+      {:ok, value} when is_integer(value) and value > 0 ->
+        :ok
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "queue #{inspect(queue)} :concurrency must be a positive integer, got: #{inspect(other)}"
+
+      :error ->
+        raise ArgumentError,
+              "queue #{inspect(queue)} must declare :concurrency explicitly"
+    end
+
+    case Keyword.fetch(queue_opts, :cached_limit) do
+      {:ok, value} when is_integer(value) and value >= 0 ->
+        :ok
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "queue #{inspect(queue)} :cached_limit must be a non-negative integer, got: #{inspect(other)}"
+
+      :error ->
+        raise ArgumentError,
+              "queue #{inspect(queue)} must declare :cached_limit explicitly"
+    end
   end
 
   @spec normalize_queue!(term()) :: atom()
@@ -443,15 +488,20 @@ defmodule Endurant.Config do
 
   @spec validate_pruner_config!(keyword()) :: :ok
   defp validate_pruner_config!(pruner_opts) do
-    case Keyword.fetch(pruner_opts, :enabled) do
-      {:ok, enabled} when is_boolean(enabled) ->
-        :ok
+    enabled =
+      case Keyword.fetch(pruner_opts, :enabled) do
+        {:ok, enabled} when is_boolean(enabled) ->
+          enabled
 
-      {:ok, other} ->
-        raise ArgumentError, ":pruner :enabled must be a boolean, got: #{inspect(other)}"
+        {:ok, other} ->
+          raise ArgumentError, ":pruner :enabled must be a boolean, got: #{inspect(other)}"
 
-      :error ->
-        :ok
+        :error ->
+          false
+      end
+
+    if enabled and not Keyword.has_key?(pruner_opts, :retention_ms) do
+      raise ArgumentError, ":pruner :retention_ms is required when :enabled is true"
     end
 
     :ok

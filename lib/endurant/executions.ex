@@ -5,7 +5,7 @@ defmodule Endurant.Executions do
   alias Endurant.Telemetry
 
   @default_prefix "public"
-  @default_list_limit 50
+  @default_list_limit 100
   @max_list_limit 1000
   @endurant_metadata_key "endurant"
   @cached_ttl_metadata_key "cached_ttl_ms"
@@ -273,7 +273,7 @@ defmodule Endurant.Executions do
     * `:terminal` - include terminal lifecycle statuses.
     * `:cursor` - keyset cursor `%{inserted_at: ..., id: ...}` or `{inserted_at, id}`.
     * `:order` - `:asc | :desc` (default `:desc`) by `inserted_at, id`.
-    * `:limit` - max rows (default `50`, max `1000`).
+    * `:limit` - max rows (default `100`, max `1000`).
   """
   @spec list(keyword(), keyword()) :: [execution_summary()]
   def list(filters \\ [], opts \\ []) when is_list(filters) and is_list(opts) do
@@ -3304,9 +3304,9 @@ defmodule Endurant.Executions do
   @spec resolve_queue(map()) :: String.t()
   defp resolve_queue(workflow) do
     case Map.get(workflow, :queue) do
+      nil -> raise ArgumentError, "workflow must define queue"
       queue when is_atom(queue) -> Atom.to_string(queue)
       queue when is_binary(queue) -> queue
-      nil -> "default"
       other -> raise ArgumentError, "invalid queue: #{inspect(other)}"
     end
   end

@@ -603,9 +603,9 @@ defmodule Endurant.Schedules do
   @spec resolve_queue(map()) :: String.t()
   defp resolve_queue(workflow) do
     case Map.get(workflow, :queue) do
+      nil -> raise ArgumentError, "workflow must define queue"
       queue when is_atom(queue) -> Atom.to_string(queue)
       queue when is_binary(queue) -> queue
-      nil -> "default"
       other -> raise ArgumentError, "invalid queue: #{inspect(other)}"
     end
   end

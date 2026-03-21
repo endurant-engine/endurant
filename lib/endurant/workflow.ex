@@ -173,6 +173,8 @@ defmodule Endurant.Workflow do
   Sets the queue name for this workflow.
 
   `value` must be a string.
+
+  Workflows must declare a queue explicitly.
   """
   defmacro queue(value) when is_binary(value) do
     quote do

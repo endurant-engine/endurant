@@ -88,6 +88,55 @@ defmodule Endurant.Integration.RetryPolicyTest do
     assert Enum.any?(events, &(&1.type == :execution_failed))
   end
 
+  test("task retries by default before failing", %{runtime_opts: runtime_opts}) do
+    workflow_module =
+      quote do
+        defmodule Endurant.Integration.RetryPolicyTest.DefaultRetryWorkflow do
+          use Endurant.Workflow, version: "1"
+
+          workflow do
+            queue("orders")
+            unique_id(fn %{id: id} -> "retry-default:#{id}" end)
+          end
+
+          @impl Endurant.Workflow
+          def run(_version, input) do
+            task(nil, "failing_step", fn _ ->
+              Endurant.Integration.RetryPolicyTest.RetryProbe.fail_twice_then_ok(input["id"])
+            end)
+          end
+        end
+      end
+
+    Code.compile_quoted(workflow_module)
+
+    assert {:ok, execution} =
+             Endurant.insert(
+               Endurant.Integration.RetryPolicyTest.DefaultRetryWorkflow,
+               %{id: "rd-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
+             )
+
+    assert {:ok, %{status: :completed, result: result}} =
+             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+
+    assert result == %{ok: true, key: "rd-1"}
+
+    {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
+    assert Enum.count(events, &(&1.type == :task_failed)) == 2
+
+    retry_wait_delays =
+      events
+      |> Enum.filter(&(&1.type == :execution_waiting))
+      |> Enum.filter(fn event ->
+        wait_key = event.payload["wait_key"] || event.payload[:wait_key]
+        is_binary(wait_key) and String.starts_with?(wait_key, "failing_step:")
+      end)
+      |> Enum.map(fn event -> event.payload["delay_ms"] || event.payload[:delay_ms] end)
+
+    assert retry_wait_delays == [250, 500]
+  end
+
   test("max attempts controls retry count", %{runtime_opts: runtime_opts}) do
     workflow_module =
       quote do
@@ -176,5 +225,77 @@ defmodule Endurant.Integration.RetryPolicyTest do
       |> Enum.map(fn event -> event.payload["delay_ms"] || event.payload[:delay_ms] end)
 
     assert retry_wait_delays == ~c"(P"
+  end
+
+  test("invalid retry max_attempts fails with a clear error", %{runtime_opts: runtime_opts}) do
+    workflow_module =
+      quote do
+        defmodule Endurant.Integration.RetryPolicyTest.InvalidMaxAttemptsWorkflow do
+          use Endurant.Workflow, version: "1"
+
+          workflow do
+            queue("orders")
+            unique_id(fn %{id: id} -> "retry-invalid-max:#{id}" end)
+          end
+
+          @impl Endurant.Workflow
+          def run(_version, _input) do
+            task(nil, "invalid_retry", fn _ -> :ok end, retry: [max_attempts: 0])
+          end
+        end
+      end
+
+    Code.compile_quoted(workflow_module)
+
+    assert {:ok, execution} =
+             Endurant.insert(
+               Endurant.Integration.RetryPolicyTest.InvalidMaxAttemptsWorkflow,
+               %{id: "rim-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
+             )
+
+    assert {:ok, %{status: :failed, result: error}} =
+             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+
+    assert Map.get(error, "message", "") =~ ":retry[:max_attempts] must be a positive integer"
+  end
+
+  test("invalid retry backoff fails with a clear error", %{runtime_opts: runtime_opts}) do
+    workflow_module =
+      quote do
+        defmodule Endurant.Integration.RetryPolicyTest.InvalidBackoffWorkflow do
+          use Endurant.Workflow, version: "1"
+
+          workflow do
+            queue("orders")
+            unique_id(fn %{id: id} -> "retry-invalid-backoff:#{id}" end)
+          end
+
+          @impl Endurant.Workflow
+          def run(_version, input) do
+            task(
+              nil,
+              "invalid_retry",
+              fn _ -> Endurant.Integration.RetryPolicyTest.RetryProbe.fail_once(input["id"]) end,
+              retry: [max_attempts: 2, backoff: :random]
+            )
+          end
+        end
+      end
+
+    Code.compile_quoted(workflow_module)
+
+    assert {:ok, execution} =
+             Endurant.insert(
+               Endurant.Integration.RetryPolicyTest.InvalidBackoffWorkflow,
+               %{id: "rib-1"},
+               instance: Keyword.fetch!(runtime_opts, :instance)
+             )
+
+    assert {:ok, %{status: :failed, result: error}} =
+             PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)
+
+    assert Map.get(error, "message", "") =~
+             ":retry[:backoff] must be :constant or :exponential"
   end
 end

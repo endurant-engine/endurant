@@ -823,7 +823,7 @@ defmodule Endurant.Integration.ChildWorkflowTest do
 
     kill_cached_executor!(execution.id, engine_name)
     force_lock_expired!(execution.id, runtime_opts)
-    Process.sleep(150)
+    _ = Endurant.Executions.recover_expired_locks(100, runtime_opts)
 
     assert %{status: :waiting} = Endurant.execution(execution.id, instance: instance)
 
@@ -831,6 +831,9 @@ defmodule Endurant.Integration.ChildWorkflowTest do
              Endurant.signal(child_execution_id, "finish_child", %{"ok" => true},
                instance: instance
              )
+
+    assert {:ok, %{status: :completed}} =
+             PostgresHelper.wait_for_execution!(child_execution_id, 8_000, runtime_opts)
 
     assert {:ok, %{status: :completed, result: result}} =
              PostgresHelper.wait_for_execution!(execution.id, 8_000, runtime_opts)

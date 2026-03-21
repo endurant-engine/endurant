@@ -131,11 +131,15 @@ defmodule Endurant do
   - `:repo` Ecto repo module for this instance.
   - `:prefix` database schema prefix (default `"public"`).
   - `:db_log` DB query logging for Endurant-issued queries (default `false`).
-  - `:queue_defaults` queue defaults merged into each queue config.
+  - `:queue_defaults` queue defaults merged into each queue config, except `:concurrency`
+    and `:cached_limit`.
   - `:crons` config-managed cron schedules synced on startup.
   - `:archivers` archive worker definitions.
   - `:pruner` archive pruning worker definition.
-  - `:queues` queue definitions and queue options.
+  - `:queues` required queue definitions and queue options.
+
+  Each queue must declare `:concurrency` and `:cached_limit` explicitly, and
+  workflows must declare `queue/1` explicitly.
 
   `:crons` entry options:
 
@@ -153,7 +157,7 @@ defmodule Endurant do
       config :endurant, :my_endurant,
         repo: MyApp.Repo,
         prefix: "public",
-        queues: [default: [concurrency: 10]]
+        queues: [default: [concurrency: 10, cached_limit: 100]]
 
   `:archivers` entry options:
 
@@ -172,6 +176,7 @@ defmodule Endurant do
 
   - `:enabled` enables the pruning worker (default `false`).
   - `:retention_ms` minimum age in milliseconds before archived terminal executions are pruned.
+    Required when `:enabled` is `true`.
   - `:batch_size` terminal executions pruned per pass.
   - `:scan_ms` prune scan interval in milliseconds.
   - `:heartbeat_ms` lease heartbeat interval in milliseconds.
@@ -201,8 +206,8 @@ defmodule Endurant do
           scan_ms: 30_000
         ],
         queues: [
-          default: [concurrency: 10, cached_ttl_ms: :infinity, poll_interval: 200],
-          emails: [concurrency: 5, poll_interval: 100]
+          default: [concurrency: 10, cached_limit: 100, cached_ttl_ms: :infinity, poll_interval: 200],
+          emails: [concurrency: 5, cached_limit: 50, poll_interval: 100]
         ]
       )
   """

@@ -32,6 +32,19 @@ defmodule Endurant.Integration.CronTest do
     end
   end
 
+  defmodule QueueRequiredCronWorkflow do
+    use Endurant.Workflow, version: "1"
+
+    workflow do
+      unique_id(fn %{"id" => id} -> "cron-no-queue:#{id}" end)
+    end
+
+    @impl Endurant.Workflow
+    def run(_version, input) do
+      %{id: input["id"], kind: "no-queue"}
+    end
+  end
+
   test "cron schedule dispatches fires and keeps status active at end_at boundary", %{
     engine_name: engine_name,
     runtime_opts: runtime_opts
@@ -143,6 +156,19 @@ defmodule Endurant.Integration.CronTest do
                _ -> false
              end
            end)
+  end
+
+  test "cron requires workflows to declare a queue", %{engine_name: engine_name} do
+    assert_raise ArgumentError, ~r/workflow must define queue/, fn ->
+      Endurant.cron(
+        QueueRequiredCronWorkflow,
+        %{"id" => "missing-queue"},
+        "*/1 * * * * *",
+        instance: engine_name,
+        start_at: DateTime.utc_now(),
+        end_at: DateTime.add(DateTime.utc_now(), 60, :second)
+      )
+    end
   end
 
   test "startup sync upserts config cron and keeps manual cron rows", %{

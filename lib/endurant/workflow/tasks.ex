@@ -55,9 +55,9 @@ defmodule Endurant.Workflow.Tasks do
   ## Options
 
     * `:retry` - keyword options:
-      * `:max_attempts` (default `1`)
-      * `:backoff` (`:constant` or `:exponential`, default `:constant`)
-      * `:base_ms` (default `100`)
+      * `:max_attempts` (default `3`)
+      * `:backoff` (`:constant` or `:exponential`, default `:exponential`)
+      * `:base_ms` (default `250`)
       * `:max_ms` (default `30_000`)
 
   ## Example
@@ -1024,20 +1024,30 @@ defmodule Endurant.Workflow.Tasks do
   # Shared helpers
   @spec max_attempts(keyword()) :: pos_integer()
   defp max_attempts(opts) do
-    retry_opts = Keyword.get(opts, :retry, [])
-
-    case Keyword.get(retry_opts, :max_attempts, 1) do
-      value when is_integer(value) and value > 0 -> value
-      _ -> 1
-    end
+    opts
+    |> retry_opts!()
+    |> Keyword.get(:max_attempts, 3)
+    |> positive_integer!(:retry_max_attempts)
   end
 
   @spec retry_delay_ms(pos_integer(), keyword()) :: pos_integer()
   defp retry_delay_ms(attempt, opts) do
-    retry_opts = Keyword.get(opts, :retry, [])
-    base = positive_integer(Keyword.get(retry_opts, :base_ms, 100))
-    max_delay = positive_integer(Keyword.get(retry_opts, :max_ms, 30_000))
-    backoff = Keyword.get(retry_opts, :backoff, :constant)
+    retry_opts = retry_opts!(opts)
+    base = positive_integer!(Keyword.get(retry_opts, :base_ms, 250), :retry_base_ms)
+    max_delay = positive_integer!(Keyword.get(retry_opts, :max_ms, 30_000), :retry_max_ms)
+
+    backoff =
+      case Keyword.get(retry_opts, :backoff, :exponential) do
+        :constant ->
+          :constant
+
+        :exponential ->
+          :exponential
+
+        other ->
+          raise ArgumentError,
+                ":retry[:backoff] must be :constant or :exponential, got: #{inspect(other)}"
+      end
 
     delay =
       case backoff do
@@ -1051,9 +1061,40 @@ defmodule Endurant.Workflow.Tasks do
     min(delay, max_delay)
   end
 
+  @spec retry_opts!(keyword()) :: keyword()
+  defp retry_opts!(opts) do
+    case Keyword.get(opts, :retry, []) do
+      retry_opts when is_list(retry_opts) ->
+        if Keyword.keyword?(retry_opts) do
+          retry_opts
+        else
+          raise ArgumentError, ":retry must be a keyword list, got: #{inspect(retry_opts)}"
+        end
+
+      other ->
+        raise ArgumentError, ":retry must be a keyword list, got: #{inspect(other)}"
+    end
+  end
+
   @spec positive_integer(term()) :: pos_integer()
   defp positive_integer(value) when is_integer(value) and value > 0, do: value
   defp positive_integer(_value), do: 1
+
+  @spec positive_integer!(term(), atom()) :: pos_integer()
+  defp positive_integer!(value, _field) when is_integer(value) and value > 0, do: value
+
+  defp positive_integer!(value, :retry_max_attempts) do
+    raise ArgumentError,
+          ":retry[:max_attempts] must be a positive integer, got: #{inspect(value)}"
+  end
+
+  defp positive_integer!(value, :retry_base_ms) do
+    raise ArgumentError, ":retry[:base_ms] must be a positive integer, got: #{inspect(value)}"
+  end
+
+  defp positive_integer!(value, :retry_max_ms) do
+    raise ArgumentError, ":retry[:max_ms] must be a positive integer, got: #{inspect(value)}"
+  end
 
   @spec format_error(Exception.t()) :: map()
   defp format_error(error) do
