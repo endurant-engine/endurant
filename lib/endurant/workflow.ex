@@ -15,6 +15,7 @@ defmodule Endurant.Workflow do
         workflow do
           queue("orders")
           cached_ttl_ms(30_000)
+          workflow_error_retry(base_ms: 60_000, max_ms: 3_600_000, max_attempts: nil)
           unique_id(fn %{"order_id" => id} -> "order:\#{id}" end)
         end
 
@@ -33,6 +34,7 @@ defmodule Endurant.Workflow do
 
     * `queue/1` sets the workflow queue
     * `cached_ttl_ms/1` overrides the queue cached TTL for this workflow
+    * `workflow_error_retry/1` configures automatic retry backoff for workflow orchestration errors
     * `unique_id/1` sets workflow uniqueness
   """
 
@@ -92,6 +94,7 @@ defmodule Endurant.Workflow do
           workflow: 1,
           queue: 1,
           cached_ttl_ms: 1,
+          workflow_error_retry: 1,
           unique_id: 1,
           sleep: 2,
           sleep: 3,
@@ -139,6 +142,10 @@ defmodule Endurant.Workflow do
       def __workflow_cached_ttl_ms__, do: nil
       defoverridable __workflow_cached_ttl_ms__: 0
 
+      @spec __workflow_workflow_error_retry__() :: keyword() | nil
+      def __workflow_workflow_error_retry__, do: nil
+      defoverridable __workflow_workflow_error_retry__: 0
+
       @spec __unique_id__(map()) :: String.t() | nil
       def __unique_id__(_input), do: nil
       defoverridable __unique_id__: 1
@@ -148,6 +155,7 @@ defmodule Endurant.Workflow do
         %{
           queue: __workflow_queue__(),
           cached_ttl_ms: __workflow_cached_ttl_ms__(),
+          workflow_error_retry: __workflow_workflow_error_retry__(),
           unique_id: &__MODULE__.__unique_id__/1,
           version: @endurant_workflow_version
         }
@@ -215,6 +223,35 @@ defmodule Endurant.Workflow do
   end
 
   @doc """
+  Configures automatic retry backoff for workflow orchestration errors.
+
+  Accepted options:
+
+    * `:base_ms` - base retry delay in milliseconds
+    * `:max_ms` - maximum retry delay in milliseconds
+    * `:max_attempts` - positive integer or `nil` for infinite retries
+    * `:backoff` - `:constant` or `:exponential`
+
+  Example:
+
+      workflow_error_retry(
+        base_ms: 60_000,
+        max_ms: 3_600_000,
+        max_attempts: nil,
+        backoff: :exponential
+      )
+  """
+  defmacro workflow_error_retry(value) do
+    retry_opts = Macro.expand(value, __CALLER__)
+    normalized = normalize_workflow_error_retry_opts!(retry_opts, Macro.to_string(value))
+
+    quote do
+      @spec __workflow_workflow_error_retry__() :: keyword()
+      def __workflow_workflow_error_retry__, do: unquote(Macro.escape(normalized))
+    end
+  end
+
+  @doc """
   Sets the unique id resolver for this workflow.
 
   Accepted forms:
@@ -256,6 +293,73 @@ defmodule Endurant.Workflow do
         end
       end
     end
+  end
+
+  @spec normalize_workflow_error_retry_opts!(term(), String.t()) :: keyword()
+  defp normalize_workflow_error_retry_opts!(retry_opts, original) when is_list(retry_opts) do
+    if Keyword.keyword?(retry_opts) do
+      base_ms = normalize_positive_integer!(Keyword.get(retry_opts, :base_ms), :base_ms, original)
+      max_ms = normalize_positive_integer!(Keyword.get(retry_opts, :max_ms), :max_ms, original)
+
+      max_attempts =
+        normalize_workflow_error_max_attempts!(
+          Keyword.get(retry_opts, :max_attempts, nil),
+          original
+        )
+
+      backoff =
+        normalize_workflow_error_backoff!(
+          Keyword.get(retry_opts, :backoff, :exponential),
+          original
+        )
+
+      if max_ms < base_ms do
+        raise ArgumentError,
+              "workflow_error_retry/1 expects :max_ms >= :base_ms, got: #{original}"
+      end
+
+      [base_ms: base_ms, max_ms: max_ms, max_attempts: max_attempts, backoff: backoff]
+    else
+      raise ArgumentError,
+            "workflow_error_retry/1 expects a keyword list, got: #{inspect(retry_opts)} from #{original}"
+    end
+  end
+
+  defp normalize_workflow_error_retry_opts!(other, original) do
+    raise ArgumentError,
+          "workflow_error_retry/1 expects a keyword list, got: #{inspect(other)} from #{original}"
+  end
+
+  @spec normalize_positive_integer!(term(), atom(), String.t()) :: pos_integer()
+  defp normalize_positive_integer!(value, _key, _original)
+       when is_integer(value) and value > 0,
+       do: value
+
+  defp normalize_positive_integer!(value, key, original) do
+    raise ArgumentError,
+          "workflow_error_retry/1 expects #{inspect(key)} to be a positive integer, got: #{inspect(value)} from #{original}"
+  end
+
+  @spec normalize_workflow_error_max_attempts!(term(), String.t()) :: nil | pos_integer()
+  defp normalize_workflow_error_max_attempts!(nil, _original), do: nil
+
+  defp normalize_workflow_error_max_attempts!(value, _original)
+       when is_integer(value) and value > 0,
+       do: value
+
+  defp normalize_workflow_error_max_attempts!(value, original) do
+    raise ArgumentError,
+          "workflow_error_retry/1 expects :max_attempts to be a positive integer or nil, got: #{inspect(value)} from #{original}"
+  end
+
+  @spec normalize_workflow_error_backoff!(term(), String.t()) :: :constant | :exponential
+  defp normalize_workflow_error_backoff!(backoff, _original)
+       when backoff in [:constant, :exponential],
+       do: backoff
+
+  defp normalize_workflow_error_backoff!(backoff, original) do
+    raise ArgumentError,
+          "workflow_error_retry/1 expects :backoff to be :constant or :exponential, got: #{inspect(backoff)} from #{original}"
   end
 
   @doc """

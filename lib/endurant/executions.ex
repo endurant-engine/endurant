@@ -9,8 +9,19 @@ defmodule Endurant.Executions do
   @max_list_limit 1000
   @endurant_metadata_key "endurant"
   @cached_ttl_metadata_key "cached_ttl_ms"
+  @workflow_error_metadata_key "workflow_error"
+  @workflow_error_retry_base_ms 60_000
+  @workflow_error_retry_max_ms 3_600_000
 
-  @open_status_strings ["pending", "running", "waiting", "continuable", "abandoned", "cancelling"]
+  @open_status_strings [
+    "pending",
+    "running",
+    "waiting",
+    "continuable",
+    "abandoned",
+    "workflow_error",
+    "cancelling"
+  ]
   @terminal_status_strings ["completed", "failed", "cancelled", "continued_as_new"]
   @all_status_strings @open_status_strings ++ @terminal_status_strings
 
@@ -20,6 +31,7 @@ defmodule Endurant.Executions do
           | :waiting
           | :continuable
           | :abandoned
+          | :workflow_error
           | :cancelling
           | :completed
           | :failed
@@ -55,7 +67,7 @@ defmodule Endurant.Executions do
           inserted_at: NaiveDateTime.t() | DateTime.t(),
           updated_at: NaiveDateTime.t() | DateTime.t()
         }
-  @type claim_ready_branch :: :continuable | :waiting_ready
+  @type claim_ready_branch :: :continuable | :waiting_ready | :workflow_error_ready
   @type recover_runnable_branch :: :running | :continuable | :waiting_ready
 
   @doc """
@@ -149,6 +161,7 @@ defmodule Endurant.Executions do
         'waiting'::#{prefix}.endurant_execution_status,
         'continuable'::#{prefix}.endurant_execution_status,
         'abandoned'::#{prefix}.endurant_execution_status,
+        'workflow_error'::#{prefix}.endurant_execution_status,
         'cancelling'::#{prefix}.endurant_execution_status
       )
       DO NOTHING
@@ -199,7 +212,7 @@ defmodule Endurant.Executions do
   Returns normalized execution data when found:
 
     * `:id` - execution id in app UUID format
-    * `:workflow` - stored workflow module name
+    * `:workflow` - workflow name
     * `:input` - workflow input map
     * `:status` - execution status atom
     * `:version` - workflow version string
@@ -263,10 +276,10 @@ defmodule Endurant.Executions do
   Supported filters:
     * `:status` - status atom/string or list of statuses.
     * `:queue` - queue atom/string or list of queues.
-    * `:workflow` - workflow module/string or list.
+    * `:workflow` - workflow name or list of workflow names.
     * `:execution_id` - one execution id.
     * `:execution_ids` - list of execution ids.
-    * `:unique_id` - exact unique id match.
+    * `:unique_id` - unique id match.
     * `:inserted_after` / `:inserted_before` - timestamp filters.
     * `:updated_after` / `:updated_before` - timestamp filters.
     * `:open` - include open lifecycle statuses.
@@ -375,7 +388,7 @@ defmodule Endurant.Executions do
   Returns a list of claimed executions. Each entry includes:
 
     * `:id` - execution id in app UUID format
-    * `:workflow` - stored workflow module name
+    * `:workflow` - workflow name
     * `:input` - workflow input map
     * `:status` - always `:running`
     * `:version` - workflow version string
@@ -497,8 +510,9 @@ defmodule Endurant.Executions do
     * `locked_by` matches `worker_id`
     * `locked_until` is present and still in the future
 
-  On success, `waiting_until` is cleared and an `:execution_started` event is
-  appended.
+  On success, `waiting_until` is cleared, any workflow-error retry bookkeeping
+  is cleared, and an `:execution_started` event is appended unless
+  `:skip_started_event` is set.
 
   ## Options
 
@@ -527,6 +541,7 @@ defmodule Endurant.Executions do
     SET
       status = 'running'::#{prefix}.endurant_execution_status,
       waiting_until = NULL,
+      metadata = $3,
       updated_at = timezone('UTC', now())
     WHERE id = $1
     AND status = 'running'::#{prefix}.endurant_execution_status
@@ -536,10 +551,43 @@ defmodule Endurant.Executions do
     RETURNING queue, workflow_name, version, inserted_at
     """
 
-    case query!(repo, sql, [execution_id, worker_id], opts).rows do
-      [[queue, workflow_name, version, inserted_at]] ->
-        Events.append(execution_id, :execution_started, %{worker_id: worker_id}, opts)
+    case Endurant.DB.transaction(
+           repo,
+           fn ->
+             case fetch_owned_running_execution_start_context(
+                    repo,
+                    prefix,
+                    execution_id,
+                    worker_id,
+                    opts
+                  ) do
+               {:ok, execution} ->
+                 metadata = clear_workflow_error_retry_metadata(execution.metadata)
 
+                 case query!(repo, sql, [execution_id, worker_id, metadata], opts).rows do
+                   [[queue, workflow_name, version, inserted_at]] ->
+                     unless Keyword.get(opts, :skip_started_event, false) do
+                       Events.append(
+                         execution_id,
+                         :execution_started,
+                         %{worker_id: worker_id},
+                         opts
+                       )
+                     end
+
+                     {queue, workflow_name, version, inserted_at}
+
+                   _ ->
+                     repo.rollback(:lock_lost)
+                 end
+
+               {:error, reason} ->
+                 repo.rollback(reason)
+             end
+           end,
+           opts
+         ) do
+      {:ok, {queue, workflow_name, version, inserted_at}} ->
         Telemetry.emit(
           [:execution, :started],
           %{
@@ -551,17 +599,8 @@ defmodule Endurant.Executions do
 
         :ok
 
-      _ ->
-        case lock_execution_status(repo, prefix, execution_id, opts) do
-          nil ->
-            {:error, :not_found}
-
-          status when status in [:cancelling, :cancelled] ->
-            {:error, :cancelled}
-
-          _ ->
-            {:error, :lock_lost}
-        end
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -766,6 +805,276 @@ defmodule Endurant.Executions do
 
       {:error, :not_running} ->
         {:error, :not_running}
+    end
+  end
+
+  @doc """
+  Marks a running execution as `workflow_error` for the current lease owner.
+
+  This is used for orchestration-code failures outside durable task execution.
+  The execution remains open, records the failure once, and is scheduled for
+  automatic retry using `waiting_until` plus mutable retry metadata.
+  """
+  @spec mark_workflow_errored_owned(binary(), String.t(), map(), keyword()) ::
+          :ok | {:error, :not_running}
+  def mark_workflow_errored_owned(execution_id, worker_id, error, opts \\ [])
+      when is_binary(worker_id) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    execution_id = to_db_id(execution_id)
+
+    sql = """
+    UPDATE #{prefix}.endurant_executions
+    SET
+      status = 'workflow_error'::#{prefix}.endurant_execution_status,
+      waiting_until = $3,
+      metadata = $4,
+      locked_by = NULL,
+      locked_until = NULL,
+      updated_at = timezone('UTC', now())
+    WHERE id = $1
+    AND status = 'running'::#{prefix}.endurant_execution_status
+    AND locked_by = $2
+    AND locked_until IS NOT NULL
+    AND locked_until > timezone('UTC', now())
+    """
+
+    case Endurant.DB.transaction(
+           repo,
+           fn ->
+             case fetch_owned_running_execution_metadata(
+                    repo,
+                    prefix,
+                    execution_id,
+                    worker_id,
+                    opts
+                  ) do
+               {:ok, execution} ->
+                 attempts = workflow_error_attempts(execution.metadata) + 1
+                 retry_scheduled? = workflow_error_retry_scheduled?(attempts, opts)
+
+                 retry_delay_ms =
+                   if retry_scheduled? do
+                     workflow_error_retry_delay_ms(attempts, opts)
+                   else
+                     nil
+                   end
+
+                 next_retry_at =
+                   if retry_scheduled? do
+                     DateTime.add(DateTime.utc_now(), retry_delay_ms, :millisecond)
+                   else
+                     nil
+                   end
+
+                 metadata = put_workflow_error_retry_metadata(execution.metadata, attempts, error)
+
+                 case query!(
+                        repo,
+                        sql,
+                        [execution_id, worker_id, maybe_naive(next_retry_at), metadata],
+                        opts
+                      ).num_rows do
+                   1 ->
+                     if attempts == 1 do
+                       Events.append(
+                         execution_id,
+                         :execution_workflow_errored,
+                         %{error: error},
+                         opts
+                       )
+                     end
+
+                     {
+                       basic_execution_context(repo, prefix, execution_id, opts),
+                       attempts,
+                       retry_delay_ms,
+                       retry_scheduled?
+                     }
+
+                   _ ->
+                     repo.rollback(:not_running)
+                 end
+
+               {:error, reason} ->
+                 repo.rollback(reason)
+             end
+           end,
+           opts
+         ) do
+      {:ok, {execution_context, attempts, retry_delay_ms, retry_scheduled?}} ->
+        Telemetry.emit(
+          [:execution, :workflow_errored],
+          %{count: 1},
+          execution_metadata(
+            opts,
+            execution_context.queue,
+            execution_context.workflow,
+            execution_context.version,
+            %{
+              error_kind: Telemetry.error_kind(error),
+              attempt: attempts,
+              retry_delay_ms: retry_delay_ms,
+              retry_scheduled: retry_scheduled?
+            }
+          )
+        )
+
+        :ok
+
+      {:error, :not_running} ->
+        {:error, :not_running}
+    end
+  end
+
+  @doc """
+  Marks a `workflow_error` execution for immediate retry.
+
+  This explicit operator-driven recovery path allows the execution to be picked
+  up again after fixed workflow code has been deployed.
+  """
+  @spec resume_workflow_error(binary(), keyword()) ::
+          :ok | {:error, :not_found | :not_workflow_error}
+  def resume_workflow_error(execution_id, opts \\ []) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    execution_id = to_db_id(execution_id)
+
+    case Endurant.DB.transaction(
+           repo,
+           fn ->
+             case lock_execution(repo, prefix, execution_id, opts) do
+               nil ->
+                 repo.rollback(:not_found)
+
+               %{status: :workflow_error} ->
+                 sql = """
+                 UPDATE #{prefix}.endurant_executions
+                 SET
+                   waiting_until = timezone('UTC', now()),
+                   locked_by = NULL,
+                   locked_until = NULL,
+                   updated_at = timezone('UTC', now())
+                 WHERE id = $1
+                 AND status = 'workflow_error'::#{prefix}.endurant_execution_status
+                 """
+
+                 case query!(repo, sql, [execution_id], opts).num_rows do
+                   1 ->
+                     basic_execution_context(repo, prefix, execution_id, opts)
+
+                   _ ->
+                     repo.rollback(:not_workflow_error)
+                 end
+
+               _ ->
+                 repo.rollback(:not_workflow_error)
+             end
+           end,
+           opts
+         ) do
+      {:ok, execution_context} ->
+        Telemetry.emit(
+          [:execution, :workflow_resumed],
+          %{count: 1},
+          execution_metadata(
+            opts,
+            execution_context.queue,
+            execution_context.workflow,
+            execution_context.version
+          )
+        )
+
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Marks multiple `workflow_error` executions for immediate retry.
+
+  Supported filters:
+
+    * `:workflow` - exact workflow name, for example `"MyApp.Workflows.OrderApprovalWorkflow"`
+    * `:queue` - exact queue name
+    * `:limit` - maximum number of executions to resume
+
+  Rows are resumed oldest-first by `inserted_at`, then `id`.
+  """
+  @spec resume_workflow_errors(keyword(), keyword()) :: non_neg_integer()
+  def resume_workflow_errors(filters \\ [], opts \\ []) when is_list(filters) and is_list(opts) do
+    repo = repo!(opts)
+    prefix = Keyword.get(opts, :prefix, @default_prefix)
+    workflow = normalize_optional_resume_workflow_filter!(Keyword.get(filters, :workflow))
+    queue = normalize_optional_resume_queue_filter!(Keyword.get(filters, :queue))
+
+    limit =
+      normalize_resume_workflow_errors_limit!(Keyword.get(filters, :limit, @default_list_limit))
+
+    {clauses, params} =
+      {["status = 'workflow_error'::#{prefix}.endurant_execution_status"], []}
+      |> maybe_add_resume_workflow_errors_clause("workflow_name", workflow)
+      |> maybe_add_resume_workflow_errors_clause("queue", queue)
+
+    where_sql = Enum.join(clauses, " AND ")
+    limit_idx = length(params) + 1
+
+    sql = """
+    WITH candidate AS (
+      SELECT id, queue, workflow_name, version
+      FROM #{prefix}.endurant_executions
+      WHERE #{where_sql}
+      ORDER BY inserted_at ASC, id ASC
+      LIMIT $#{limit_idx}
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE #{prefix}.endurant_executions e
+    SET
+      waiting_until = timezone('UTC', now()),
+      locked_by = NULL,
+      locked_until = NULL,
+      updated_at = timezone('UTC', now())
+    FROM candidate
+    WHERE e.id = candidate.id
+    RETURNING e.id, candidate.queue, candidate.workflow_name, candidate.version
+    """
+
+    case Endurant.DB.transaction(
+           repo,
+           fn ->
+             rows = query!(repo, sql, params ++ [limit], opts).rows
+
+             Enum.map(rows, fn [id, queue_name, workflow_name, version] ->
+               %{
+                 id: to_app_id(id),
+                 queue: queue_name,
+                 workflow: workflow_name,
+                 version: version
+               }
+             end)
+           end,
+           opts
+         ) do
+      {:ok, executions} ->
+        Enum.each(executions, fn execution ->
+          Telemetry.emit(
+            [:execution, :workflow_resumed],
+            %{count: 1},
+            execution_metadata(
+              opts,
+              execution.queue,
+              execution.workflow,
+              execution.version
+            )
+          )
+        end)
+
+        length(executions)
+
+      {:error, reason} ->
+        raise "resume_workflow_errors failed: #{inspect(reason)}"
     end
   end
 
@@ -1398,15 +1707,17 @@ defmodule Endurant.Executions do
   Eligible executions are:
 
     * `continuable`, or
-    * `waiting` with `waiting_until <= now()`
+    * `waiting` with `waiting_until <= now()`, or
+    * `workflow_error` with `waiting_until <= now()`
 
   Additional gating rules:
 
     * queue matches `queue`
     * execution is currently unowned (`locked_by IS NULL`)
 
-  For each claimed row, `:execution_resumed` is appended in the same
-  transaction as the state update.
+  For `continuable` and ready `waiting` rows, `:execution_resumed` is appended
+  in the same transaction as the state update. Automatic `workflow_error`
+  retries do not append resume events.
 
   ## Parameters
 
@@ -1427,7 +1738,7 @@ defmodule Endurant.Executions do
   Returns a list of claimed executions. Each entry includes:
 
     * `:id` - execution id in app UUID format
-    * `:workflow` - stored workflow module name
+    * `:workflow` - workflow name
     * `:input` - workflow input map
     * `:status` - always `:running`
     * `:version` - workflow version string
@@ -1472,10 +1783,14 @@ defmodule Endurant.Executions do
                  status: :running,
                  version: version,
                  claim_branch: branch,
-                 previous_status: claim_branch_previous_status(branch)
+                 previous_status: claim_branch_previous_status(branch),
+                 start_confirmed: claim_branch_start_confirmed?(branch),
+                 suppress_started_event: claim_branch_suppresses_started_event?(branch)
                }
 
-               Events.append(execution.id, :execution_resumed, %{worker_id: worker_id}, opts)
+               if claim_branch_emits_resumed_event?(branch) do
+                 Events.append(execution.id, :execution_resumed, %{worker_id: worker_id}, opts)
+               end
 
                execution
              end)
@@ -1484,20 +1799,22 @@ defmodule Endurant.Executions do
          ) do
       {:ok, executions} ->
         Enum.each(executions, fn execution ->
-          Telemetry.emit(
-            [:execution, :resumed],
-            %{count: 1},
-            execution_metadata(
-              opts,
-              execution.queue,
-              execution.workflow,
-              execution.version,
-              %{
-                previous_status: execution.previous_status,
-                claim_branch: execution.claim_branch
-              }
+          if claim_branch_emits_resumed_event?(execution.claim_branch) do
+            Telemetry.emit(
+              [:execution, :resumed],
+              %{count: 1},
+              execution_metadata(
+                opts,
+                execution.queue,
+                execution.workflow,
+                execution.version,
+                %{
+                  previous_status: execution.previous_status,
+                  claim_branch: execution.claim_branch
+                }
+              )
             )
-          )
+          end
         end)
 
         Enum.map(executions, &Map.drop(&1, [:claim_branch, :previous_status]))
@@ -1925,12 +2242,13 @@ defmodule Endurant.Executions do
 
   @spec claim_ready_branch_order(keyword()) :: [claim_ready_branch()]
   defp claim_ready_branch_order(opts) do
-    default_order = [:continuable, :waiting_ready]
+    default_order = [:continuable, :waiting_ready, :workflow_error_ready]
     configured_order = Keyword.get(opts, :claim_order, default_order)
 
     case configured_order do
-      [first, second] = order ->
-        if first != second and MapSet.new(order) == MapSet.new(default_order) do
+      [_first, _second, _third] = order ->
+        if length(Enum.uniq(order)) == length(default_order) and
+             MapSet.new(order) == MapSet.new(default_order) do
           order
         else
           default_order
@@ -1974,6 +2292,33 @@ defmodule Endurant.Executions do
       FROM #{prefix}.endurant_executions e
       WHERE e.queue = $1
       AND e.status = 'waiting'::#{prefix}.endurant_execution_status
+      AND e.waiting_until IS NOT NULL
+      AND e.waiting_until <= timezone('UTC', now())
+      AND e.locked_by IS NULL
+      ORDER BY e.inserted_at ASC, e.id ASC
+      LIMIT $2
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE #{prefix}.endurant_executions e
+    SET
+      status = 'running'::#{prefix}.endurant_execution_status,
+      waiting_until = NULL,
+      locked_by = $3,
+      locked_until = timezone('UTC', now()) + ($4::int * interval '1 millisecond'),
+      updated_at = timezone('UTC', now())
+    FROM candidate
+    WHERE e.id = candidate.id
+    RETURNING e.id, e.workflow_name, e.input, e.version
+    """
+  end
+
+  defp claim_ready_waiting_sql(prefix, :workflow_error_ready) do
+    """
+    WITH candidate AS (
+      SELECT e.id
+      FROM #{prefix}.endurant_executions e
+      WHERE e.queue = $1
+      AND e.status = 'workflow_error'::#{prefix}.endurant_execution_status
       AND e.waiting_until IS NOT NULL
       AND e.waiting_until <= timezone('UTC', now())
       AND e.locked_by IS NULL
@@ -2157,6 +2502,8 @@ defmodule Endurant.Executions do
 
   Signals are accepted only for active execution states:
   `pending`, `running`, `waiting`, `continuable`, `abandoned`.
+  Executions in `workflow_error` remain open for uniqueness, but they do not
+  accept new signals until explicitly resumed.
 
   ## Parameters
 
@@ -2253,7 +2600,7 @@ defmodule Endurant.Executions do
     * running executions transition to `cancelling` and are finalized by the
       running executor (or recovery on lease expiry)
     * non-running active executions (`pending`, `waiting`, `continuable`,
-      `abandoned`) transition to `cancelling` and are finalized immediately
+      `abandoned`, `workflow_error`) transition to `cancelling` and are finalized immediately
     * repeated cancellation requests for `cancelling`/`cancelled` are idempotent
 
   ## Options
@@ -2335,7 +2682,7 @@ defmodule Endurant.Executions do
                  {:running, execution}
 
                %{status: status} = execution
-               when status in [:pending, :waiting, :continuable, :abandoned] ->
+               when status in [:pending, :waiting, :continuable, :abandoned, :workflow_error] ->
                  mark_cancelling_in_tx(repo, prefix, execution_id, opts)
                  {:finalize_now, execution}
 
@@ -2452,7 +2799,8 @@ defmodule Endurant.Executions do
       'running'::#{prefix}.endurant_execution_status,
       'waiting'::#{prefix}.endurant_execution_status,
       'continuable'::#{prefix}.endurant_execution_status,
-      'abandoned'::#{prefix}.endurant_execution_status
+      'abandoned'::#{prefix}.endurant_execution_status,
+      'workflow_error'::#{prefix}.endurant_execution_status
     )
     """
 
@@ -2713,6 +3061,21 @@ defmodule Endurant.Executions do
     raise ArgumentError, ":unique_id must be a binary, got: #{inspect(other)}"
   end
 
+  @spec maybe_add_resume_workflow_errors_clause(
+          {[String.t()], list()},
+          String.t(),
+          nil | String.t()
+        ) ::
+          {[String.t()], list()}
+  defp maybe_add_resume_workflow_errors_clause({clauses, params}, _column, nil),
+    do: {clauses, params}
+
+  defp maybe_add_resume_workflow_errors_clause({clauses, params}, column, value)
+       when is_binary(column) and is_binary(value) do
+    index = length(params) + 1
+    {clauses ++ ["#{column} = $#{index}"], params ++ [value]}
+  end
+
   @spec maybe_add_time_clause(
           [String.t()],
           list(),
@@ -2893,12 +3256,34 @@ defmodule Endurant.Executions do
     raise ArgumentError, "queue filter must be atom, binary, or list, got: #{inspect(other)}"
   end
 
+  @spec normalize_optional_resume_queue_filter!(term()) :: nil | String.t()
+  defp normalize_optional_resume_queue_filter!(nil), do: nil
+  defp normalize_optional_resume_queue_filter!(queue), do: normalize_queue_value!(queue)
+
   @spec normalize_workflow_value!(term()) :: String.t()
   defp normalize_workflow_value!(workflow) when is_atom(workflow), do: inspect(workflow)
   defp normalize_workflow_value!(workflow) when is_binary(workflow), do: workflow
 
   defp normalize_workflow_value!(other) do
-    raise ArgumentError, "workflow filter must be module or binary, got: #{inspect(other)}"
+    raise ArgumentError,
+          "workflow filter must be a workflow name or module, got: #{inspect(other)}"
+  end
+
+  @spec normalize_optional_resume_workflow_filter!(term()) :: nil | String.t()
+  defp normalize_optional_resume_workflow_filter!(nil), do: nil
+
+  defp normalize_optional_resume_workflow_filter!(workflow) do
+    normalize_workflow_value!(workflow)
+  end
+
+  @spec normalize_resume_workflow_errors_limit!(term()) :: pos_integer()
+  defp normalize_resume_workflow_errors_limit!(value) when is_integer(value) and value > 0 do
+    min(value, @max_list_limit)
+  end
+
+  defp normalize_resume_workflow_errors_limit!(other) do
+    raise ArgumentError,
+          ":limit for resume_workflow_errors must be a positive integer, got: #{inspect(other)}"
   end
 
   @spec normalize_cursor_filter!(term()) :: {NaiveDateTime.t(), binary()} | nil
@@ -2972,6 +3357,102 @@ defmodule Endurant.Executions do
       |> Map.put(@cached_ttl_metadata_key, dump_cached_ttl_ms!(cached_ttl_ms))
 
     Map.put(metadata, @endurant_metadata_key, internal_metadata)
+  end
+
+  @spec internal_metadata(map()) :: map()
+  defp internal_metadata(metadata) when is_map(metadata) do
+    metadata
+    |> Map.get(@endurant_metadata_key, Map.get(metadata, :endurant, %{}))
+    |> normalize_execution_row_metadata()
+  end
+
+  @spec put_internal_metadata(map(), map()) :: map()
+  defp put_internal_metadata(metadata, internal_metadata)
+       when is_map(metadata) and is_map(internal_metadata) do
+    if map_size(internal_metadata) == 0 do
+      metadata
+      |> Map.delete(@endurant_metadata_key)
+      |> Map.delete(:endurant)
+    else
+      Map.put(metadata, @endurant_metadata_key, internal_metadata)
+    end
+  end
+
+  @spec workflow_error_attempts(map()) :: non_neg_integer()
+  defp workflow_error_attempts(metadata) when is_map(metadata) do
+    metadata
+    |> internal_metadata()
+    |> Map.get(@workflow_error_metadata_key, %{})
+    |> Map.get("attempts", 0)
+    |> normalize_workflow_error_attempts()
+  end
+
+  @spec clear_workflow_error_retry_metadata(map()) :: map()
+  defp clear_workflow_error_retry_metadata(metadata) when is_map(metadata) do
+    internal_metadata =
+      metadata
+      |> internal_metadata()
+      |> Map.delete(@workflow_error_metadata_key)
+
+    put_internal_metadata(metadata, internal_metadata)
+  end
+
+  @spec put_workflow_error_retry_metadata(map(), pos_integer(), map()) :: map()
+  defp put_workflow_error_retry_metadata(metadata, attempts, error)
+       when is_map(metadata) and is_integer(attempts) and attempts > 0 and is_map(error) do
+    workflow_error_metadata = %{
+      "attempts" => attempts,
+      "last_error" => error,
+      "last_error_at" =>
+        DateTime.utc_now() |> DateTime.truncate(:microsecond) |> DateTime.to_iso8601()
+    }
+
+    internal_metadata =
+      metadata
+      |> internal_metadata()
+      |> Map.put(@workflow_error_metadata_key, workflow_error_metadata)
+
+    put_internal_metadata(metadata, internal_metadata)
+  end
+
+  @spec normalize_workflow_error_attempts(term()) :: non_neg_integer()
+  defp normalize_workflow_error_attempts(attempts)
+       when is_integer(attempts) and attempts >= 0,
+       do: attempts
+
+  defp normalize_workflow_error_attempts(attempts) when is_binary(attempts) do
+    case Integer.parse(attempts) do
+      {parsed, ""} when parsed >= 0 -> parsed
+      _ -> 0
+    end
+  end
+
+  defp normalize_workflow_error_attempts(_attempts), do: 0
+
+  @spec workflow_error_retry_delay_ms(pos_integer(), keyword()) :: pos_integer()
+  defp workflow_error_retry_delay_ms(attempt, opts)
+       when is_integer(attempt) and attempt > 0 and is_list(opts) do
+    base_ms = Keyword.get(opts, :workflow_error_retry_base_ms, @workflow_error_retry_base_ms)
+    max_ms = Keyword.get(opts, :workflow_error_retry_max_ms, @workflow_error_retry_max_ms)
+    backoff = Keyword.get(opts, :workflow_error_retry_backoff, :exponential)
+    exponent = max(attempt - 1, 0)
+
+    delay_ms =
+      case backoff do
+        :constant -> base_ms
+        :exponential -> base_ms * trunc(:math.pow(2, exponent))
+      end
+
+    min(delay_ms, max_ms)
+  end
+
+  @spec workflow_error_retry_scheduled?(pos_integer(), keyword()) :: boolean()
+  defp workflow_error_retry_scheduled?(attempt, opts)
+       when is_integer(attempt) and attempt > 0 and is_list(opts) do
+    case Keyword.get(opts, :workflow_error_retry_max_attempts, nil) do
+      nil -> true
+      max_attempts when is_integer(max_attempts) and max_attempts > 0 -> attempt < max_attempts
+    end
   end
 
   @spec dump_cached_ttl_ms!(pos_integer() | :infinity) :: pos_integer() | String.t()
@@ -3092,9 +3573,23 @@ defmodule Endurant.Executions do
 
   defp payload_task_run_id(_payload), do: nil
 
-  @spec claim_branch_previous_status(claim_ready_branch()) :: :continuable | :waiting
+  @spec claim_branch_previous_status(claim_ready_branch()) ::
+          :continuable | :waiting | :workflow_error
   defp claim_branch_previous_status(:continuable), do: :continuable
   defp claim_branch_previous_status(:waiting_ready), do: :waiting
+  defp claim_branch_previous_status(:workflow_error_ready), do: :workflow_error
+
+  @spec claim_branch_emits_resumed_event?(claim_ready_branch()) :: boolean()
+  defp claim_branch_emits_resumed_event?(:workflow_error_ready), do: false
+  defp claim_branch_emits_resumed_event?(_branch), do: true
+
+  @spec claim_branch_start_confirmed?(claim_ready_branch()) :: boolean()
+  defp claim_branch_start_confirmed?(:workflow_error_ready), do: false
+  defp claim_branch_start_confirmed?(_branch), do: false
+
+  @spec claim_branch_suppresses_started_event?(claim_ready_branch()) :: boolean()
+  defp claim_branch_suppresses_started_event?(:workflow_error_ready), do: true
+  defp claim_branch_suppresses_started_event?(_branch), do: false
 
   @spec execution_metadata(keyword(), String.t(), String.t(), String.t(), map()) :: map()
   defp execution_metadata(opts, queue, workflow, version, extra \\ %{}) do
@@ -3244,6 +3739,7 @@ defmodule Endurant.Executions do
       "waiting" -> :waiting
       "continuable" -> :continuable
       "abandoned" -> :abandoned
+      "workflow_error" -> :workflow_error
       "cancelling" -> :cancelling
       "completed" -> :completed
       "failed" -> :failed
@@ -3347,6 +3843,75 @@ defmodule Endurant.Executions do
 
       _ ->
         nil
+    end
+  end
+
+  @spec fetch_owned_running_execution_metadata(
+          module(),
+          String.t(),
+          binary(),
+          String.t(),
+          keyword()
+        ) :: {:ok, map()} | {:error, :not_running}
+  defp fetch_owned_running_execution_metadata(repo, prefix, execution_id, worker_id, opts) do
+    sql = """
+    SELECT metadata
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    AND status = 'running'::#{prefix}.endurant_execution_status
+    AND locked_by = $2
+    AND locked_until IS NOT NULL
+    AND locked_until > timezone('UTC', now())
+    FOR UPDATE
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [execution_id, worker_id], opts).rows do
+      [[metadata]] ->
+        {:ok, %{metadata: metadata || %{}}}
+
+      _ ->
+        {:error, :not_running}
+    end
+  end
+
+  @spec fetch_owned_running_execution_start_context(
+          module(),
+          String.t(),
+          binary(),
+          String.t(),
+          keyword()
+        ) :: {:ok, map()} | {:error, :not_found | :lock_lost | :cancelled}
+  defp fetch_owned_running_execution_start_context(repo, prefix, execution_id, worker_id, opts) do
+    sql = """
+    SELECT queue, workflow_name, version, inserted_at, metadata
+    FROM #{prefix}.endurant_executions
+    WHERE id = $1
+    AND status = 'running'::#{prefix}.endurant_execution_status
+    AND locked_by = $2
+    AND locked_until IS NOT NULL
+    AND locked_until > timezone('UTC', now())
+    FOR UPDATE
+    LIMIT 1
+    """
+
+    case query!(repo, sql, [execution_id, worker_id], opts).rows do
+      [[queue, workflow_name, version, inserted_at, metadata]] ->
+        {:ok,
+         %{
+           queue: queue,
+           workflow: workflow_name,
+           version: version,
+           inserted_at: inserted_at,
+           metadata: metadata || %{}
+         }}
+
+      _ ->
+        case lock_execution_status(repo, prefix, execution_id, opts) do
+          nil -> {:error, :not_found}
+          status when status in [:cancelling, :cancelled] -> {:error, :cancelled}
+          _ -> {:error, :lock_lost}
+        end
     end
   end
 
@@ -3561,7 +4126,8 @@ defmodule Endurant.Executions do
     """
 
     case query!(repo, sql, [unique_id], opts).rows do
-      [[status]] when status in ["completed", "failed", "cancelled", "continued_as_new"] ->
+      [[status]]
+      when status in ["completed", "failed", "cancelled", "continued_as_new", "workflow_error"] ->
         :not_active
 
       _ ->
@@ -3582,6 +4148,7 @@ defmodule Endurant.Executions do
       'waiting'::#{prefix}.endurant_execution_status,
       'continuable'::#{prefix}.endurant_execution_status,
       'abandoned'::#{prefix}.endurant_execution_status,
+      'workflow_error'::#{prefix}.endurant_execution_status,
       'cancelling'::#{prefix}.endurant_execution_status
     )
     ORDER BY inserted_at DESC, id DESC
@@ -3736,6 +4303,7 @@ defmodule Endurant.Executions do
       'waiting'::#{prefix}.endurant_execution_status,
       'continuable'::#{prefix}.endurant_execution_status,
       'abandoned'::#{prefix}.endurant_execution_status,
+      'workflow_error'::#{prefix}.endurant_execution_status,
       'cancelling'::#{prefix}.endurant_execution_status
     )
     FOR UPDATE
@@ -3801,6 +4369,7 @@ defmodule Endurant.Executions do
       'waiting'::#{prefix}.endurant_execution_status,
       'continuable'::#{prefix}.endurant_execution_status,
       'abandoned'::#{prefix}.endurant_execution_status,
+      'workflow_error'::#{prefix}.endurant_execution_status,
       'cancelling'::#{prefix}.endurant_execution_status
     )
     FOR UPDATE
@@ -3834,7 +4403,8 @@ defmodule Endurant.Executions do
       %{status: :running} ->
         mark_cancelling_in_tx(repo, prefix, execution_id_db, opts)
 
-      %{status: status} when status in [:pending, :waiting, :continuable, :abandoned] ->
+      %{status: status}
+      when status in [:pending, :waiting, :continuable, :abandoned, :workflow_error] ->
         :ok = mark_cancelling_in_tx(repo, prefix, execution_id_db, opts)
         _ = finalize_cancel_in_tx(repo, prefix, execution_id_db, opts)
         :ok

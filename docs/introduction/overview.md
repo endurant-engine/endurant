@@ -2,7 +2,9 @@
 
 Endurant is a durable workflow engine for Elixir.
 
-Workflows are defined as Elixir modules and written as code. Executions state is persistet in an event log. If a worker crashes or restarts, Endurant replays those events and resumes execution deterministically.
+Workflows are defined as Elixir modules and written as code. Execution state is
+persisted in an event log. If a worker crashes or restarts, Endurant replays
+those events and resumes execution deterministically.
 
 ## Features
 
@@ -14,6 +16,13 @@ Workflows are defined as Elixir modules and written as code. Executions state is
 - Recurring cron scheduling with `Endurant.cron/..`
 - Parallel task patterns with async primitives
 - Event history for debugging and auditing
+
+## Failure Semantics
+
+Task failures can use retry policies. If workflow code fails outside durable
+primitives, Endurant automatically retries it with backoff until it recovers.
+Worker crashes and restarts are handled by replaying persisted history from the
+last durable state.
 
 ## Example
 

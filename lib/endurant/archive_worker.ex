@@ -575,6 +575,7 @@ defmodule Endurant.ArchiveWorker do
   defp parse_status("waiting"), do: :waiting
   defp parse_status("continuable"), do: :continuable
   defp parse_status("abandoned"), do: :abandoned
+  defp parse_status("workflow_error"), do: :workflow_error
   defp parse_status("cancelling"), do: :cancelling
   defp parse_status("completed"), do: :completed
   defp parse_status("failed"), do: :failed
@@ -584,6 +585,7 @@ defmodule Endurant.ArchiveWorker do
   @spec parse_event_type(String.t()) :: atom()
   defp parse_event_type("execution_created"), do: :execution_created
   defp parse_event_type("execution_started"), do: :execution_started
+  defp parse_event_type("execution_workflow_errored"), do: :execution_workflow_errored
   defp parse_event_type("execution_continued_as_new"), do: :execution_continued_as_new
   defp parse_event_type("execution_completed"), do: :execution_completed
   defp parse_event_type("execution_failed"), do: :execution_failed

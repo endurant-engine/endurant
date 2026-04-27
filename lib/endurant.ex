@@ -109,6 +109,8 @@ defmodule Endurant do
   @type delete_cron_result :: :ok | {:error, :not_found | :transient_db}
   @type signal_result :: :ok | {:error, :not_found | :not_active}
   @type cancel_result :: :ok | {:error, :not_found | :not_active}
+  @type resume_workflow_error_result :: :ok | {:error, :not_found | :not_workflow_error}
+  @type resume_workflow_errors_result :: non_neg_integer()
   @type execution_result :: map() | nil
   @type executions_result :: [map()]
   @typedoc "Workflow execution event returned by `events/1` and `events/2`."
@@ -508,6 +510,47 @@ defmodule Endurant do
   @spec cancel(binary(), keyword()) :: cancel_result()
   def cancel(execution_id, opts) when is_binary(execution_id) and is_list(opts) do
     Endurant.Executions.cancel(execution_id, runtime_opts_from_public_opts!(opts))
+  end
+
+  @doc """
+  Requeues a `workflow_error` execution on the default instance.
+  """
+  @spec resume_workflow_error(binary()) :: resume_workflow_error_result()
+  def resume_workflow_error(execution_id) when is_binary(execution_id) do
+    Endurant.Executions.resume_workflow_error(
+      execution_id,
+      instance_runtime_opts!(@default_instance)
+    )
+  end
+
+  @spec resume_workflow_error(binary(), keyword()) :: resume_workflow_error_result()
+  def resume_workflow_error(execution_id, opts)
+      when is_binary(execution_id) and is_list(opts) do
+    Endurant.Executions.resume_workflow_error(execution_id, runtime_opts_from_public_opts!(opts))
+  end
+
+  @doc """
+  Requeues all `workflow_error` executions on the default instance.
+  """
+  @spec resume_workflow_errors() :: resume_workflow_errors_result()
+  def resume_workflow_errors do
+    Endurant.Executions.resume_workflow_errors([], instance_runtime_opts!(@default_instance))
+  end
+
+  @doc """
+  Requeues `workflow_error` executions using optional filters.
+
+  Supported filters:
+
+    * `:workflow` - workflow name, for example `"MyApp.Workflows.OrderApprovalWorkflow"`
+    * `:queue` - queue name
+    * `:limit` - maximum number of executions to resume
+    * `:instance` - target Endurant instance
+  """
+  @spec resume_workflow_errors(keyword()) :: resume_workflow_errors_result()
+  def resume_workflow_errors(filters) when is_list(filters) do
+    {instance, resolved_filters} = split_instance_from_keyword(filters)
+    Endurant.Executions.resume_workflow_errors(resolved_filters, instance_runtime_opts!(instance))
   end
 
   @doc """
