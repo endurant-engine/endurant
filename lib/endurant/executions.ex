@@ -905,7 +905,7 @@ defmodule Endurant.Executions do
       {:ok, {execution_context, attempts, retry_delay_ms, retry_scheduled?}} ->
         Telemetry.emit(
           [:execution, :workflow_errored],
-          %{count: 1},
+          %{count: 1, attempt: attempts, retry_delay_ms: retry_delay_ms},
           execution_metadata(
             opts,
             execution_context.queue,

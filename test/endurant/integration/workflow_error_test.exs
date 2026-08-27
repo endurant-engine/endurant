@@ -180,10 +180,29 @@ defmodule Endurant.Integration.WorkflowErrorTest do
          engine_name: engine_name,
          runtime_opts: runtime_opts
        } do
+    test_pid = self()
+    handler_id = "workflow-error-telemetry-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:endurant, :execution, :workflow_errored],
+        &__MODULE__.handle_telemetry/4,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     assert {:ok, execution} =
              Endurant.insert(AutoRetryWorkflow, %{id: "auto-1"}, instance: engine_name)
 
     assert :workflow_error = wait_for_status(execution.id, :workflow_error, 5_000, runtime_opts)
+
+    assert_receive {:telemetry, [:endurant, :execution, :workflow_errored], measurements,
+                    metadata}
+
+    assert %{count: 1, attempt: 1, retry_delay_ms: 25} = measurements
+    assert %{retry_scheduled: true, error_kind: "exception"} = metadata
 
     Application.put_env(:endurant, AutoRetryWorkflow, :ok)
 
@@ -358,5 +377,9 @@ defmodule Endurant.Integration.WorkflowErrorTest do
     metadata
     |> Map.get("endurant", %{})
     |> Map.get("workflow_error", %{})
+  end
+
+  def handle_telemetry(event, measurements, metadata, test_pid) do
+    send(test_pid, {:telemetry, event, measurements, metadata})
   end
 end
