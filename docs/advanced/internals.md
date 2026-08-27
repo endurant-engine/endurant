@@ -10,6 +10,7 @@ On recovery, it replays event history to reconstruct workflow runtime state:
 
 - `execution_created`
 - `execution_started`
+- `execution_workflow_errored`
 - `execution_waiting`
 - `execution_resumed`
 - `execution_abandoned`
@@ -24,6 +25,11 @@ On recovery, it replays event history to reconstruct workflow runtime state:
 
 This replay model is what makes execution durable and deterministic across
 worker crashes and restarts.
+
+Workflow orchestration failures are handled separately from task failures. If
+`run/2` raises outside durable primitives, the execution moves to
+`:workflow_error` and is retried with backoff. Manual resume APIs can trigger
+an immediate retry.
 
 ## Determinism Rules
 
@@ -45,6 +51,7 @@ Executions move through states such as:
 - `:running`
 - `:waiting`
 - `:continuable`
+- `:workflow_error`
 - terminal states like `:completed`, `:failed`, `:cancelled`
 
 See the state diagram in [State Machine](../state_machine.md).

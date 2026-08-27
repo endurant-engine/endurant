@@ -6,11 +6,19 @@ defmodule Endurant.Executor do
   alias Endurant.Telemetry
   alias Endurant.Workflow
 
+  @terminal_failure_event_types [
+    :task_failed,
+    :child_execution_failed,
+    :child_execution_cancelled
+  ]
+  @terminal_failure_modules [Endurant.Workflow.Tasks, Endurant.Workflow.Children]
+
   @type execution_ref :: map() | binary()
   @type execution_outcome ::
           :completed
           | :waiting
           | :cancelled
+          | :workflow_error
           | :failed
           | :lock_lost
           | :not_found
@@ -42,9 +50,20 @@ defmodule Endurant.Executor do
     workflow = Map.get(execution, :workflow)
     status = Map.get(execution, :status, :running)
     version = Map.get(execution, :version, "1")
+    start_confirmed = Map.get(execution, :start_confirmed, false)
+    suppress_started_event = Map.get(execution, :suppress_started_event, false)
 
     {:ok,
-     %{id: id, queue: queue, workflow: workflow, input: input, status: status, version: version}}
+     %{
+       id: id,
+       queue: queue,
+       workflow: workflow,
+       input: input,
+       status: status,
+       version: version,
+       start_confirmed: start_confirmed,
+       suppress_started_event: suppress_started_event
+     }}
   end
 
   defp fetch_execution(execution_id, opts) when is_binary(execution_id) and is_list(opts) do
@@ -172,6 +191,7 @@ defmodule Endurant.Executor do
     opts = execution_runtime_opts(execution, workflow_module, opts)
     lease_ms = Keyword.get(opts, :lease_ms, 30_000)
     heartbeat_ms = heartbeat_interval_ms(opts, lease_ms)
+    start_confirmed? = already_started? || Map.get(execution, :start_confirmed, false)
 
     case maybe_start_execution(
            execution,
@@ -179,7 +199,7 @@ defmodule Endurant.Executor do
            lease_ms,
            heartbeat_ms,
            opts,
-           already_started?
+           start_confirmed?
          ) do
       {:ok, heartbeat_pid} ->
         try do
@@ -221,7 +241,14 @@ defmodule Endurant.Executor do
   end
 
   defp maybe_start_execution(execution, worker_id, lease_ms, heartbeat_ms, opts, false) do
-    case Executions.mark_started(execution.id, worker_id, opts) do
+    start_opts =
+      if Map.get(execution, :suppress_started_event, false) do
+        Keyword.put(opts, :skip_started_event, true)
+      else
+        opts
+      end
+
+    case Executions.mark_started(execution.id, worker_id, start_opts) do
       :ok ->
         start_heartbeat_for_execution(execution.id, worker_id, lease_ms, heartbeat_ms, opts)
 
@@ -367,10 +394,29 @@ defmodule Endurant.Executor do
         end
       else
         {:error, reason, execution_id} ->
-          _ =
-            Executions.mark_failed_owned(execution_id, worker_id, serialize_reason(reason), opts)
+          case classify_execution_failure(execution_id, reason, opts) do
+            :failed ->
+              _ =
+                Executions.mark_failed_owned(
+                  execution_id,
+                  worker_id,
+                  serialize_reason(reason),
+                  opts
+                )
 
-          :failed
+              :failed
+
+            :workflow_error ->
+              _ =
+                Executions.mark_workflow_errored_owned(
+                  execution_id,
+                  worker_id,
+                  serialize_reason(reason),
+                  opts
+                )
+
+              :workflow_error
+          end
       end
     end
   end
@@ -912,6 +958,62 @@ defmodule Endurant.Executor do
 
   defp serialize_reason(other), do: %{reason: inspect(other)}
 
+  @spec classify_execution_failure(binary(), term(), keyword()) :: :failed | :workflow_error
+  defp classify_execution_failure(execution_id, reason, opts) do
+    if child_execution?(execution_id, opts) or terminal_failure_event?(execution_id, opts) or
+         terminal_failure_module?(reason) do
+      :failed
+    else
+      :workflow_error
+    end
+  end
+
+  @spec child_execution?(binary(), keyword()) :: boolean()
+  defp child_execution?(execution_id, opts) do
+    case Executions.get(execution_id, opts) do
+      %{metadata: %{"child_workflow" => %{} = _child_workflow}} -> true
+      %{metadata: %{child_workflow: %{} = _child_workflow}} -> true
+      _ -> false
+    end
+  end
+
+  @spec terminal_failure_event?(binary(), keyword()) :: boolean()
+  defp terminal_failure_event?(execution_id, opts) do
+    case Events.list(execution_id, opts) |> Enum.reverse() do
+      [%{type: type} | _] when type in @terminal_failure_event_types ->
+        true
+
+      [%{type: :execution_resumed}, %{type: type} | _]
+      when type in @terminal_failure_event_types ->
+        true
+
+      _ ->
+        false
+    end
+  end
+
+  @spec terminal_failure_module?(term()) :: boolean()
+  defp terminal_failure_module?({:exception, _error, stacktrace}),
+    do: stacktrace_in_terminal_failure_module?(stacktrace)
+
+  defp terminal_failure_module?({:throw, _kind, _reason, stacktrace}),
+    do: stacktrace_in_terminal_failure_module?(stacktrace)
+
+  defp terminal_failure_module?(_), do: false
+
+  @spec stacktrace_in_terminal_failure_module?(list()) :: boolean()
+  defp stacktrace_in_terminal_failure_module?(stacktrace) when is_list(stacktrace) do
+    Enum.any?(stacktrace, fn
+      {module, _function, _arity, _location} when is_atom(module) ->
+        Enum.member?(@terminal_failure_modules, module)
+
+      _ ->
+        false
+    end)
+  end
+
+  defp stacktrace_in_terminal_failure_module?(_), do: false
+
   @spec cancel_execution(binary(), keyword()) :: :ok
   defp cancel_execution(execution_id, opts) do
     _ = Executions.request_cancel(execution_id, opts)
@@ -957,12 +1059,52 @@ defmodule Endurant.Executor do
 
   @spec execution_runtime_opts(Executions.execution(), module(), keyword()) :: keyword()
   defp execution_runtime_opts(execution, workflow_module, opts) do
-    Keyword.put(
-      opts,
-      :cached_ttl_ms,
-      resolve_cached_ttl_ms(execution, workflow_module, opts)
+    opts
+    |> Keyword.put(:cached_ttl_ms, resolve_cached_ttl_ms(execution, workflow_module, opts))
+    |> put_workflow_error_retry_opts(workflow_module)
+  end
+
+  @spec put_workflow_error_retry_opts(keyword(), module()) :: keyword()
+  defp put_workflow_error_retry_opts(opts, workflow_module) do
+    retry_opts =
+      workflow_module.__workflow__()
+      |> Map.get(:workflow_error_retry)
+      |> case do
+        nil ->
+          [
+            base_ms: Keyword.get(opts, :workflow_error_retry_base_ms),
+            max_ms: Keyword.get(opts, :workflow_error_retry_max_ms),
+            max_attempts: Keyword.get(opts, :workflow_error_retry_max_attempts),
+            backoff: Keyword.get(opts, :workflow_error_retry_backoff)
+          ]
+          |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+
+        values ->
+          values
+      end
+
+    opts
+    |> maybe_put_workflow_error_retry_opt(
+      :workflow_error_retry_base_ms,
+      Keyword.get(retry_opts, :base_ms)
+    )
+    |> maybe_put_workflow_error_retry_opt(
+      :workflow_error_retry_max_ms,
+      Keyword.get(retry_opts, :max_ms)
+    )
+    |> maybe_put_workflow_error_retry_opt(
+      :workflow_error_retry_max_attempts,
+      Keyword.get(retry_opts, :max_attempts)
+    )
+    |> maybe_put_workflow_error_retry_opt(
+      :workflow_error_retry_backoff,
+      Keyword.get(retry_opts, :backoff)
     )
   end
+
+  @spec maybe_put_workflow_error_retry_opt(keyword(), atom(), term()) :: keyword()
+  defp maybe_put_workflow_error_retry_opt(opts, _key, nil), do: opts
+  defp maybe_put_workflow_error_retry_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   @spec resolve_cached_ttl_ms(Executions.execution(), module(), keyword()) ::
           :infinity | pos_integer()

@@ -19,6 +19,7 @@ defmodule Endurant.Migrations.Postgres.V01 do
         'waiting',
         'continuable',
         'abandoned',
+        'workflow_error',
         'cancelling',
         'completed',
         'failed',
@@ -33,6 +34,7 @@ defmodule Endurant.Migrations.Postgres.V01 do
       CREATE TYPE #{quoted}.endurant_event_type AS ENUM (
         'execution_created',
         'execution_started',
+        'execution_workflow_errored',
         'execution_completed',
         'execution_failed',
         'execution_cancelled',
@@ -119,6 +121,7 @@ defmodule Endurant.Migrations.Postgres.V01 do
       'waiting'::#{quoted}.endurant_execution_status,
       'continuable'::#{quoted}.endurant_execution_status,
       'abandoned'::#{quoted}.endurant_execution_status,
+      'workflow_error'::#{quoted}.endurant_execution_status,
       'cancelling'::#{quoted}.endurant_execution_status
     )
     """)
@@ -178,6 +181,14 @@ defmodule Endurant.Migrations.Postgres.V01 do
     )
 
     create_if_not_exists(
+      index(:endurant_executions, [:queue, :waiting_until, :inserted_at, :id],
+        name: :endurant_executions_claim_workflow_error_ready_idx,
+        where: "status = 'workflow_error' AND waiting_until IS NOT NULL AND locked_by IS NULL",
+        prefix: prefix
+      )
+    )
+
+    create_if_not_exists(
       index(:endurant_executions, [:queue, :locked_until, :id],
         name: :endurant_executions_recover_waiting_idx,
         where: "status = 'waiting' AND locked_until IS NOT NULL",
@@ -228,6 +239,7 @@ defmodule Endurant.Migrations.Postgres.V01 do
         'waiting'::#{quoted}.endurant_execution_status,
         'continuable'::#{quoted}.endurant_execution_status,
         'abandoned'::#{quoted}.endurant_execution_status,
+        'workflow_error'::#{quoted}.endurant_execution_status,
         'cancelling'::#{quoted}.endurant_execution_status
       )
     """)
@@ -251,6 +263,7 @@ defmodule Endurant.Migrations.Postgres.V01 do
         'waiting'::#{quoted}.endurant_execution_status,
         'continuable'::#{quoted}.endurant_execution_status,
         'abandoned'::#{quoted}.endurant_execution_status,
+        'workflow_error'::#{quoted}.endurant_execution_status,
         'cancelling'::#{quoted}.endurant_execution_status
       )
     """)

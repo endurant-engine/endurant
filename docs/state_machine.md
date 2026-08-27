@@ -8,6 +8,10 @@ flowchart LR
     abandoned
   end
 
+  subgraph Blocked
+    workflow_error
+  end
+
   subgraph Waiting
     waiting
     continuable
@@ -34,11 +38,16 @@ flowchart LR
   waiting -->|due wait and lease expired| abandoned
   continuable -->|lease expired| abandoned
 
+  running -->|workflow orchestration error| workflow_error
+  workflow_error -->|backoff retry due| running
+  workflow_error -->|manual resume schedules immediate retry| workflow_error
+
   pending -->|request cancel| cancelling
   running -->|request cancel| cancelling
   waiting -->|request cancel| cancelling
   continuable -->|request cancel| cancelling
   abandoned -->|request cancel| cancelling
+  workflow_error -->|request cancel| cancelling
   cancelling -->|mark cancelled| cancelled
 
   running -->|mark completed| completed

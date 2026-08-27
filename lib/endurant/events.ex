@@ -469,6 +469,7 @@ defmodule Endurant.Events do
     case type do
       "execution_created" -> :execution_created
       "execution_started" -> :execution_started
+      "execution_workflow_errored" -> :execution_workflow_errored
       "execution_continued_as_new" -> :execution_continued_as_new
       "execution_completed" -> :execution_completed
       "execution_failed" -> :execution_failed

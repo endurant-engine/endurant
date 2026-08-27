@@ -236,7 +236,7 @@ defmodule Endurant.Integration.SignalSemanticsTest do
     assert :ok = wait_for_process_up(engine_name, 2000)
 
     assert {:ok, %{status: :completed, result: %{id: "crash-1", ok: true}}} =
-             PostgresHelper.wait_for_execution!(execution.id, 10000, runtime_opts)
+             PostgresHelper.wait_for_execution!(execution.id, 15_000, runtime_opts)
 
     {:ok, events} = PostgresHelper.history(execution.id, runtime_opts)
     assert Enum.any?(events, &(&1.type == :execution_abandoned))
